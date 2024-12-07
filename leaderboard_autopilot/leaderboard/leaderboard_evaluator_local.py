@@ -372,8 +372,13 @@ class LeaderboardEvaluator(object):
         # Run the scenario
         try:
             # Load scenario and run it
+            print(f'ARGS.RECORD: {args.record}')
             if args.record:
-                self.client.start_recorder("{}.log".format(args.record), False) # changed to False, otherwise the log file become too large
+                if int(os.environ.get('RECORD_EXPERT_AGENT', 0))==1:
+                    print(f'RECORDING EXPERT AGENT')
+                    self.client.start_recorder("{}/{}_rep{}.log".format(args.record, config.name, config.repetition_index))
+                else:
+                    self.client.start_recorder("{}.log".format(args.record), False) # changed to False, otherwise the log file become too large
             self.manager.load_scenario(self.route_scenario, self.agent_instance, config.index, config.repetition_index)
             self.manager.run_scenario()
 

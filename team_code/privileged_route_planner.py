@@ -1,5 +1,5 @@
 """
-This Python script defines a PrivilegedRoutePlanner class for planning and modifying routes in the CARLA 
+This Python script defines a PrivilegedRoutePlanner class for planning and modifying routes in the CARLA
 simulation environment. The class provides functionalities to create a smooth and interpolated route,
 compute distances to traffic lights and stop signs, handle lane changes, and identify leading and trailing vehicles.
 """
@@ -10,6 +10,7 @@ from scipy.interpolate import interp1d
 from scipy.spatial import cKDTree
 from agents.navigation.local_planner import RoadOption
 
+import os
 
 class PrivilegedRoutePlanner(object):
   """
@@ -518,7 +519,7 @@ class PrivilegedRoutePlanner(object):
   def compute_route_info(self, carla_world, carla_map):
     """
         Computes additional information for the route such as distances to traffic lights and stop signs,
-        speed limits, and prevents too early lane changes and computes yaw angles corresponding to the ego 
+        speed limits, and prevents too early lane changes and computes yaw angles corresponding to the ego
         vehicle's orientation at individual route points in degrees.
 
         Args:
@@ -610,7 +611,7 @@ class PrivilegedRoutePlanner(object):
     """
         Compute the distance to the next stop sign from each individual route location.
         We use the official implementation that is used to test whether we ran a stop sign
-        The logic is copied from the class RunningStopTest in 
+        The logic is copied from the class RunningStopTest in
         scenario_runner/srunner/scenariomanager/scenarioatomics/atomic_criteria
 
         Args:
@@ -738,7 +739,8 @@ class PrivilegedRoutePlanner(object):
     map_name = carla_map.name.split("/")[-1]
 
     # Load speed limit data from file
-    file_name_speed_limits = f"team_code/speed_limits/{map_name}_speed_limits.npy"
+    work_dir = os.getenv('WORK_DIR')
+    file_name_speed_limits = os.path.join(work_dir, f"team_code/speed_limits/{map_name}_speed_limits.npy")
     file_content = np.load(file_name_speed_limits, allow_pickle=True)
     map_data = file_content.item()
 
