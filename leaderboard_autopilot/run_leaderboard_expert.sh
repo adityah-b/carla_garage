@@ -1,10 +1,10 @@
  #!/bin/bash
 
 # PDM-Lite agent
-# export TEAM_AGENT=$WORK_DIR/team_code/autopilot.py
+export TEAM_AGENT=$WORK_DIR/team_code/autopilot.py
 
 # PDM-Lite agent with data collection
-export TEAM_AGENT=$WORK_DIR/team_code/data_agent.py
+# export TEAM_AGENT=$WORK_DIR/team_code/data_agent.py
 
 # export ROUTES=$LEADERBOARD_ROOT/data/routes_validation.xml
 export ROUTES=$WORK_DIR/data/50x36_Town13/SignalizedJunctionLeftTurn/9_0.xml
@@ -17,12 +17,12 @@ export CHALLENGE_TRACK_CODENAME=MAP
 export CHECKPOINT_ENDPOINT="${LEADERBOARD_ROOT}/results.json"
 export RECORD_PATH=
 export RESUME=1
-export SAVE_PATH="$WORK_DIR/debug_visualizations/test_run"
+# export SAVE_PATH="$WORK_DIR/debug_visualizations/test_run"
 
 export TOWN=13
 export REPETITION=0
 
-export RECORD_EXPERT_AGENT=1
+# export RECORD_EXPERT_AGENT=1
 
 #!/bin/bash
 
