@@ -28,6 +28,13 @@ from kinematic_bicycle_model import KinematicBicycleModel
 
 import json
 
+from birds_eye_view.chauffeurnet import ObsManager
+from birds_eye_view.run_stop_sign import RunStopSign
+
+from carla_birdeye_view import BirdViewProducer, BirdViewCropType, PixelDimensions
+from srunner.scenariomanager.actorcontrols.visualizer import Visualizer
+import cv2
+
 def get_entry_point():
   return "AutoPilot"
 
@@ -59,18 +66,24 @@ class SceneDescriptor:
               state = traffic_light.get_state()
               time_elapsed = traffic_light.get_elapsed_time()
 
+              print(f"Time Elapsed: {time_elapsed}")
+
               if state == carla.TrafficLightState.Red:
+                light_state = "RED"
                 time_remaining = traffic_light.get_red_time() - time_elapsed
               elif state == carla.TrafficLightState.Yellow:
+                light_state = "YELLOW"
                 time_remaining = traffic_light.get_yellow_time() - time_elapsed
               elif state == carla.TrafficLightState.Green:
+                light_state = "GREEN"
                 time_remaining = traffic_light.get_green_time() - time_elapsed
               else:
+                light_state = "UNKNOWN"
                 time_remaining = 0.0
 
               traffic_light_data = {
                   "distance_to_light": distance_to_light,
-                  "state": state,
+                  "state": light_state,
                   "time_remaining_in_state": time_remaining
               }
             return traffic_light_data
@@ -110,7 +123,7 @@ class SceneDescriptor:
         ego_data = {
             "speed": ego_context["speed"],
             "orientation": ego_context["compass"],
-            "position": ego_context["gps"][:2]
+            "position": ego_context["gps"][:2].tolist()
         }
         return ego_data
     
@@ -138,7 +151,7 @@ class SceneDescriptor:
                   "vehicle_id": vehicle.id,
                   "data": {
                     "speed": vehicle.get_velocity().length(),
-                    "orientation": vehicle.get_transform().yaw,
+                    "orientation": vehicle.get_transform().rotation.yaw,
                     "position": [vehicle.get_location().x, vehicle.get_location().y]
                   }
               }
@@ -173,13 +186,67 @@ class SceneDescriptor:
             str: A JSON string containing the structured data.
         """
         return json.dumps(structured_data, indent=4)
-
-# Example usage:
-# autopilot_instance = AutoPilot(...)
-# interface = SimulatorDataInterface(autopilot_instance)
-# json_data = interface.to_json()
-# print(json_data)
-
+    
+        # ...existing code...
+    
+    def to_formatted_string(self, structured_data):
+        """
+        Convert the structured data to a formatted string.
+    
+        Args:
+            structured_data (dict): The structured data.
+    
+        Returns:
+            str: A formatted string representation of the data.
+        """
+        traffic_data = structured_data['traffic']
+        ego_data = structured_data['ego']
+        agent_data = structured_data['agent']
+    
+        formatted_string = "Traffic Data:\n"
+        formatted_string += "    Next Traffic Light:\n"
+        if traffic_data['next_traffic_light']:
+            formatted_string += f"        Distance to Light: {traffic_data['next_traffic_light'].get('distance_to_light', 'N/A')}\n"
+            formatted_string += f"        State: {traffic_data['next_traffic_light'].get('state', 'N/A')}\n"
+            formatted_string += f"        Time Remaining in State: {traffic_data['next_traffic_light'].get('time_remaining_in_state', 'N/A')}\n"
+        else:
+            formatted_string += "        No data available\n"
+        formatted_string += "    Next Stop Sign:\n"
+        if traffic_data['next_stop_sign']:
+            formatted_string += f"        Distance to Stop Sign: {traffic_data['next_stop_sign'].get('distance_to_stop_sign', 'N/A')}\n"
+        else:
+            formatted_string += "        No data available\n"
+        formatted_string += f"    Speed Limit: {traffic_data.get('speed_limit', 'N/A')}\n"
+    
+        formatted_string += "Ego Data:\n"
+        formatted_string += f"    Speed: {ego_data.get('speed', 'N/A')}\n"
+        formatted_string += f"    Orientation: {ego_data.get('orientation', 'N/A')}\n"
+        formatted_string += f"    Position: {ego_data.get('position', 'N/A')}\n"
+    
+        formatted_string += "Agent Data:\n"
+        formatted_string += "    Leading Vehicles:\n"
+        if agent_data['leading_vehicles']:
+            for vehicle in agent_data['leading_vehicles']:
+                formatted_string += f"        Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Position: {vehicle['data']['position']}, Orientation: {vehicle['data']['orientation']}, Speed: {vehicle['data']['speed']}\n"
+        else:
+            formatted_string += "        No data available\n"
+        formatted_string += "    Trailing Vehicles:\n"
+        if agent_data['trailing_vehicles']:
+            for vehicle in agent_data['trailing_vehicles']:
+                formatted_string += f"        Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Position: {vehicle['data']['position']}, Orientation: {vehicle['data']['orientation']}, Speed: {vehicle['data']['speed']}\n"
+        else:
+            formatted_string += "        No data available\n"
+    
+        return formatted_string
+    
+    # Example usage:
+    # autopilot_instance = AutoPilot(...)
+    # interface = SimulatorDataInterface(autopilot_instance)
+    # structured_data = interface.get_structured_data(traffic_context, ego_context, agent_context)
+    # formatted_string = interface.to_formatted_string(structured_data)
+    # print(formatted_string)
+    
+    # ...existing code...
 class AutoPilot(autonomous_agent_local.AutonomousAgent):
   """
       Privileged driving agent used for data collection.
@@ -343,6 +410,33 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self._vehicle = CarlaDataProvider.get_hero_actor()
     self._world = self._vehicle.get_world()
 
+    # Visualizer
+    self.visualizer = Visualizer(self._vehicle)
+
+    # BEV Visualizer
+    obs_config = {
+        'width_in_pixels': self.config.lidar_resolution_width,
+        'pixels_ev_to_bottom': self.config.lidar_resolution_height / 2.0,
+        'pixels_per_meter': self.config.pixels_per_meter_collection,
+        'history_idx': [-1],
+        'scale_bbox': True,
+        'scale_mask_col': 1.0,
+        'map_folder': 'maps_2ppm_cv'
+    }
+
+    self.stop_sign_criteria = RunStopSign(self._world)
+    self.ss_bev_manager = ObsManager(obs_config, self.config)
+    self.ss_bev_manager.attach_ego_vehicle(self._vehicle, criteria_stop=self.stop_sign_criteria)
+
+    # # BEV Renderer
+    # self.birdview_producer = BirdViewProducer(
+    #     CarlaDataProvider.get_client(),  # carla.Client
+    #     target_size=PixelDimensions(width=150, height=336),
+    #     render_lanes_on_junctions=True,
+    #     pixels_per_meter=4,
+    #     crop_type=BirdViewCropType.FRONT_AND_REAR_AREA
+    # )
+
     # Check if the vehicle starts from a parking spot
     distance_to_road = self.org_dense_route_world_coord[0][0].location.distance(self._vehicle.get_location())
     # The first waypoint starts at the lane center, hence it's more than 2 m away from the center of the
@@ -392,11 +486,12 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         Returns:
             list: A list of sensor specification dictionaries.
         """
-    sensor_specs = [{
+    sensor_specs = [
+      {
         "type": "sensor.opendrive_map",
         "reading_frequency": 1e-6,
         "id": "hd_map"
-    }, {
+      }, {
         "type": "sensor.other.imu",
         "x": 0.0,
         "y": 0.0,
@@ -406,11 +501,24 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         "yaw": 0.0,
         "sensor_tick": 0.05,
         "id": "imu"
-    }, {
+      }, {
+        'type': 'sensor.camera.rgb',
+        'x': self.config.camera_pos[0],
+        'y': self.config.camera_pos[1],
+        'z': self.config.camera_pos[2],
+        'roll': self.config.camera_rot_0[0],
+        'pitch': self.config.camera_rot_0[1],
+        'yaw': self.config.camera_rot_0[2],
+        'width': self.config.camera_width,
+        'height': self.config.camera_height,
+        'fov': self.config.camera_fov,
+        'id': 'rgb'
+      }, {
         "type": "sensor.speedometer",
         "reading_frequency": 20,
         "id": "speed"
-    }]
+      }
+    ]
 
     return sensor_specs
 
@@ -470,6 +578,21 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     # Get the control commands and driving data for the current step
     control, driving_data = self._get_control(input_data, plant)
+
+    bev_semantics = self.ss_bev_manager.get_observation(self.close_traffic_lights)
+    rgb = input_data['rgb'][1][:, :, :3]
+    bev_img = bev_semantics['rendered']
+
+    rendered = cv2.resize(bev_img, dsize=(rgb.shape[1], rgb.shape[1]), interpolation=cv2.INTER_LINEAR)
+    visu_img = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+
+    final = np.concatenate((visu_img, rendered), axis=0)
+
+    cv2.namedWindow("BirdView RGB", cv2.WINDOW_NORMAL)
+    cv2.imshow("BirdView RGB", final)
+    cv2.waitKey(1)
+
+    # self.visualizer.render()
 
     if plant:
       return driving_data
@@ -541,10 +664,11 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         "trailing_vehicles": trailing_vehicles
     }
 
-    structured_data = self.scene_descriptor.get_structured_data(traffic_context, ego_context, agent_context)
-    json_data = self.scene_descriptor.to_json(structured_data)
-    print(f"Structured Data: {json_data}")
-    
+    # structured_data = self.scene_descriptor.get_structured_data(traffic_context, ego_context, agent_context)
+    # print(f"Structured Data: {structured_data}")
+    # formatted_data = self.scene_descriptor.to_formatted_string(structured_data)
+    # print(f"Structured Data: {formatted_data}")
+
     # Manage route obstacle scenarios and adjust target speed
     target_speed_route_obstacle, keep_driving, speed_reduced_by_obj = self._manage_route_obstacle_scenarios(
         target_speed, ego_speed, route_wp, vehicles, route_np)
@@ -1177,6 +1301,9 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         Args:
             results (optional): Any additional results to be processed or saved.
         """
+    
+    self.visualizer.reset()
+    
     if self.save_path is not None:
       self.lon_logger.dump_to_json()
 
