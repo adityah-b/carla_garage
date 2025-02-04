@@ -29,6 +29,7 @@ COLOR_GREY = (128, 128, 128)
 COLOR_ALUMINIUM_0 = (238, 238, 236)
 COLOR_ALUMINIUM_3 = (136, 138, 133)
 COLOR_ALUMINIUM_5 = (46, 52, 54)
+COLOR_ORANGE = (255, 140, 0)
 
 
 def tint(color, factor):
@@ -161,13 +162,15 @@ class ObsManager(ObsManagerBase):
 
     actors = self._world.get_actors()
     vehicles = list(actors.filter('*vehicle*'))
+    static_vehicles = []
     walkers = actors.filter('*walker*')
     static_all = actors.filter('*static*')
     for static in static_all:
       if static.type_id == 'static.prop.mesh':
         if 'mesh_path' in static.attributes:
           if 'Car' in static.attributes['mesh_path']:
-            vehicles.append(static)
+            # vehicles.append(static)
+            static_vehicles.append(static)
 
     # This style of generating bounding boxes is more ugly than just calling world.get_level_bbs in carla but it has
     # the advantage of not causing segfaults in the carla library :)
@@ -188,6 +191,21 @@ class ObsManager(ObsManagerBase):
 
       vehicle_bbox_list.append(bounding_box)
 
+    static_vehicle_bbox_list = []
+    for static_vehicle in static_vehicles:
+      traffic_transform = static_vehicle.get_transform()
+
+      # Convert the bounding box to global coordinates
+      bounding_box = carla.BoundingBox(traffic_transform.location + static_vehicle.bounding_box.location,
+                        static_vehicle.bounding_box.extent)
+      # Rotations of the bb are 0.
+      bounding_box.rotation = carla.Rotation(pitch=static_vehicle.bounding_box.rotation.pitch +
+                                             traffic_transform.rotation.pitch,
+                                             yaw=static_vehicle.bounding_box.rotation.yaw + traffic_transform.rotation.yaw,
+                                             roll=static_vehicle.bounding_box.rotation.roll + traffic_transform.rotation.roll)
+
+      static_vehicle_bbox_list.append(bounding_box)
+
     walker_bbox_list = []
     for walker in walkers:
       walker_transform = walker.get_transform()
@@ -203,9 +221,11 @@ class ObsManager(ObsManagerBase):
 
     if self._scale_bbox:
       vehicles = self._get_surrounding_actors(vehicle_bbox_list, is_within_distance, 1.0)
+      static_vehicles = self._get_surrounding_actors(static_vehicle_bbox_list, is_within_distance, 1.0)
       walkers = self._get_surrounding_actors(walker_bbox_list, is_within_distance, 2.0)
     else:
       vehicles = self._get_surrounding_actors(vehicle_bbox_list, is_within_distance)
+      static_vehicles = self._get_surrounding_actors(static_vehicle_bbox_list, is_within_distance)
       walkers = self._get_surrounding_actors(walker_bbox_list, is_within_distance)
 
     tl_green = TrafficLightHandler.get_stopline_vtx(ev_loc, 0, self._distance_threshold, close_traffic_lights)
@@ -213,12 +233,12 @@ class ObsManager(ObsManagerBase):
     tl_red = TrafficLightHandler.get_stopline_vtx(ev_loc, 2, self._distance_threshold, close_traffic_lights)
     stops = self._get_stops(self.criteria_stop)
 
-    self._history_queue.append((vehicles, walkers, tl_green, tl_yellow, tl_red, stops))
+    self._history_queue.append((vehicles, static_vehicles, walkers, tl_green, tl_yellow, tl_red, stops))
 
     m_warp = self._get_warp_transform(ev_loc, ev_rot)
 
     # objects with history
-    vehicle_masks, walker_masks, tl_green_masks, tl_yellow_masks, tl_red_masks, stop_masks \
+    vehicle_masks, static_vehicle_masks, walker_masks, tl_green_masks, tl_yellow_masks, tl_red_masks, stop_masks \
         = self._get_history_masks(m_warp)
 
     # road_mask, lane_mask
@@ -250,6 +270,8 @@ class ObsManager(ObsManagerBase):
 
       for i, mask in enumerate(vehicle_masks):
         image[mask] = tint(COLOR_BLUE, (h_len - i) * 0.2)
+      for i, mask in enumerate(static_vehicle_masks):
+        image[mask] = tint(COLOR_ORANGE, (h_len - i) * 0.2)
       for i, mask in enumerate(walker_masks):
         image[mask] = tint(COLOR_CYAN, (h_len - i) * 0.2)
 
@@ -280,20 +302,21 @@ class ObsManager(ObsManagerBase):
 
   def _get_history_masks(self, m_warp):
     qsize = len(self._history_queue)
-    vehicle_masks, walker_masks, tl_green_masks, tl_yellow_masks, tl_red_masks, stop_masks = [], [], [], [], [], []
+    vehicle_masks, static_vehicle_masks, walker_masks, tl_green_masks, tl_yellow_masks, tl_red_masks, stop_masks = [], [], [], [], [], [], []
     for idx in self._history_idx:
       idx = max(idx, -1 * qsize)
 
-      vehicles, walkers, tl_green, tl_yellow, tl_red, stops = self._history_queue[idx]
+      vehicles, static_vehicles, walkers, tl_green, tl_yellow, tl_red, stops = self._history_queue[idx]
 
       vehicle_masks.append(self._get_mask_from_actor_list(vehicles, m_warp))
+      static_vehicle_masks.append(self._get_mask_from_actor_list(static_vehicles, m_warp))
       walker_masks.append(self._get_mask_from_actor_list(walkers, m_warp))
       tl_green_masks.append(self._get_mask_from_stopline_vtx(tl_green, m_warp))
       tl_yellow_masks.append(self._get_mask_from_stopline_vtx(tl_yellow, m_warp))
       tl_red_masks.append(self._get_mask_from_stopline_vtx(tl_red, m_warp))
       stop_masks.append(self._get_mask_from_actor_list(stops, m_warp))
 
-    return vehicle_masks, walker_masks, tl_green_masks, tl_yellow_masks, tl_red_masks, stop_masks
+    return vehicle_masks, static_vehicle_masks, walker_masks, tl_green_masks, tl_yellow_masks, tl_red_masks, stop_masks
 
   def _get_mask_from_stopline_vtx(self, stopline_vtx, m_warp):
     mask = np.zeros([self._width, self._width], dtype=np.uint8)

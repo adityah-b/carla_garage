@@ -202,6 +202,14 @@ class GlobalConfig:
     self.default_overtake_speed = 50. / 3.6
     # Distance in meters at which two ways scenarios are considered finished
     self.distance_to_delete_scenario_in_two_ways = int(2 * self.points_per_meter)
+
+
+
+    # LLM GUIDED NEW CODE (WIP)
+    self.traffic_light_distance_threshold = 100.0
+    self.stop_sign_distance_threshold = 100.0
+    # LLM GUIDED NEW CODE (WIP)
+
     # -----------------------------------------------------------------------------
     # Longitudinal Linear Regression controller
     # -----------------------------------------------------------------------------

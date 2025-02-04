@@ -1,15 +1,15 @@
  #!/bin/bash
 
 # PDM-Lite agent
-export TEAM_AGENT=$WORK_DIR/team_code/autopilot.py
+export TEAM_AGENT=$WORK_DIR/team_code/autopilot_new.py
 
 # PDM-Lite agent with data collection
 # export TEAM_AGENT=$WORK_DIR/team_code/data_agent.py
 
-# export ROUTES=$LEADERBOARD_ROOT/data/routes_validation.xml
-export ROUTES=$WORK_DIR/data/50x36_Town13/SignalizedJunctionLeftTurn/9_0.xml
+export ROUTES=$LEADERBOARD_ROOT/data/routes_devtest.xml
+# export ROUTES=$WORK_DIR/data/50x36_Town13/SignalizedJunctionLeftTurn/9_0.xml
 
-# export ROUTES_SUBSET=13
+export ROUTES_SUBSET=0
 export REPETITIONS=1
 
 export DEBUG_CHALLENGE=1
@@ -37,4 +37,5 @@ python3 ${LEADERBOARD_ROOT}/leaderboard/leaderboard_evaluator_local.py \
 --debug=${DEBUG_CHALLENGE} \
 --record=${RECORD_PATH} \
 --resume=${RESUME} \
-# --routes-subset=${ROUTES_SUBSET} \
+--timeout=300 \
+--routes-subset=${ROUTES_SUBSET} \
