@@ -31,232 +31,16 @@ import json
 from birds_eye_view.chauffeurnet import ObsManager
 from birds_eye_view.run_stop_sign import RunStopSign
 
-from carla_birdeye_view import BirdViewProducer, BirdViewCropType, PixelDimensions
 from srunner.scenariomanager.actorcontrols.visualizer import Visualizer
 import cv2
+
+from agent_utils import AgentPrediction, SceneDescriptor
+from agents.navigation.global_route_planner import GlobalRoutePlanner
+
 
 def get_entry_point():
   return "AutoPilot"
 
-class SceneDescriptor:
-    """
-    Interface class to convert privileged simulator data into a structured JSON-like format.
-    """
-    def __init__(self, config):
-        """
-        Initialize the SceneDescriptor object.
-
-        Args:
-            config (object): The configuration object.
-        """
-        self.config = config
-
-    def get_traffic_data(self, traffic_context):
-        """
-        Get the traffic data from the privileged simulator data.
-
-        Returns:
-            dict: A dictionary containing the traffic data.
-        """
-        def __get_traffic_light_data(traffic_light, distance_to_light):
-            """
-            Get the traffic light data from the privileged simulator data.
-
-            Args:
-                traffic_light (carla.Actor): The traffic light actor.
-
-            Returns:
-                dict: A dictionary containing the traffic light data.
-            """
-            traffic_light_data = None
-
-            if traffic_light and distance_to_light < self.config.traffic_light_distance_threshold:
-              state = traffic_light.get_state()
-
-              if state == carla.TrafficLightState.Red:
-                light_state = "RED"
-              elif state == carla.TrafficLightState.Yellow:
-                light_state = "YELLOW"
-              elif state == carla.TrafficLightState.Green:
-                light_state = "GREEN"
-              else:
-                light_state = "UNKNOWN"
-
-              traffic_light_data = {
-                  "distance_to_light": distance_to_light,
-                  "state": light_state,
-              }
-            return traffic_light_data
-
-        def __get_stop_sign_data(stop_sign, distance_to_stop_sign):
-            """
-            Get the stop sign data from the privileged simulator data.
-
-            Args:
-                stop_sign (carla.Actor): The stop sign actor.
-
-            Returns:
-                dict: A dictionary containing the stop sign data.
-            """
-            stop_sign_data = None
-
-            if stop_sign and distance_to_stop_sign < self.config.stop_sign_distance_threshold:
-              stop_sign_data = {
-                  "distance_to_stop_sign": distance_to_stop_sign
-              }
-            return stop_sign_data
-
-        traffic_data = {
-            "next_traffic_light": __get_traffic_light_data(traffic_context["next_traffic_light"], traffic_context["distance_to_next_traffic_light"]),
-            "next_stop_sign": __get_stop_sign_data(traffic_context["next_stop_sign"], traffic_context["distance_to_next_stop_sign"]),
-            "speed_limit": traffic_context["speed_limit"]
-        }
-        return traffic_data
-
-    def get_ego_data(self, ego_context):
-        """
-        Get the ego vehicle data from the privileged simulator data.
-
-        Returns:
-            dict: A dictionary containing the ego vehicle data.
-        """
-        ego_data = {
-            "speed": ego_context["speed"],
-            "orientation": ego_context["compass"],
-            "position": ego_context["gps"][:2].tolist()
-        }
-        return ego_data
-
-    def get_agent_data(self, agent_context, ego_data):
-        """
-        Get the agent data from the privileged simulator data.
-
-        Returns:
-            dict: A dictionary containing the agent data.
-        """
-        def __get_npc_vehicle_data(vehicles):
-            """
-            Get the non-player vehicle data from the privileged simulator data.
-
-            Args:
-                vehicles (list): A list of non-player vehicle actors.
-
-            Returns:
-                list: A list of dictionaries containing the non-player vehicle data.
-            """
-            npc_vehicle_data = []
-
-            for vehicle in vehicles:
-              vehicle_position = np.array([vehicle.get_location().x, vehicle.get_location().y], dtype=np.float32)
-              relative_position_veh_wrt_ego = t_u.inverse_conversion_2d(vehicle_position, ego_data["position"], -ego_data["orientation"]).tolist()
-
-              print(f"Vehicle Position: {vehicle.get_location().x}, {vehicle.get_location().y}")
-              print(f"Relative Vehicle Position Ego Frame: {relative_position_veh_wrt_ego}")
-
-              relative_distance = np.linalg.norm(relative_position_veh_wrt_ego)
-
-              vehicle_data = {
-                  "vehicle_id": vehicle.id,
-                  "data": {
-                    "speed": vehicle.get_velocity().length(),
-                    "relative orientation": t_u.normalize_angle(np.deg2rad(vehicle.get_transform().rotation.yaw) - ego_data["orientation"]),
-                    "relative position": relative_position_veh_wrt_ego,
-                    "relative distance": relative_distance
-                  }
-              }
-              npc_vehicle_data.append(vehicle_data)
-            return npc_vehicle_data
-
-        agent_data = {
-            "leading_vehicles": __get_npc_vehicle_data(agent_context["leading_vehicles"]),
-            "trailing_vehicles": __get_npc_vehicle_data(agent_context["trailing_vehicles"]),
-        }
-        return agent_data
-
-    def get_structured_data(self, traffic_context, ego_context, agent_context):
-        """
-        Convert the privileged simulator data into a structured JSON-like format.
-
-        Returns:
-            dict: A dictionary containing the structured data.
-        """
-        ego_data = self.get_ego_data(ego_context)
-
-        data = {
-            "traffic": self.get_traffic_data(traffic_context),
-            "ego": ego_data,
-            "agent": self.get_agent_data(agent_context, ego_data)
-        }
-        return data
-
-    def to_json(self, structured_data):
-        """
-        Convert the structured data into a JSON string.
-
-        Returns:
-            str: A JSON string containing the structured data.
-        """
-        return json.dumps(structured_data, indent=4)
-
-        # ...existing code...
-
-    def to_formatted_string(self, structured_data):
-      """
-      Convert the structured data to a formatted string.
-
-      Args:
-        structured_data (dict): The structured data.
-
-      Returns:
-        str: A formatted string representation of the data.
-      """
-      traffic_data = structured_data['traffic']
-      ego_data = structured_data['ego']
-      agent_data = structured_data['agent']
-
-      formatted_string = "Traffic Data:\n"
-      formatted_string += "    Next Traffic Light:\n"
-      if traffic_data['next_traffic_light']:
-        formatted_string += f"        Distance to Light: {traffic_data['next_traffic_light'].get('distance_to_light', 'N/A')}\n"
-        formatted_string += f"        State: {traffic_data['next_traffic_light'].get('state', 'N/A')}\n"
-      else:
-        formatted_string += "        No data available\n"
-      formatted_string += "    Next Stop Sign:\n"
-      if traffic_data['next_stop_sign']:
-        formatted_string += f"        Distance to Stop Sign: {traffic_data['next_stop_sign'].get('distance_to_stop_sign', 'N/A')}\n"
-      else:
-        formatted_string += "        No data available\n"
-      formatted_string += f"    Speed Limit: {traffic_data.get('speed_limit', 'N/A')}\n"
-
-      formatted_string += "Ego Data:\n"
-      formatted_string += f"    Speed: {ego_data.get('speed', 'N/A')}\n"
-      formatted_string += f"    Orientation: {ego_data.get('orientation', 'N/A')}\n"
-      formatted_string += f"    Position: {ego_data.get('position', 'N/A')}\n"
-
-      formatted_string += "Agent Data:\n"
-      formatted_string += "    Leading Vehicles:\n"
-      if agent_data['leading_vehicles']:
-        for vehicle in agent_data['leading_vehicles']:
-          formatted_string += f"        Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-      else:
-        formatted_string += "        No data available\n"
-      formatted_string += "    Trailing Vehicles:\n"
-      if agent_data['trailing_vehicles']:
-        for vehicle in agent_data['trailing_vehicles']:
-          formatted_string += f"        Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-      else:
-        formatted_string += "        No data available\n"
-
-      return formatted_string
-
-    # Example usage:
-    # autopilot_instance = AutoPilot(...)
-    # interface = SimulatorDataInterface(autopilot_instance)
-    # structured_data = interface.get_structured_data(traffic_context, ego_context, agent_context)
-    # formatted_string = interface.to_formatted_string(structured_data)
-    # print(formatted_string)
-
-    # ...existing code...
 class AutoPilot(autonomous_agent_local.AutonomousAgent):
   """
       Privileged driving agent used for data collection.
@@ -328,7 +112,10 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self.brake = 0.0
 
     # New Code
+    self.traffic_manager = traffic_manager
     self.scene_descriptor = SceneDescriptor(self.config)
+    self.agent_prediction = AgentPrediction(self.config)
+    # New Code
 
     self.augmentation_translation = 0
     self.augmentation_rotation = 0
@@ -483,6 +270,10 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         extent = actor.bounding_box.extent
         if extent.x < 0.001 or extent.y < 0.001 or extent.z < 0.001:
           actor.destroy()
+
+    # Setup agent prediction module
+    grp = GlobalRoutePlanner(self.world_map, self.config.sampling_resolution)
+    self.agent_prediction.setup(self.traffic_manager, self.world_map, grp)
 
     self.initialized = True
 
@@ -667,7 +458,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     ego_context = {
         "speed": tick_data["speed"],
         "compass": tick_data["compass"],
-        "gps": tick_data["gps"]
+        "gps": tick_data["gps"],
+        "route": route_wp[self._waypoint_planner.route_index:],
     }
 
     agent_context = {
@@ -679,6 +471,9 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     # print(f"Structured Data: {structured_data}")
     formatted_data = self.scene_descriptor.to_formatted_string(structured_data)
     print(f"Structured Data: {formatted_data}")
+
+    self.agent_prediction.run_step(ego_context, vehicles)
+    # NEW CODE
 
     # Manage route obstacle scenarios and adjust target speed
     target_speed_route_obstacle, keep_driving, speed_reduced_by_obj = self._manage_route_obstacle_scenarios(

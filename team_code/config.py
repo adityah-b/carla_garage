@@ -208,6 +208,10 @@ class GlobalConfig:
     # LLM GUIDED NEW CODE (WIP)
     self.traffic_light_distance_threshold = 100.0
     self.stop_sign_distance_threshold = 100.0
+
+    self.sampling_resolution = 2.0
+    self.prediction_horizon = 3.0
+
     # LLM GUIDED NEW CODE (WIP)
 
     # -----------------------------------------------------------------------------
