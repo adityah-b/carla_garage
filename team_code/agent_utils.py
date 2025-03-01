@@ -1,3 +1,4 @@
+import carla
 import numpy as np
 import transfuser_utils as t_u
 
@@ -112,16 +113,18 @@ class AgentPrediction:
         Returns:
             list: List of waypoints of the ego vehicle up to the specified distance.
         """
-        distance = ego_speed * self.config.prediction_horizon
-        traveled_distance = 0.0
-        cur_index = 0
-        cur_position = ego_route[cur_index].transform.location
+        if ego_route:
+            distance = ego_speed * self.config.prediction_horizon
+            traveled_distance = 0.0
+            cur_index = 0
+            cur_position = ego_route[cur_index].transform.location
 
-        while traveled_distance < distance and cur_index < len(ego_route):
-            traveled_distance = cur_position.distance(ego_route[cur_index + 1].transform.location)
-            cur_index += 1
+            while traveled_distance < distance and cur_index + 1 < len(ego_route):
+                traveled_distance = cur_position.distance(ego_route[cur_index + 1].transform.location)
+                cur_index += 1
 
-        return ego_route[:cur_index]
+            return ego_route[:cur_index]
+        return None
 
     def _get_ego_route_entry_exit_pairs(self, ego_waypoints):
         """
@@ -178,6 +181,7 @@ class AgentPrediction:
 
         cur_wp = waypoint
         while traveled_distance < distance:
+            print(f'traveled_distance: {traveled_distance}')
             wp_choice = cur_wp.next(self.config.sampling_resolution)
             if len(wp_choice) > 1:
                 print(f'Junction detected at waypoint {cur_wp.transform.location}')
@@ -186,7 +190,7 @@ class AgentPrediction:
                 cur_wp = wp_choice[0]
 
             plan.append(cur_wp)
-            traveled_distance += cur_wp.transform.location.distance(waypoint.transform.location)
+            traveled_distance = cur_wp.transform.location.distance(waypoint.transform.location)
 
         return plan
 
@@ -221,6 +225,10 @@ class AgentPrediction:
         # for lane_id, vehicles in lanes.items():
 
         for vehicle in npc_vehicles_list:
+            # Ignore the ego vehicle
+            if vehicle.attributes['role_name'] == 'hero':
+                continue
+
             vehicle_plan = []
             vehicle_loc = vehicle.get_location()
 
@@ -247,6 +255,9 @@ class AgentPrediction:
                 print(f'Multiple actions for vehicle {vehicle.id}')
                 next_vehicle_wps = [action[1] for action in next_vehicle_actions]
                 vehicle_plan.extend(next_vehicle_wps)
+                print(f'Preliminary plan for vehicle {vehicle.id}:')
+                for wp in vehicle_plan:
+                    print(f'    Location: {wp.transform.location}, Road ID: {wp.road_id}, Lane ID: {wp.lane_id}')
                 vehicle_wp = next_vehicle_wps[-1]
 
             else:
@@ -254,7 +265,12 @@ class AgentPrediction:
 
             cur_speed = np.sqrt(vehicle.get_velocity().x**2 + vehicle.get_velocity().y**2)
             distance = cur_speed * self.config.prediction_horizon
-            vehicle_plan = self._get_waypoint_list_at_distance(vehicle_wp, distance, ego_entry_exit_pairs)
+            print(f'vehicle: {vehicle.id}, pos: {vehicle_loc}, speed: {cur_speed}, distance: {distance}')
+            vehicle_plan.extend(self._get_waypoint_list_at_distance(vehicle_wp, distance, ego_entry_exit_pairs))
+
+            print(f'Predicted path for vehicle {vehicle.id}:')
+            for wp in vehicle_plan:
+                print(f'    Location: {wp.transform.location}, Road ID: {wp.road_id}, Lane ID: {wp.lane_id}')
 
             if vehicle.id not in predicted_positions:
                 predicted_positions[vehicle.id] = []

@@ -382,7 +382,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     bev_semantics = self.ss_bev_manager.get_observation(self.close_traffic_lights)
     rgb = input_data['rgb'][1][:, :, :3]
-    bev_img = bev_semantics['rendered']
+    bev_img = bev_semantics['rendered'] # debug_challenge=1 otherwise crashes
 
     bev_img = cv2.cvtColor(bev_img, cv2.COLOR_BGR2RGB)
     rendered = cv2.resize(bev_img, dsize=(rgb.shape[1], rgb.shape[1]), interpolation=cv2.INTER_LINEAR)
@@ -472,7 +472,16 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     formatted_data = self.scene_descriptor.to_formatted_string(structured_data)
     print(f"Structured Data: {formatted_data}")
 
-    self.agent_prediction.run_step(ego_context, vehicles)
+    predicted_paths = self.agent_prediction.run_step(ego_context, vehicles)
+    # if self.visualize == 1:
+    for vehicle_id, predicted_path in predicted_paths.items():
+      for predicted_wp in predicted_path:
+        predicted_loc = predicted_wp.transform.location
+        predicted_loc = carla.Location(predicted_loc.x, predicted_loc.y, predicted_loc.z + 0.1)
+        self._world.debug.draw_point(location=predicted_loc,
+                                      size=0.1,
+                                      color=self.config.other_vehicles_forecasted_bbs_color,
+                                      life_time=self.config.draw_life_time)
     # NEW CODE
 
     # Manage route obstacle scenarios and adjust target speed
@@ -1361,14 +1370,14 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
           # Store the predicted bounding boxes for this actor in the dictionary
           predicted_bounding_boxes[actor.id] = predicted_actor_boxes
 
-        if self.visualize == 1:
-          for actor_idx, actors_forecasted_bounding_boxes in predicted_bounding_boxes.items():
-            for bb in actors_forecasted_bounding_boxes:
-              self._world.debug.draw_box(box=bb,
-                                         rotation=bb.rotation,
-                                         thickness=0.1,
-                                         color=self.config.other_vehicles_forecasted_bbs_color,
-                                         life_time=self.config.draw_life_time)
+        # if self.visualize == 1:
+        #   for actor_idx, actors_forecasted_bounding_boxes in predicted_bounding_boxes.items():
+        #     for bb in actors_forecasted_bounding_boxes:
+        #       self._world.debug.draw_box(box=bb,
+        #                                  rotation=bb.rotation,
+        #                                  thickness=0.1,
+        #                                  color=self.config.other_vehicles_forecasted_bbs_color,
+        #                                  life_time=self.config.draw_life_time)
 
     return predicted_bounding_boxes
 
@@ -1552,12 +1561,12 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
                 target_speed_pedestrian, blocking_actor.type_id, blocking_actor.id, distance_to_actor
             ]
 
-      if self.visualize == 1:
-        self._world.debug.draw_box(box=ego_bounding_box,
-                                   rotation=ego_bounding_box.rotation,
-                                   thickness=0.1,
-                                   color=color,
-                                   life_time=self.config.draw_life_time)
+      # if self.visualize == 1:
+      #   self._world.debug.draw_box(box=ego_bounding_box,
+      #                              rotation=ego_bounding_box.rotation,
+      #                              thickness=0.1,
+      #                              color=color,
+      #                              life_time=self.config.draw_life_time)
 
     return target_speed_bicycle, target_speed_pedestrian, target_speed_vehicle, speed_reduced_by_obj
 
