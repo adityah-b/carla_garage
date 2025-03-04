@@ -162,6 +162,48 @@ class AgentPrediction:
 
         return waypoint_choices[np.random.randint(len(waypoint_choices))] # Randomly choose a waypoint
 
+    def get_distance(self, wp1, wp2):
+        return wp1.transform.location.distance(wp2.transform.location)
+
+    def _interpolate_between_waypoints(self, source_wp, target_wp):
+        """
+        Interpolate waypoints between source and target waypoints up to a desired distance.
+
+        Args:
+            source_wp (carla.Waypoint): Source waypoint.
+            target_wp (carla.Waypoint): Target waypoint.
+
+        Returns:
+            list: List of interpolated waypoints between source and target waypoints up to desired distance.
+            float: The total distance traveled.
+        """
+        # print(f'Interpolating between waypoints {source_wp.transform.location} and {target_wp.transform.location}')
+        interp_wps = []
+        traveled_distance = 0.0
+        cur_wp = source_wp
+
+        while self.get_distance(cur_wp, target_wp) > self.config.sampling_resolution and self.get_distance(cur_wp, source_wp) < self.get_distance(target_wp, source_wp):
+            # print(f'traveled_distance: {traveled_distance}')
+            wp_choice = cur_wp.next(self.config.sampling_resolution)
+            if len(wp_choice) > 1:
+                max_dot = -1 * np.inf
+                target_wp_vec = target_wp.transform.get_forward_vector()
+                for wp in wp_choice:
+                    wp_vec = wp.transform.get_forward_vector()
+                    target_select_wp_dot = target_wp_vec.dot(wp_vec)
+                    # Select waypoint with straightest path to target waypoint
+                    if target_select_wp_dot > max_dot:
+                        max_dot = target_select_wp_dot
+                        cur_wp = wp
+            else:
+                cur_wp = wp_choice[0]
+
+            interp_wps.append(cur_wp)
+            traveled_distance = self.get_distance(cur_wp, source_wp)
+
+        interp_wps.append(target_wp)
+
+        return interp_wps, traveled_distance
 
     def _get_waypoint_list_at_distance(self, waypoint, distance, ego_entry_exit_pairs):
         """
@@ -175,22 +217,22 @@ class AgentPrediction:
         Returns:
             list: List of waypoints at the specified distance.
         """
-        print(f'Getting waypoints at distance {distance} from {waypoint.transform.location}')
+        # print(f'Getting waypoints at distance {distance} from {waypoint.transform.location}')
         traveled_distance = 0.0
         plan = []
 
         cur_wp = waypoint
         while traveled_distance < distance:
-            print(f'traveled_distance: {traveled_distance}')
+            # print(f'traveled_distance: {traveled_distance}')
             wp_choice = cur_wp.next(self.config.sampling_resolution)
             if len(wp_choice) > 1:
-                print(f'Junction detected at waypoint {cur_wp.transform.location}')
+                # print(f'Junction detected at waypoint {cur_wp.transform.location}')
                 cur_wp = self._choose_at_junction(wp_choice, ego_entry_exit_pairs)
             else:
                 cur_wp = wp_choice[0]
 
             plan.append(cur_wp)
-            traveled_distance = cur_wp.transform.location.distance(waypoint.transform.location)
+            traveled_distance = self.get_distance(cur_wp, waypoint)
 
         return plan
 
@@ -231,16 +273,23 @@ class AgentPrediction:
 
             vehicle_plan = []
             vehicle_loc = vehicle.get_location()
+            cur_speed = np.sqrt(vehicle.get_velocity().x**2 + vehicle.get_velocity().y**2)
+            distance = cur_speed * self.config.prediction_horizon
+            print(f'vehicle: {vehicle.id}, pos: {vehicle_loc}, speed: {cur_speed}, prediction distance: {distance}')
+
+            # Locate the NPC vehicle waypoint in the map
+            vehicle_wp = self._world_map.get_waypoint(vehicle_loc)
+            if not vehicle_wp:
+                print(f'Could not find waypoint for vehicle {vehicle.id}')
+                continue
 
             # Try to get the next actions of the NPC vehicle from TrafficManager
             next_vehicle_actions = None
-            vehicle_wp = None
             try:
                 next_vehicle_actions = self._traffic_manager.get_all_actions(vehicle)
             except Exception as e:
                 print(f'Error getting next actions for vehicle {vehicle.id}: {e}')
                 print(f'Using current waypoint instead')
-                vehicle_wp = self._world_map.get_waypoint(vehicle_loc)
                 if not vehicle_wp:
                     print(f'Could not find waypoint for vehicle {vehicle.id}')
                     continue
@@ -251,26 +300,52 @@ class AgentPrediction:
                 # TODO: Implement scenario vehicle check
                 pass
 
+            # MAYBE TODO: Current prediction impl starts from next waypoint of the vehicle, instead of current waypoint
+            # Maybe better to predict from current waypoint, incorporating future actions
             elif len(next_vehicle_actions) > 1:
-                print(f'Multiple actions for vehicle {vehicle.id}')
+                # print(f'Multiple actions for vehicle {vehicle.id}')
                 next_vehicle_wps = [action[1] for action in next_vehicle_actions]
-                vehicle_plan.extend(next_vehicle_wps)
-                print(f'Preliminary plan for vehicle {vehicle.id}:')
-                for wp in vehicle_plan:
-                    print(f'    Location: {wp.transform.location}, Road ID: {wp.road_id}, Lane ID: {wp.lane_id}')
-                vehicle_wp = next_vehicle_wps[-1]
+                source_wp = vehicle_wp
+
+                for next_target_wp in next_vehicle_wps:
+                    next_target_wp_dist = self.get_distance(next_target_wp, source_wp)
+                    if next_target_wp_dist > self.config.sampling_resolution:
+                        # Interpolate waypoints between current and next waypoint
+                        interp_plan, traveled_dist = self._interpolate_between_waypoints(source_wp, next_target_wp)
+                        vehicle_plan.extend(interp_plan)
+                        distance -= traveled_dist
+                    else:
+                        vehicle_plan.append(next_target_wp)
+                        distance -= next_target_wp_dist
+
+                    source_wp = next_target_wp
+
+                # print(f'Preliminary plan for vehicle {vehicle.id}:')
+                # for wp in vehicle_plan:
+                #     print(f'    Location: {wp.transform.location}, Road ID: {wp.road_id}, Lane ID: {wp.lane_id}')
+                vehicle_wp = vehicle_plan[-1]
 
             else:
-                vehicle_wp = next_vehicle_actions[0][1]
+                next_target_wp = next_vehicle_actions[0][1]
+                next_target_wp_dist = self.get_distance(next_target_wp, vehicle_wp)
+                if next_target_wp_dist > self.config.sampling_resolution:
+                    # Interpolate waypoints between current and next waypoint
+                    interp_plan, traveled_dist = self._interpolate_between_waypoints(vehicle_wp, next_target_wp)
+                    vehicle_plan.extend(interp_plan)
+                    distance -= traveled_dist
+                else:
+                    vehicle_plan.append(next_target_wp)
+                    distance -= next_target_wp_dist
 
-            cur_speed = np.sqrt(vehicle.get_velocity().x**2 + vehicle.get_velocity().y**2)
-            distance = cur_speed * self.config.prediction_horizon
-            print(f'vehicle: {vehicle.id}, pos: {vehicle_loc}, speed: {cur_speed}, distance: {distance}')
-            vehicle_plan.extend(self._get_waypoint_list_at_distance(vehicle_wp, distance, ego_entry_exit_pairs))
+                vehicle_wp = vehicle_plan[-1]
 
-            print(f'Predicted path for vehicle {vehicle.id}:')
-            for wp in vehicle_plan:
-                print(f'    Location: {wp.transform.location}, Road ID: {wp.road_id}, Lane ID: {wp.lane_id}')
+            # Get waypoints at distance from the vehicle's current waypoint
+            if distance > 0:
+                vehicle_plan.extend(self._get_waypoint_list_at_distance(vehicle_wp, distance, ego_entry_exit_pairs))
+
+            # print(f'Predicted path for vehicle {vehicle.id}:')
+            # for wp in vehicle_plan:
+            #     print(f'    Location: {wp.transform.location}, Road ID: {wp.road_id}, Lane ID: {wp.lane_id}')
 
             if vehicle.id not in predicted_positions:
                 predicted_positions[vehicle.id] = []
@@ -290,6 +365,70 @@ class SceneDescriptor:
             config (object): The configuration object.
         """
         self.config = config
+
+    def _get_same_dir_lanes(self, waypoint):
+        """
+        Gets all the lanes with the same direction of the road of a wp.
+        Ordered from the edge lane to the center one (from outwards to inwards)
+        """
+        same_dir_wps = [waypoint]
+
+        # Check roads on the right
+        right_wp = waypoint
+        while True:
+            possible_right_wp = right_wp.get_right_lane()
+            if possible_right_wp is None or possible_right_wp.lane_type != carla.LaneType.Driving:
+                break
+            right_wp = possible_right_wp
+            same_dir_wps.append(right_wp)
+
+        # Check roads on the left
+        left_wp = waypoint
+        while True:
+            possible_left_wp = left_wp.get_left_lane()
+            if possible_left_wp is None or possible_left_wp.lane_type != carla.LaneType.Driving:
+                break
+            if possible_left_wp.lane_id * left_wp.lane_id < 0:
+                break
+            left_wp = possible_left_wp
+            same_dir_wps.insert(0, left_wp)
+
+        return same_dir_wps
+
+
+    def _get_opposite_dir_lanes(self, waypoint):
+        """
+        Gets all the lanes with opposite direction of the road of a wp
+        Ordered from the center lane to the edge one (from inwards to outwards)
+        """
+        other_dir_wps = []
+        other_dir_wp = None
+
+        # Get the first lane of the opposite direction
+        left_wp = waypoint
+        while True:
+            possible_left_wp = left_wp.get_left_lane()
+            if possible_left_wp is None:
+                break
+            if possible_left_wp.lane_id * left_wp.lane_id < 0:
+                other_dir_wp = possible_left_wp
+                break
+            left_wp = possible_left_wp
+
+        if not other_dir_wp:
+            return other_dir_wps
+
+        # Check roads on the right
+        right_wp = other_dir_wp
+        while True:
+            if right_wp.lane_type == carla.LaneType.Driving:
+                other_dir_wps.append(right_wp)
+            possible_right_wp = right_wp.get_right_lane()
+            if possible_right_wp is None:
+                break
+            right_wp = possible_right_wp
+
+        return other_dir_wps
 
     def get_traffic_data(self, traffic_context):
         """
@@ -363,7 +502,8 @@ class SceneDescriptor:
         ego_data = {
             "speed": ego_context["speed"],
             "orientation": ego_context["compass"],
-            "position": ego_context["gps"][:2].tolist()
+            "position": ego_context["gps"][:2].tolist(),
+            "route": ego_context["route"]
         }
         return ego_data
 
@@ -390,8 +530,8 @@ class SceneDescriptor:
               vehicle_position = np.array([vehicle.get_location().x, vehicle.get_location().y], dtype=np.float32)
               relative_position_veh_wrt_ego = t_u.inverse_conversion_2d(vehicle_position, ego_data["position"], -ego_data["orientation"]).tolist()
 
-              print(f"Vehicle Position: {vehicle.get_location().x}, {vehicle.get_location().y}")
-              print(f"Relative Vehicle Position Ego Frame: {relative_position_veh_wrt_ego}")
+            #   print(f"Vehicle Position: {vehicle.get_location().x}, {vehicle.get_location().y}")
+            #   print(f"Relative Vehicle Position Ego Frame: {relative_position_veh_wrt_ego}")
 
               relative_distance = np.linalg.norm(relative_position_veh_wrt_ego)
 
@@ -406,6 +546,101 @@ class SceneDescriptor:
               }
               npc_vehicle_data.append(vehicle_data)
             return npc_vehicle_data
+
+        # ego_wp = ego_data['route'][0]
+        # predicted_paths = agent_context['predicted_paths']
+
+        # # Get the lanes in the same direction and opposite direction as the ego vehicle
+        # same_lanes = self._get_same_dir_lanes(ego_wp)
+        # opposite_lanes = self._get_opposite_dir_lanes(ego_wp)
+        # # TODO: Get the leading and trailing vehicles in the same and opposite lanes
+        # # TODO: Identify the cross lanes and get the leading and trailing vehicles in the cross lanes
+
+        # same_lane_vehicles = {}
+        # opposite_lane_vehicles = {}
+
+        # ego_lane_id = ego_wp.lane_id
+        # print(f'Ego Lane ID: {ego_lane_id}, Road ID: {ego_wp.road_id}')
+
+        # for vehicle_id, predicted_path in predicted_paths.items():
+        #     if not predicted_path:
+        #         continue
+
+        #     vehicle_wp = predicted_path[0]
+        #     print(f'Vehicle ID: {vehicle_id}, Lane ID: {vehicle_wp.lane_id}, Road ID: {vehicle_wp.road_id}')
+        #     for same_lane_wp, opposite_lane_wp in zip(same_lanes, opposite_lanes):
+
+        #         print(f'Same Lane ID: {same_lane_wp.lane_id}, Road ID: {same_lane_wp.road_id}')
+        #         print(f'Opposite Lane ID: {opposite_lane_wp.lane_id}, Road ID: {opposite_lane_wp.road_id}')
+
+        #         # TODO: Issue with road ID not matching vehicle road ID, need to check
+        #         # Could do a road connection check similar to the one in is_connected_edge
+        #         if vehicle_wp.lane_id == same_lane_wp.lane_id:
+        #             if vehicle_wp.lane_id not in same_lane_vehicles:
+        #                 same_lane_vehicles[vehicle_wp.lane_id] = []
+        #             same_lane_vehicles[vehicle_wp.lane_id].append(vehicle_id)
+
+        #         elif vehicle_wp.lane_id == opposite_lane_wp.lane_id:
+        #             if vehicle_wp.lane_id not in opposite_lane_vehicles:
+        #                 opposite_lane_vehicles[vehicle_wp.lane_id] = []
+        #             opposite_lane_vehicles[vehicle_wp.lane_id].append(vehicle_id)
+
+        # agent_data = {
+        #     "Ongoing Lanes": {},
+        #     "Oncoming Traffic": {},
+        #     "Cross Traffic": {}
+        # }
+
+        # print(f'Same Lane Vehicles: {same_lane_vehicles}')
+        # print(f'Opposite Lane Vehicles: {opposite_lane_vehicles}')
+
+        # leading_vehicles = agent_context["leading_vehicles"]
+        # trailing_vehicles = agent_context["trailing_vehicles"]
+
+        # same_lane_center = same_lanes[0].lane_id
+        # same_lane_edge = same_lanes[-1].lane_id
+
+        # for i in range(same_lane_center, same_lane_edge + 1):
+        #     lane_vehicles = same_lane_vehicles.get(i, [])
+        #     print(f'Lane Vehicles: {lane_vehicles} in lane {i}')
+
+        #     # Debug prints
+        #     print("Leading vehicle IDs:", [vehicle.id for vehicle in leading_vehicles])
+        #     print("Trailing vehicle IDs:", [vehicle.id for vehicle in trailing_vehicles])
+
+        #     leading_vehicles_in_lane = [vehicle for vehicle in leading_vehicles if vehicle.id in lane_vehicles]
+        #     trailing_vehicles_in_lane = [vehicle for vehicle in trailing_vehicles if vehicle.id in lane_vehicles]
+
+        #     print(f'Leading Vehicles in Lane {i}: {leading_vehicles_in_lane}')
+        #     print(f'Trailing Vehicles in Lane {i}: {trailing_vehicles_in_lane}')
+        #     if i == ego_lane_id:
+        #         agent_data["Ongoing Lanes"]["Ego"] = {
+        #             "leading_vehicles": __get_npc_vehicle_data(leading_vehicles_in_lane),
+        #             "trailing_vehicles": __get_npc_vehicle_data(trailing_vehicles_in_lane),
+        #         }
+        #     else:
+        #         offset = i - ego_lane_id
+        #         key = f"Left-{abs(offset)}" if offset > 0 else f"Right-{abs(offset)}"
+        #         agent_data["Ongoing Lanes"][key] = {
+        #             "leading_vehicles": __get_npc_vehicle_data(leading_vehicles_in_lane),
+        #             "trailing_vehicles": __get_npc_vehicle_data(trailing_vehicles_in_lane),
+        #         }
+
+        # if opposite_lanes:
+        #     opposite_lane_center = opposite_lanes[0].lane_id
+        #     opposite_lane_edge = opposite_lanes[-1].lane_id
+
+        #     for i in range(opposite_lane_center, opposite_lane_edge + 1):
+        #         lane_vehicles = opposite_lane_vehicles.get(i, [])
+        #         leading_vehicles_in_lane = [vehicle for vehicle in leading_vehicles if vehicle.id in lane_vehicles]
+        #         trailing_vehicles_in_lane = [vehicle for vehicle in trailing_vehicles if vehicle.id in lane_vehicles]
+
+        #         offset = i - ego_lane_id
+        #         key = f"Left-{abs(offset)}" if offset > 0 else f"Right-{abs(offset)}"
+        #         agent_data["Oncoming Traffic"][key] = {
+        #             "leading_vehicles": __get_npc_vehicle_data(leading_vehicles_in_lane),
+        #             "trailing_vehicles": __get_npc_vehicle_data(trailing_vehicles_in_lane),
+        #         }
 
         agent_data = {
             "leading_vehicles": __get_npc_vehicle_data(agent_context["leading_vehicles"]),
@@ -474,18 +709,42 @@ class SceneDescriptor:
       formatted_string += f"    Position: {ego_data.get('position', 'N/A')}\n"
 
       formatted_string += "Agent Data:\n"
-      formatted_string += "    Leading Vehicles:\n"
-      if agent_data['leading_vehicles']:
-        for vehicle in agent_data['leading_vehicles']:
-          formatted_string += f"        Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-      else:
-        formatted_string += "        No data available\n"
-      formatted_string += "    Trailing Vehicles:\n"
-      if agent_data['trailing_vehicles']:
-        for vehicle in agent_data['trailing_vehicles']:
-          formatted_string += f"        Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-      else:
-        formatted_string += "        No data available\n"
+    #   formatted_string += "    Ongoing Lanes:\n"
+    #   for lane, vehicles in agent_data["Ongoing Lanes"].items():
+    #     formatted_string += f"        {lane}:\n"
+    #     formatted_string += "            Leading Vehicles:\n"
+    #     if vehicles["leading_vehicles"]:
+    #         for vehicle in vehicles["leading_vehicles"]:
+    #             formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
+    #     else:
+    #         formatted_string += "                No data available\n"
+
+    #     formatted_string += "            Trailing Vehicles:\n"
+    #     if vehicles["trailing_vehicles"]:
+    #         for vehicle in vehicles["trailing_vehicles"]:
+    #             formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
+    #     else:
+    #         formatted_string += "                No data available\n"
+
+    #   formatted_string += "    Oncoming Traffic:\n"
+    #   for lane, vehicles in agent_data["Oncoming Traffic"].items():
+    #     formatted_string += f"        {lane}:\n"
+    #     formatted_string += "            Leading Vehicles:\n"
+    #     for vehicle in vehicles["leading_vehicles"]:
+    #         formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
+    #     formatted_string += "            Trailing Vehicles:\n"
+    #     for vehicle in vehicles["trailing_vehicles"]:
+    #         formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
+
+    #   formatted_string += "    Cross Traffic:\n"
+    #   for lane, vehicles in agent_data["Cross Traffic"].items():
+    #     formatted_string += f"        {lane}:\n"
+    #     formatted_string += "            Leading Vehicles:\n"
+    #     for vehicle in vehicles["leading_vehicles"]:
+    #         formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
+    #     formatted_string += "            Trailing Vehicles:\n"
+    #     for vehicle in vehicles["trailing_vehicles"]:
+    #         formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
 
       return formatted_string
 

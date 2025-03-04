@@ -447,30 +447,12 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     leading_vehicles = [vehicle for vehicle in vehicles if vehicle.id in leading_vehicle_ids]
     trailing_vehicles = [vehicle for vehicle in vehicles if vehicle.id in trailing_vehicle_ids]
 
-    traffic_context = {
-        "next_traffic_light": next_traffic_light,
-        "distance_to_next_traffic_light": distance_to_next_traffic_light,
-        "next_stop_sign": next_stop_sign,
-        "distance_to_next_stop_sign": distance_to_next_stop_sign,
-        "speed_limit": speed_limit
-    }
-
     ego_context = {
         "speed": tick_data["speed"],
         "compass": tick_data["compass"],
         "gps": tick_data["gps"],
         "route": route_wp[self._waypoint_planner.route_index:],
     }
-
-    agent_context = {
-        "leading_vehicles": leading_vehicles,
-        "trailing_vehicles": trailing_vehicles
-    }
-
-    structured_data = self.scene_descriptor.get_structured_data(traffic_context, ego_context, agent_context)
-    # print(f"Structured Data: {structured_data}")
-    formatted_data = self.scene_descriptor.to_formatted_string(structured_data)
-    print(f"Structured Data: {formatted_data}")
 
     predicted_paths = self.agent_prediction.run_step(ego_context, vehicles)
     # if self.visualize == 1:
@@ -482,6 +464,25 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
                                       size=0.1,
                                       color=self.config.other_vehicles_forecasted_bbs_color,
                                       life_time=self.config.draw_life_time)
+
+    traffic_context = {
+        "next_traffic_light": next_traffic_light,
+        "distance_to_next_traffic_light": distance_to_next_traffic_light,
+        "next_stop_sign": next_stop_sign,
+        "distance_to_next_stop_sign": distance_to_next_stop_sign,
+        "speed_limit": speed_limit
+    }
+
+    agent_context = {
+        "leading_vehicles": leading_vehicles,
+        "trailing_vehicles": trailing_vehicles,
+        "predicted_paths": predicted_paths,
+    }
+
+    structured_data = self.scene_descriptor.get_structured_data(traffic_context, ego_context, agent_context)
+    # print(f"Structured Data: {structured_data}")
+    formatted_data = self.scene_descriptor.to_formatted_string(structured_data)
+    print(f"Structured Data: {formatted_data}")
     # NEW CODE
 
     # Manage route obstacle scenarios and adjust target speed
