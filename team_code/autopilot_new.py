@@ -439,22 +439,39 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     vehicles = list(actors.filter("*vehicle*"))
 
     # NEW CODE
+    npc_vehicles = [vehicle for vehicle in vehicles if vehicle.id != self._vehicle.id]
+    print(f'Printing All Vehicle IDs')
+    for vehicle in npc_vehicles:
+      vehicle_id = vehicle.id
+      print(f"\tVehicle ID: {vehicle_id}")
+      # Draw vehicle ID as debug information
+      vehicle_location = vehicle.get_location()
+      self._world.debug.draw_string(vehicle_location, str(vehicle_id), draw_shadow=False,
+                                    color=carla.Color(r=255, g=0, b=0), life_time=self.config.draw_life_time,
+                                    persistent_lines=True)
+    print(f'\n')
 
-    # Get ids of leading and trailing vehicles
-    leading_vehicle_ids = self._waypoint_planner.compute_leading_vehicles(vehicles, self._vehicle.id)
-    trailing_vehicle_ids = self._waypoint_planner.compute_trailing_vehicles(vehicles, self._vehicle.id)
+    # Get leading and trailing vehicles for ongoing and oncoming traffic
+    ongoing_leading_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "ongoing")
+    ongoing_trailing_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "ongoing")
 
-    leading_vehicles = [vehicle for vehicle in vehicles if vehicle.id in leading_vehicle_ids]
-    trailing_vehicles = [vehicle for vehicle in vehicles if vehicle.id in trailing_vehicle_ids]
+    oncoming_leading_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "oncoming")
+    oncoming_trailing_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "oncoming")
+
+    print(f'Ongoing Leading Vehicles: {ongoing_leading_vehicles}')
+    print(f'Ongoing Trailing Vehicles: {ongoing_trailing_vehicles}')
+    print(f'Oncoming Leading Vehicles: {oncoming_leading_vehicles}')
+    print(f'Oncoming Trailing Vehicles: {oncoming_trailing_vehicles}')
 
     ego_context = {
         "speed": tick_data["speed"],
         "compass": tick_data["compass"],
         "gps": tick_data["gps"],
-        "route": route_wp[self._waypoint_planner.route_index:],
+        "route": route_wp,
+        "waypoint": self.world_map.get_waypoint(self._vehicle.get_location())
     }
 
-    predicted_paths = self.agent_prediction.run_step(ego_context, vehicles)
+    predicted_paths = self.agent_prediction.run_step(ego_context, npc_vehicles)
     # if self.visualize == 1:
     for vehicle_id, predicted_path in predicted_paths.items():
       for predicted_wp in predicted_path:
@@ -474,8 +491,10 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     }
 
     agent_context = {
-        "leading_vehicles": leading_vehicles,
-        "trailing_vehicles": trailing_vehicles,
+        "ongoing_leading_vehicles": ongoing_leading_vehicles,
+        "ongoing_trailing_vehicles": ongoing_trailing_vehicles,
+        "oncoming_leading_vehicles": oncoming_leading_vehicles,
+        "oncoming_trailing_vehicles": oncoming_trailing_vehicles,
         "predicted_paths": predicted_paths,
     }
 

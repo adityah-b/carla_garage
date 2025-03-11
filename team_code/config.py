@@ -325,6 +325,19 @@ class GlobalConfig:
     self.leading_vehicles_max_route_distance = 2.5
     # Max angle difference for detecting leading vehicles  in meters.
     self.leading_vehicles_max_route_angle_distance = 35.
+
+    # NEW CODE
+    # Max angle difference for detecting leading vehicles in ongoing direction in degrees.
+    self.leading_vehicles_max_route_angle_ongoing = 35
+    self.trailing_vehicles_max_route_angle_ongoing = 35
+
+    # Max angle difference for detecting leading vehicles in oncoming direction in degrees.
+    self.leading_vehicles_max_route_angle_oncoming = 145
+    self.trailing_vehicles_max_route_angle_oncoming = 145
+
+    # NEW CODE
+
+
     # Max radius for detecting any leading vehicles in meters.
     self.leading_vehicles_maximum_detection_radius = 80 * self.points_per_meter
     # Max distance on route for detecting trailing vehicles.
