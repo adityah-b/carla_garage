@@ -858,7 +858,7 @@ class PrivilegedRoutePlanner(object):
         same_lanes = self.get_same_dir_lanes(ego_wp)
         opposite_lanes = self.get_opposite_dir_lanes(ego_wp)
 
-        max_distance = self.config.leading_vehicles_maximum_detection_radius
+        leading_max_detection_radius = self.config.leading_vehicles_maximum_detection_radius
 
         # Get NPC waypoints for lane filtering
         vehicle_waypoints = [carla_map.get_waypoint(vehicle.get_location()) for vehicle in npc_vehicles]
@@ -870,15 +870,23 @@ class PrivilegedRoutePlanner(object):
         elif traffic_type == "oncoming":
             target_lanes = opposite_lanes
 
-        target_lane_id_set = {wp.lane_id for wp in target_lanes}
+        target_lane_road_ids = {(wp.lane_id, wp.road_id) for wp in target_lanes}
         valid_npc_vehicles = [
-            (npc_vehicles[i], wp.lane_id) for i, wp in enumerate(vehicle_waypoints)
-            if wp.lane_id in target_lane_id_set and wp.road_id == ego_wp.road_id
+            (npc_vehicles[i], wp.lane_id)
+            for i, wp in enumerate(vehicle_waypoints)
+            if (wp.lane_id, wp.road_id) in target_lane_road_ids
         ]
 
         # Check if there are valid NPC vehicles
         if not valid_npc_vehicles:
+            print(f"No valid NPC vehicles found for {traffic_type} traffic.")
             return {}
+
+        min_lane_id = min(valid_npc_vehicles, key=lambda x: x[1])[1]
+        max_lane_id = max(valid_npc_vehicles, key=lambda x: x[1])[1]
+
+        for vehicle, lane_id in valid_npc_vehicles:
+            print(f"Vehicle {vehicle.id} is in lane {lane_id}")
 
         # Get the IDs, locations, and yaw angles of all NPC vehicles
         vehicle_ids = np.array([vehicle.id for vehicle, _ in valid_npc_vehicles])
@@ -888,7 +896,7 @@ class PrivilegedRoutePlanner(object):
         # Compute relative distances each NPC vehicle with the ego's route points
         # Returns a 3D array with shape (num_vehicles, num_route_points, 2)
         relative_positions = vehicle_locations[:, np.newaxis, :2] - \
-          self.route_points[np.newaxis, self.route_index:self.route_index + max_distance, :2][:, ::self.config.points_per_meter, :]
+          self.route_points[np.newaxis, self.route_index:self.route_index + leading_max_detection_radius, :2][:, ::self.config.points_per_meter, :]
 
         # Compute the relative distances
         # Returns a 2D array with shape (num_vehicles, num_route_points)
@@ -901,13 +909,14 @@ class PrivilegedRoutePlanner(object):
         min_distances = relative_distances[np.arange(len(route_indices)), route_indices]
 
         # Get the yaw angles of the route points
-        rotation_angles = self.rotation_angles[self.route_index:self.route_index + max_distance][::self.points_per_meter]
+        rotation_angles = self.rotation_angles[self.route_index:self.route_index + leading_max_detection_radius][::self.points_per_meter]
         route_yaws = rotation_angles[route_indices]
         yaw_differences = (route_yaws - vehicle_yaws) % 360
         yaw_differences = np.minimum(yaw_differences, 360 - yaw_differences)
 
         # Define the maximum distance and yaw difference thresholds
-        max_distance = self.leading_vehicles_max_route_distance
+        max_lane_offset = max(abs(min_lane_id - ego_wp.lane_id), abs(max_lane_id - ego_wp.lane_id))
+        max_distance = self.leading_vehicles_max_route_distance * (1 + max_lane_offset)
 
         # Filter leading vehicles based on traffic type
         yaw_indices = []
@@ -915,6 +924,8 @@ class PrivilegedRoutePlanner(object):
             max_yaw_difference = self.config.leading_vehicles_max_route_angle_ongoing
             yaw_indices = np.where(yaw_differences < max_yaw_difference)[0]
         elif traffic_type == "oncoming":
+            print(f'Yaw differences: {yaw_differences}, Max yaw difference: {self.config.leading_vehicles_max_route_angle_oncoming}')
+            print(f'Distance: {min_distances}, Max distance: {max_distance}')
             max_yaw_difference = self.config.leading_vehicles_max_route_angle_oncoming
 
             vehicle_fwd_vecs = np.array([
@@ -937,11 +948,11 @@ class PrivilegedRoutePlanner(object):
 
         # Group leading vehicles by their target lane ids
         leading_vehicle_groups = {}
-        for target_lane_id in target_lane_id_set:
-            leading_vehicle_groups[target_lane_id] = []
+        for target_lane_wp in target_lanes:
+            leading_vehicle_groups[target_lane_wp.lane_id] = []
             for vehicle, lane_id in valid_npc_vehicles:
-                if vehicle.id in leading_vehicle_ids and lane_id == target_lane_id:
-                    leading_vehicle_groups[target_lane_id].append(vehicle)
+                if vehicle.id in leading_vehicle_ids and lane_id == target_lane_wp.lane_id:
+                    leading_vehicle_groups[target_lane_wp.lane_id].append(vehicle)
 
         return leading_vehicle_groups
     else:
@@ -967,7 +978,7 @@ class PrivilegedRoutePlanner(object):
         same_lanes = self.get_same_dir_lanes(ego_wp)
         opposite_lanes = self.get_opposite_dir_lanes(ego_wp)
 
-        max_distance_trailing_vehicles = self.tailing_vehicles_maximum_detection_radius
+        trailing_max_detection_radius = self.tailing_vehicles_maximum_detection_radius
 
         # Get NPC waypoints for lane filtering
         vehicle_waypoints = [carla_map.get_waypoint(vehicle.get_location()) for vehicle in npc_vehicles]
@@ -979,15 +990,19 @@ class PrivilegedRoutePlanner(object):
         elif traffic_type == "oncoming":
             target_lanes = opposite_lanes
 
-        target_lane_id_set = {wp.lane_id for wp in target_lanes}
+        target_lane_road_ids = {(wp.lane_id, wp.road_id) for wp in target_lanes}
         valid_npc_vehicles = [
-            (npc_vehicles[i], wp.lane_id) for i, wp in enumerate(vehicle_waypoints)
-            if wp.lane_id in target_lane_id_set and wp.road_id == ego_wp.road_id
+            (npc_vehicles[i], wp.lane_id)
+            for i, wp in enumerate(vehicle_waypoints)
+            if (wp.lane_id, wp.road_id) in target_lane_road_ids
         ]
 
         # Check if there are valid NPC vehicles
         if not valid_npc_vehicles:
             return {}
+
+        min_lane_id = min(valid_npc_vehicles, key=lambda x: x[1])[1]
+        max_lane_id = max(valid_npc_vehicles, key=lambda x: x[1])[1]
 
         # Get the IDs, locations, and yaw angles of all NPC vehicles
         vehicle_ids = np.array([vehicle.id for vehicle, _ in valid_npc_vehicles])
@@ -996,7 +1011,7 @@ class PrivilegedRoutePlanner(object):
 
         # Compute relative distances each NPC vehicle with the ego's route points
         # Returns a 3D array with shape (num_vehicles, num_route_points, 2)
-        from_idx = max(0, self.route_index - max_distance_trailing_vehicles)
+        from_idx = max(0, self.route_index - trailing_max_detection_radius)
         relative_positions = vehicle_locations[:, np.newaxis, :2] - \
           self.route_points[np.newaxis, from_idx:self.route_index, :2][:, ::self.points_per_meter, :]
 
@@ -1017,7 +1032,8 @@ class PrivilegedRoutePlanner(object):
         yaw_differences = np.minimum(yaw_differences, 360 - yaw_differences)
 
         # Define the maximum distance and yaw difference thresholds
-        max_distance = self.config.trailing_vehicles_max_route_distance
+        max_lane_offset = max(abs(min_lane_id - ego_wp.lane_id), abs(max_lane_id - ego_wp.lane_id))
+        max_distance = self.config.trailing_vehicles_max_route_distance * (1 + max_lane_offset)
 
         # Filter trailing vehicles based on traffic type
         yaw_indices = []
@@ -1047,11 +1063,11 @@ class PrivilegedRoutePlanner(object):
 
         # Group trailing vehicles by their target lane ids
         trailing_vehicle_groups = {}
-        for target_lane_id in target_lane_id_set:
-            trailing_vehicle_groups[target_lane_id] = []
+        for target_lane_wp in target_lanes:
+            trailing_vehicle_groups[target_lane_wp.lane_id] = []
             for vehicle, lane_id in valid_npc_vehicles:
-                if vehicle.id in trailing_vehicle_ids and lane_id == target_lane_id:
-                    trailing_vehicle_groups[target_lane_id].append(vehicle)
+                if vehicle.id in trailing_vehicle_ids and lane_id == target_lane_wp.lane_id:
+                    trailing_vehicle_groups[target_lane_wp.lane_id].append(vehicle)
 
         return trailing_vehicle_groups
     else:

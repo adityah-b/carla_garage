@@ -399,8 +399,8 @@ class SceneDescriptor:
             relative_pos = np.round(relative_pos, 2)
             # vehicle_speed = self._get_forward_speed(transform=vehicle_transform, velocity=vehicle_velocity)
 
-            print(f"Vehicle Position: {vehicle.get_location().x}, {vehicle.get_location().y}")
-            print(f"Relative Vehicle Position Ego Frame: {relative_pos}")
+            # print(f"Vehicle Position: {vehicle.get_location().x}, {vehicle.get_location().y}")
+            # print(f"Relative Vehicle Position Ego Frame: {relative_pos}")
 
             relative_distance = np.linalg.norm(relative_pos)
             relative_distance = np.round(relative_distance, 2)
@@ -451,17 +451,15 @@ class SceneDescriptor:
         for lane_id, lane_vehicles in ongoing_leading_vehicles.items():
             print(f'Vehicles in lane {lane_id}: {lane_vehicles}')
             if lane_id == ego_lane_id:
-                grouped_npc_vehicles["Ongoing Traffic"]["Ego"] = {
-                    "leading_vehicles": self._get_npc_vehicle_data(ego_context, lane_vehicles),
-                    "trailing_vehicles": self._get_npc_vehicle_data(ego_context, ongoing_trailing_vehicles[lane_id]),
-                }
+                key = "Ego"
             else:
                 offset = lane_id - ego_lane_id
                 key = f"Left-{abs(offset)}" if offset > 0 else f"Right-{abs(offset)}"
-                grouped_npc_vehicles["Ongoing Traffic"][key] = {
-                    "leading_vehicles": self._get_npc_vehicle_data(ego_context, lane_vehicles),
-                    "trailing_vehicles": self._get_npc_vehicle_data(ego_context, ongoing_trailing_vehicles[lane_id]),
-                }
+
+            grouped_npc_vehicles["Ongoing Traffic"][key] = {
+                "leading_vehicles": self._get_npc_vehicle_data(ego_context, lane_vehicles),
+                "trailing_vehicles": self._get_npc_vehicle_data(ego_context, ongoing_trailing_vehicles[lane_id]),
+            }
 
         for lane_id, lane_vehicles in oncoming_leading_vehicles.items():
             print(f'Vehicles in lane {lane_id}: {lane_vehicles}')

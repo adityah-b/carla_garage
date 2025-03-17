@@ -453,10 +453,10 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     # Get leading and trailing vehicles for ongoing and oncoming traffic
     ongoing_leading_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "ongoing")
-    ongoing_trailing_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "ongoing")
+    ongoing_trailing_vehicles = self._waypoint_planner.get_trailing_vehicles(self.world_map, npc_vehicles, "ongoing")
 
     oncoming_leading_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "oncoming")
-    oncoming_trailing_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "oncoming")
+    oncoming_trailing_vehicles = self._waypoint_planner.get_trailing_vehicles(self.world_map, npc_vehicles, "oncoming")
 
     print(f'Ongoing Leading Vehicles: {ongoing_leading_vehicles}')
     print(f'Ongoing Trailing Vehicles: {ongoing_trailing_vehicles}')
@@ -471,16 +471,16 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         "waypoint": self.world_map.get_waypoint(self._vehicle.get_location())
     }
 
-    predicted_paths = self.agent_prediction.run_step(ego_context, npc_vehicles)
-    # if self.visualize == 1:
-    for vehicle_id, predicted_path in predicted_paths.items():
-      for predicted_wp in predicted_path:
-        predicted_loc = predicted_wp.transform.location
-        predicted_loc = carla.Location(predicted_loc.x, predicted_loc.y, predicted_loc.z + 0.1)
-        self._world.debug.draw_point(location=predicted_loc,
-                                      size=0.1,
-                                      color=self.config.other_vehicles_forecasted_bbs_color,
-                                      life_time=self.config.draw_life_time)
+    # predicted_paths = self.agent_prediction.run_step(ego_context, npc_vehicles)
+    # # if self.visualize == 1:
+    # for vehicle_id, predicted_path in predicted_paths.items():
+    #   for predicted_wp in predicted_path:
+    #     predicted_loc = predicted_wp.transform.location
+    #     predicted_loc = carla.Location(predicted_loc.x, predicted_loc.y, predicted_loc.z + 0.1)
+    #     self._world.debug.draw_point(location=predicted_loc,
+    #                                   size=0.1,
+    #                                   color=self.config.other_vehicles_forecasted_bbs_color,
+    #                                   life_time=self.config.draw_life_time)
 
     traffic_context = {
         "next_traffic_light": next_traffic_light,
@@ -495,7 +495,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         "ongoing_trailing_vehicles": ongoing_trailing_vehicles,
         "oncoming_leading_vehicles": oncoming_leading_vehicles,
         "oncoming_trailing_vehicles": oncoming_trailing_vehicles,
-        "predicted_paths": predicted_paths,
+        # "predicted_paths": predicted_paths,
     }
 
     structured_data = self.scene_descriptor.get_structured_data(traffic_context, ego_context, agent_context)
