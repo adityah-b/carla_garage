@@ -35,6 +35,9 @@ from srunner.scenariomanager.actorcontrols.visualizer import Visualizer
 import cv2
 
 from agent_utils import AgentPrediction, SceneDescriptor
+from scene_interpreter import SceneInterpreter
+from trajectory_planner import TrajectoryPlanner
+
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
 
@@ -115,6 +118,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self.traffic_manager = traffic_manager
     self.scene_descriptor = SceneDescriptor(self.config)
     self.agent_prediction = AgentPrediction(self.config)
+    self.scene_interpreter = SceneInterpreter(self.config.system_prompt)
+    self.trajectory_planner = TrajectoryPlanner(self.config)
     # New Code
 
     self.augmentation_translation = 0
@@ -440,16 +445,16 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     # NEW CODE
     npc_vehicles = [vehicle for vehicle in vehicles if vehicle.id != self._vehicle.id]
-    print(f'Printing All Vehicle IDs')
+    # print(f'Printing All Vehicle IDs')
     for vehicle in npc_vehicles:
       vehicle_id = vehicle.id
-      print(f"\tVehicle ID: {vehicle_id}")
+      # print(f"\tVehicle ID: {vehicle_id}")
       # Draw vehicle ID as debug information
       vehicle_location = vehicle.get_location()
       self._world.debug.draw_string(vehicle_location, str(vehicle_id), draw_shadow=False,
                                     color=carla.Color(r=255, g=0, b=0), life_time=self.config.draw_life_time,
                                     persistent_lines=True)
-    print(f'\n')
+    # print(f'\n')
 
     # Get leading and trailing vehicles for ongoing and oncoming traffic
     ongoing_leading_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "ongoing")
@@ -458,17 +463,18 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     oncoming_leading_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "oncoming")
     oncoming_trailing_vehicles = self._waypoint_planner.get_trailing_vehicles(self.world_map, npc_vehicles, "oncoming")
 
-    print(f'Ongoing Leading Vehicles: {ongoing_leading_vehicles}')
-    print(f'Ongoing Trailing Vehicles: {ongoing_trailing_vehicles}')
-    print(f'Oncoming Leading Vehicles: {oncoming_leading_vehicles}')
-    print(f'Oncoming Trailing Vehicles: {oncoming_trailing_vehicles}')
+    # print(f'Ongoing Leading Vehicles: {ongoing_leading_vehicles}')
+    # print(f'Ongoing Trailing Vehicles: {ongoing_trailing_vehicles}')
+    # print(f'Oncoming Leading Vehicles: {oncoming_leading_vehicles}')
+    # print(f'Oncoming Trailing Vehicles: {oncoming_trailing_vehicles}')
 
     ego_context = {
         "speed": tick_data["speed"],
         "compass": tick_data["compass"],
         "gps": tick_data["gps"],
         "route": route_wp,
-        "waypoint": self.world_map.get_waypoint(self._vehicle.get_location())
+        "waypoint": self.world_map.get_waypoint(self._vehicle.get_location()),
+        "location": self._vehicle.get_location(),
     }
 
     # predicted_paths = self.agent_prediction.run_step(ego_context, npc_vehicles)
@@ -491,6 +497,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     }
 
     agent_context = {
+        "npc_vehicles": npc_vehicles,
         "ongoing_leading_vehicles": ongoing_leading_vehicles,
         "ongoing_trailing_vehicles": ongoing_trailing_vehicles,
         "oncoming_leading_vehicles": oncoming_leading_vehicles,
@@ -501,22 +508,56 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     structured_data = self.scene_descriptor.get_structured_data(traffic_context, ego_context, agent_context)
     # print(f"Structured Data: {structured_data}")
     formatted_data = self.scene_descriptor.to_formatted_string(structured_data)
-    print(f"Structured Data: {formatted_data}")
+    # print(f"Structured Data: {formatted_data}")
+
+    bev_semantics = self.ss_bev_manager.get_observation(self.close_traffic_lights)
+    rgb = input_data['rgb'][1][:, :, :3]
+    bev_img = bev_semantics['rendered'] # debug_challenge=1 otherwise crashes
+
+    bev_img = cv2.cvtColor(bev_img, cv2.COLOR_BGR2RGB)
+    rendered = cv2.resize(bev_img, dsize=(rgb.shape[1], rgb.shape[1]), interpolation=cv2.INTER_LINEAR)
+
+    # Execute at 1Hz
+    high_level_cmd = None
+    if self.step % int(self.config.carla_fps) == 0:
+      print(f"Structured Data: {formatted_data}")
+      high_level_cmd = self.scene_interpreter.run_step(formatted_data, rendered)
+
+    # Translate the high-level command to low-level commands
+    brake = False
+    if high_level_cmd:
+      self.trajectory_planner.update_state(agent_context, traffic_context, ego_context)
+      llm_target_speed = self.trajectory_planner.run_command(high_level_cmd)
+      self.prev_cmd = high_level_cmd
+
+    else:
+      llm_target_speed = self.trajectory_planner.run_command(self.prev_cmd)
+
+    # if llm_target_speed < 0.1:
+    #     brake = True
+
+    print(f"LLM Target Speed: {self.trajectory_planner.target_speed}")
     # NEW CODE
 
     # Manage route obstacle scenarios and adjust target speed
     target_speed_route_obstacle, keep_driving, speed_reduced_by_obj = self._manage_route_obstacle_scenarios(
         target_speed, ego_speed, route_wp, vehicles, route_np)
 
+    print(f'Target Speed Route Obstacle: {target_speed_route_obstacle}')
     # In case the agent overtakes an obstacle, keep driving in case the opposite lane is free instead of using idm
     # and the kinematic bicycle model forecasts
     if keep_driving:
       brake, target_speed = False, target_speed_route_obstacle
     else:
-      brake, target_speed, speed_reduced_by_obj = self.get_brake_and_target_speed(
+      # brake, target_speed, speed_reduced_by_obj = self.get_brake_and_target_speed(
+      #     plant, route_np, distance_to_next_traffic_light, next_traffic_light, distance_to_next_stop_sign,
+      #     next_stop_sign, vehicles, actors, target_speed, speed_reduced_by_obj)
+      _, target_speed, speed_reduced_by_obj = self.get_brake_and_target_speed(
           plant, route_np, distance_to_next_traffic_light, next_traffic_light, distance_to_next_stop_sign,
           next_stop_sign, vehicles, actors, target_speed, speed_reduced_by_obj)
 
+    print(f'Speed Reduced by Object: {speed_reduced_by_obj}')
+    print(f'IDM Target Speed: {target_speed}')
     target_speed = min(target_speed, target_speed_route_obstacle)
 
     # Determine if the ego vehicle is at a junction
@@ -524,7 +565,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self.junction = ego_vehicle_waypoint.is_junction
 
     # Compute throttle and brake control
-    throttle, control_brake = self._longitudinal_controller.get_throttle_and_brake(brake, target_speed, ego_speed)
+    # throttle, control_brake = self._longitudinal_controller.get_throttle_and_brake(brake, target_speed, ego_speed)
+    throttle, control_brake = self._longitudinal_controller.get_throttle_and_brake(brake, self.trajectory_planner.target_speed, ego_speed)
 
     # Compute steering control
     steer = self._get_steer(route_np, ego_position, tick_data["compass"], ego_speed)

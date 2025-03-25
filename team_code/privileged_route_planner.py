@@ -885,8 +885,8 @@ class PrivilegedRoutePlanner(object):
         min_lane_id = min(valid_npc_vehicles, key=lambda x: x[1])[1]
         max_lane_id = max(valid_npc_vehicles, key=lambda x: x[1])[1]
 
-        for vehicle, lane_id in valid_npc_vehicles:
-            print(f"Vehicle {vehicle.id} is in lane {lane_id}")
+        # for vehicle, lane_id in valid_npc_vehicles:
+        #     print(f"Vehicle {vehicle.id} is in lane {lane_id}")
 
         # Get the IDs, locations, and yaw angles of all NPC vehicles
         vehicle_ids = np.array([vehicle.id for vehicle, _ in valid_npc_vehicles])
@@ -924,8 +924,8 @@ class PrivilegedRoutePlanner(object):
             max_yaw_difference = self.config.leading_vehicles_max_route_angle_ongoing
             yaw_indices = np.where(yaw_differences < max_yaw_difference)[0]
         elif traffic_type == "oncoming":
-            print(f'Yaw differences: {yaw_differences}, Max yaw difference: {self.config.leading_vehicles_max_route_angle_oncoming}')
-            print(f'Distance: {min_distances}, Max distance: {max_distance}')
+            # print(f'Yaw differences: {yaw_differences}, Max yaw difference: {self.config.leading_vehicles_max_route_angle_oncoming}')
+            # print(f'Distance: {min_distances}, Max distance: {max_distance}')
             max_yaw_difference = self.config.leading_vehicles_max_route_angle_oncoming
 
             vehicle_fwd_vecs = np.array([

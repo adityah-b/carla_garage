@@ -434,7 +434,7 @@ class SceneDescriptor:
         ego_loc = ego_wp.transform.location
         ego_yaw = np.deg2rad(ego_wp.transform.rotation.yaw)
         ego_lane_id = ego_wp.lane_id
-        print(f'Ego Lane ID: {ego_wp.lane_id}, Road ID: {ego_wp.road_id}, Location: {ego_wp.transform.location}')
+        # print(f'Ego Lane ID: {ego_wp.lane_id}, Road ID: {ego_wp.road_id}, Location: {ego_wp.transform.location}')
 
         # Setup NPC vehicle data dictionary
         grouped_npc_vehicles = {
@@ -449,7 +449,7 @@ class SceneDescriptor:
         oncoming_trailing_vehicles = agent_context["oncoming_trailing_vehicles"]
 
         for lane_id, lane_vehicles in ongoing_leading_vehicles.items():
-            print(f'Vehicles in lane {lane_id}: {lane_vehicles}')
+            # print(f'Vehicles in lane {lane_id}: {lane_vehicles}')
             if lane_id == ego_lane_id:
                 key = "Ego"
             else:
@@ -462,7 +462,7 @@ class SceneDescriptor:
             }
 
         for lane_id, lane_vehicles in oncoming_leading_vehicles.items():
-            print(f'Vehicles in lane {lane_id}: {lane_vehicles}')
+            # print(f'Vehicles in lane {lane_id}: {lane_vehicles}')
             offset = lane_id - ego_lane_id
             key = f"Left-{abs(offset)}" if offset > 0 else f"Right-{abs(offset)}"
             grouped_npc_vehicles["Oncoming Traffic"][key] = {
@@ -505,6 +505,7 @@ class SceneDescriptor:
                 light_state = "UNKNOWN"
 
               traffic_light_data = {
+                  "id": traffic_light.id,
                   "distance_to_light": distance_to_light,
                   "state": light_state,
               }
@@ -610,8 +611,7 @@ class SceneDescriptor:
       formatted_string = "Traffic Data:\n"
       formatted_string += "    Next Traffic Light:\n"
       if traffic_data['next_traffic_light']:
-        formatted_string += f"        Distance to Light: {traffic_data['next_traffic_light'].get('distance_to_light', 'N/A')}\n"
-        formatted_string += f"        State: {traffic_data['next_traffic_light'].get('state', 'N/A')}\n"
+        formatted_string += f"        Traffic Light ID: {traffic_data['next_traffic_light'].get('id', 'N/A')}, State: {traffic_data['next_traffic_light'].get('state', 'N/A')}, Relative Distance: {traffic_data['next_traffic_light'].get('distance_to_light', 'N/A')}\n"
       else:
         formatted_string += "        No data available\n"
       formatted_string += "    Next Stop Sign:\n"
