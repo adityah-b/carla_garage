@@ -34,7 +34,8 @@ from birds_eye_view.run_stop_sign import RunStopSign
 from srunner.scenariomanager.actorcontrols.visualizer import Visualizer
 import cv2
 
-from agent_utils import AgentPrediction, SceneDescriptor
+from agent_utils import AgentPrediction
+from scene_descriptor import SceneDescriptor
 from scene_interpreter import SceneInterpreter
 from trajectory_planner import TrajectoryPlanner
 
@@ -278,7 +279,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     # Setup agent prediction module
     grp = GlobalRoutePlanner(self.world_map, self.config.sampling_resolution)
-    self.agent_prediction.setup(self.traffic_manager, self.world_map, grp)
+    self.agent_prediction.setup(self.traffic_manager, self.world_map, grp, self._vehicle)
 
     self.initialized = True
 
@@ -473,6 +474,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         "compass": tick_data["compass"],
         "gps": tick_data["gps"],
         "route": route_wp,
+        "route_points" : route_np,
         "waypoint": self.world_map.get_waypoint(self._vehicle.get_location()),
         "location": self._vehicle.get_location(),
     }

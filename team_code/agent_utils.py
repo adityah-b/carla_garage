@@ -1,15 +1,32 @@
-import carla
 import numpy as np
-import transfuser_utils as t_u
+import carla
+
+from kinematic_bicycle_model import KinematicBicycleModel
+
+from lateral_controller import LateralPIDController
+from longitudinal_controller import LongitudinalLinearRegressionController
+from privileged_route_planner import PrivilegedRoutePlanner
 
 class AgentPrediction:
     def __init__(self, config):
         self.config = config
 
-    def setup(self, traffic_manager, world_map, global_route_planner):
+        # Dummy waypoint planner
+        self._waypoint_planner = PrivilegedRoutePlanner(self.config)
+
+        # Dynamics models
+        self.ego_model = KinematicBicycleModel(self.config)
+        self.vehicle_model = KinematicBicycleModel(self.config)
+
+        # Controllers
+        self._turn_controller = LateralPIDController(self.config) # Lateral
+        self._longitudinal_controller = LongitudinalLinearRegressionController(self.config) # Longitudinal
+
+    def setup(self, traffic_manager, world_map, global_route_planner, ego_vehicle):
         self._traffic_manager = traffic_manager
         self._world_map = world_map
         self._global_route_planner = global_route_planner
+        self._ego_vehicle = ego_vehicle
 
     def _group_npc_vehicles_by_road_and_lane(self, vehicles_list):
         """
@@ -162,7 +179,7 @@ class AgentPrediction:
 
         return waypoint_choices[np.random.randint(len(waypoint_choices))] # Randomly choose a waypoint
 
-    def get_distance(self, wp1, wp2):
+    def _get_distance(self, wp1, wp2):
         return wp1.transform.location.distance(wp2.transform.location)
 
     def _interpolate_between_waypoints(self, source_wp, target_wp):
@@ -182,7 +199,7 @@ class AgentPrediction:
         traveled_distance = 0.0
         cur_wp = source_wp
 
-        while self.get_distance(cur_wp, target_wp) > self.config.sampling_resolution and self.get_distance(cur_wp, source_wp) < self.get_distance(target_wp, source_wp):
+        while self._get_distance(cur_wp, target_wp) > self.config.sampling_resolution and self._get_distance(cur_wp, source_wp) < self._get_distance(target_wp, source_wp):
             # print(f'traveled_distance: {traveled_distance}')
             wp_choice = cur_wp.next(self.config.sampling_resolution)
             if len(wp_choice) > 1:
@@ -199,7 +216,7 @@ class AgentPrediction:
                 cur_wp = wp_choice[0]
 
             interp_wps.append(cur_wp)
-            traveled_distance = self.get_distance(cur_wp, source_wp)
+            traveled_distance = self._get_distance(cur_wp, source_wp)
 
         interp_wps.append(target_wp)
 
@@ -232,17 +249,17 @@ class AgentPrediction:
                 cur_wp = wp_choice[0]
 
             plan.append(cur_wp)
-            traveled_distance = self.get_distance(cur_wp, waypoint)
+            traveled_distance = self._get_distance(cur_wp, waypoint)
 
         return plan
 
-    def run_step(self, ego_data, npc_vehicles_list):
+    def predict_npc_vehicle_waypoints(self, ego_data, nearby_npc_vehicles_list):
         """
-        Run one step of the agent prediction.
+        Get the predicted waypoints of NPC vehicles with a 3s prediction horizon.
 
         Args:
             ego_data (dict): Dictionary containing the ego vehicle's data.
-            npc_vehicles_list (list): List of NPC vehicles.
+            nearby_npc_vehicles_list (list): List of nearby NPC vehicles.
 
         Returns:
             dict: A dictionary containing the predicted positions of NPC vehicles.
@@ -250,34 +267,24 @@ class AgentPrediction:
         ego_route = ego_data['route']
         ego_speed = ego_data['speed']
 
-        print(f'Getting next waypoints for ego vehicle with speed {ego_speed}')
+        # Get the next waypoints of the ego vehicle
         ego_waypoints = self._get_next_ego_waypoints(ego_route, ego_speed)
 
-        print(f'Getting entry and exit pairs for ego vehicle')
+        # Get the entry and exit points of the road segments of the ego vehicle's route
         ego_entry_exit_pairs = self._get_ego_route_entry_exit_pairs(ego_waypoints)
 
         predicted_positions = {}
-
-        # print(f'Grouping NPC vehicles by road and lane')
-        # npc_vehicles_by_road_and_lane = self._group_npc_vehicles_by_road_and_lane(npc_vehicles_list)
-        # predicted_positions = {}
-
-        # print(f'Grouped NPC vehicles: {npc_vehicles_by_road_and_lane}')
-        # lanes = npc_vehicles_by_road_and_lane.values()
-        # for lane_id, vehicles in lanes.items():
-
-        for vehicle in npc_vehicles_list:
+        npc_vehicle_dict = {}
+        for vehicle in nearby_npc_vehicles_list:
             vehicle_plan = []
-            vehicle_loc = vehicle.get_location()
-            cur_speed = np.sqrt(vehicle.get_velocity().x**2 + vehicle.get_velocity().y**2)
-            distance = cur_speed * self.config.prediction_horizon
-            print(f'vehicle: {vehicle.id}, pos: {vehicle_loc}, speed: {cur_speed}, prediction distance: {distance}')
 
-            # Locate the NPC vehicle waypoint in the map
+            # Get vehicle data
+            vehicle_loc = vehicle.get_location()
+            vehicle_speed = np.sqrt(vehicle.get_velocity().x**2 + vehicle.get_velocity().y**2) # Maybe a different way to calculate speed is required
+            vehicle_predicted_distance = vehicle_speed * self.config.prediction_horizon
+
+            # Locate NPC vehicle waypoint in the map
             vehicle_wp = self._world_map.get_waypoint(vehicle_loc)
-            if not vehicle_wp:
-                print(f'Could not find waypoint for vehicle {vehicle.id}')
-                continue
 
             # Try to get the next actions of the NPC vehicle from TrafficManager
             next_vehicle_actions = None
@@ -286,9 +293,6 @@ class AgentPrediction:
             except Exception as e:
                 print(f'Error getting next actions for vehicle {vehicle.id}: {e}')
                 print(f'Using current waypoint instead')
-                if not vehicle_wp:
-                    print(f'Could not find waypoint for vehicle {vehicle.id}')
-                    continue
 
             # Vehicle not controlled by TrafficManager (either static vehicle or scenario vehicle)
             if not next_vehicle_actions:
@@ -296,23 +300,20 @@ class AgentPrediction:
                 # TODO: Implement scenario vehicle check
                 pass
 
-            # MAYBE TODO: Current prediction impl starts from next waypoint of the vehicle, instead of current waypoint
-            # Maybe better to predict from current waypoint, incorporating future actions
             elif len(next_vehicle_actions) > 1:
-                # print(f'Multiple actions for vehicle {vehicle.id}')
                 next_vehicle_wps = [action[1] for action in next_vehicle_actions]
                 source_wp = vehicle_wp
 
                 for next_target_wp in next_vehicle_wps:
-                    next_target_wp_dist = self.get_distance(next_target_wp, source_wp)
+                    next_target_wp_dist = self._get_distance(next_target_wp, source_wp)
                     if next_target_wp_dist > self.config.sampling_resolution:
                         # Interpolate waypoints between current and next waypoint
                         interp_plan, traveled_dist = self._interpolate_between_waypoints(source_wp, next_target_wp)
                         vehicle_plan.extend(interp_plan)
-                        distance -= traveled_dist
+                        vehicle_predicted_distance -= traveled_dist
                     else:
                         vehicle_plan.append(next_target_wp)
-                        distance -= next_target_wp_dist
+                        vehicle_predicted_distance -= next_target_wp_dist
 
                     source_wp = next_target_wp
 
@@ -323,21 +324,21 @@ class AgentPrediction:
 
             else:
                 next_target_wp = next_vehicle_actions[0][1]
-                next_target_wp_dist = self.get_distance(next_target_wp, vehicle_wp)
+                next_target_wp_dist = self._get_distance(next_target_wp, vehicle_wp)
                 if next_target_wp_dist > self.config.sampling_resolution:
                     # Interpolate waypoints between current and next waypoint
                     interp_plan, traveled_dist = self._interpolate_between_waypoints(vehicle_wp, next_target_wp)
                     vehicle_plan.extend(interp_plan)
-                    distance -= traveled_dist
+                    vehicle_predicted_distance -= traveled_dist
                 else:
                     vehicle_plan.append(next_target_wp)
-                    distance -= next_target_wp_dist
+                    vehicle_predicted_distance -= next_target_wp_dist
 
                 vehicle_wp = vehicle_plan[-1]
 
             # Get waypoints at distance from the vehicle's current waypoint
-            if distance > 0:
-                vehicle_plan.extend(self._get_waypoint_list_at_distance(vehicle_wp, distance, ego_entry_exit_pairs))
+            if vehicle_predicted_distance > 0:
+                vehicle_plan.extend(self._get_waypoint_list_at_distance(vehicle_wp, vehicle_predicted_distance, ego_entry_exit_pairs))
 
             # print(f'Predicted path for vehicle {vehicle.id}:')
             # for wp in vehicle_plan:
@@ -346,331 +347,177 @@ class AgentPrediction:
             if vehicle.id not in predicted_positions:
                 predicted_positions[vehicle.id] = []
             predicted_positions[vehicle.id].extend(vehicle_plan)
+            npc_vehicle_dict[vehicle.id] = vehicle
 
-        return predicted_positions
+        return predicted_positions, npc_vehicle_dict
 
-class SceneDescriptor:
-    """
-    Interface class to convert privileged simulator data into a structured JSON-like format.
-    """
-    def __init__(self, config):
+    def _get_nearest_vehicle_route_point(self, vehicle_route_points, vehicle_location, route_index):
         """
-        Initialize the SceneDescriptor object.
+        Get the nearest route point to the vehicle.
 
         Args:
-            config (object): The configuration object.
-        """
-        self.config = config
-
-    def _get_npc_vehicle_data(self, ego_context, vehicles):
-        """
-        Get the non-player vehicle data from the privileged simulator data.
-
-        Args:
-            ego_context (dict): Dictionary containing the ego context data.
-            vehicles (list): A list of non-player vehicle actors.
+            vehicle_route_points (numpy.ndarray): An array of waypoints representing the planned route.
+            vehicle_location (numpy.ndarray): The current location of the vehicle.
 
         Returns:
-            list: A list of dictionaries containing the non-player vehicle data.
+            numpy.ndarray: The remaining route points from the nearest route point to the vehicle.
         """
-        ego_wp = ego_context['waypoint']
-        ego_transform = ego_wp.transform
-        ego_yaw = np.deg2rad(ego_transform.rotation.yaw)
-        ego_matrix = np.array(ego_transform.get_matrix())
+        to_index = self.config.ego_vehicles_route_point_search_distance
+        search_range = min(route_index + to_index, vehicle_route_points.shape[0])
 
-        npc_vehicle_data = []
+        # Find the index of the nearest route point to the agent's position
+        route_index_offset = np.argmin(np.linalg.norm(
+            vehicle_location[None, :2] - vehicle_route_points[route_index:search_range, :2], axis=1)
+        )
 
-        for vehicle in vehicles:
-            # Get the vehicle data
-            vehicle_id = vehicle.id
-            vehicle_transform = vehicle.get_transform()
-            vehicle_yaw = np.deg2rad(vehicle_transform.rotation.yaw)
-            vehicle_matrix = np.array(vehicle_transform.get_matrix())
-            vehicle_velocity = vehicle.get_velocity()
+        return vehicle_route_points[route_index + route_index_offset:], route_index_offset
 
-            vehicle_speed = vehicle_velocity.length()
-            vehicle_speed = np.round(vehicle_speed, 2)
-
-            # Calculate the relative position and orientation of the vehicle
-            relative_yaw = t_u.normalize_angle(vehicle_yaw - ego_yaw)
-            relative_yaw = np.round(relative_yaw, 2)
-
-            relative_pos = t_u.get_relative_transform(ego_matrix, vehicle_matrix)[:2]
-            relative_pos = np.round(relative_pos, 2)
-            # vehicle_speed = self._get_forward_speed(transform=vehicle_transform, velocity=vehicle_velocity)
-
-            # print(f"Vehicle Position: {vehicle.get_location().x}, {vehicle.get_location().y}")
-            # print(f"Relative Vehicle Position Ego Frame: {relative_pos}")
-
-            relative_distance = np.linalg.norm(relative_pos)
-            relative_distance = np.round(relative_distance, 2)
-
-            vehicle_data = {
-                "vehicle_id": vehicle_id,
-                "data": {
-                    "speed": vehicle_speed,
-                    "relative orientation": relative_yaw,
-                    "relative position": relative_pos,
-                    "relative distance": relative_distance
-                }
-            }
-            npc_vehicle_data.append(vehicle_data)
-        return npc_vehicle_data
-
-    def _group_npc_vehicles(self, agent_context, ego_context, npc_vehicles):
+    def forecast_ego_vehicle_bounding_boxes(self, ego_data, target_speed, num_future_frames):
         """
-        Group the NPC vehicles by road and lane.
-
-        Args:
-            agent_context (dict): Dictionary containing the agent context data.
-            ego_context (dict): Dictionary containing the ego context data.
-            npc_vehicles (list): List of NPC vehicles.
-
-        Returns:
-            dict: A dictionary containing the NPC vehicles grouped by road and lane.
-        """
-        # Get the ego vehicle data
-        ego_wp = ego_context['waypoint']
-        ego_loc = ego_wp.transform.location
-        ego_yaw = np.deg2rad(ego_wp.transform.rotation.yaw)
-        ego_lane_id = ego_wp.lane_id
-        # print(f'Ego Lane ID: {ego_wp.lane_id}, Road ID: {ego_wp.road_id}, Location: {ego_wp.transform.location}')
-
-        # Setup NPC vehicle data dictionary
-        grouped_npc_vehicles = {
-            "Ongoing Traffic": {},
-            "Oncoming Traffic": {},
-            "Cross Traffic": {}
-        }
-
-        ongoing_leading_vehicles = agent_context["ongoing_leading_vehicles"]
-        ongoing_trailing_vehicles = agent_context["ongoing_trailing_vehicles"]
-        oncoming_leading_vehicles = agent_context["oncoming_leading_vehicles"]
-        oncoming_trailing_vehicles = agent_context["oncoming_trailing_vehicles"]
-
-        for lane_id, lane_vehicles in ongoing_leading_vehicles.items():
-            # print(f'Vehicles in lane {lane_id}: {lane_vehicles}')
-            if lane_id == ego_lane_id:
-                key = "Ego"
-            else:
-                offset = lane_id - ego_lane_id
-                key = f"Left-{abs(offset)}" if offset > 0 else f"Right-{abs(offset)}"
-
-            grouped_npc_vehicles["Ongoing Traffic"][key] = {
-                "leading_vehicles": self._get_npc_vehicle_data(ego_context, lane_vehicles),
-                "trailing_vehicles": self._get_npc_vehicle_data(ego_context, ongoing_trailing_vehicles[lane_id]),
-            }
-
-        for lane_id, lane_vehicles in oncoming_leading_vehicles.items():
-            # print(f'Vehicles in lane {lane_id}: {lane_vehicles}')
-            offset = lane_id - ego_lane_id
-            key = f"Left-{abs(offset)}" if offset > 0 else f"Right-{abs(offset)}"
-            grouped_npc_vehicles["Oncoming Traffic"][key] = {
-                "leading_vehicles": self._get_npc_vehicle_data(ego_context, lane_vehicles),
-                "trailing_vehicles": self._get_npc_vehicle_data(ego_context, oncoming_trailing_vehicles[lane_id]),
-            }
-
-        return grouped_npc_vehicles
-
-
-    def get_traffic_data(self, traffic_context):
-        """
-        Get the traffic data from the privileged simulator data.
-
-        Returns:
-            dict: A dictionary containing the traffic data.
-        """
-        def __get_traffic_light_data(traffic_light, distance_to_light):
-            """
-            Get the traffic light data from the privileged simulator data.
+            Forecast the future states of the ego agent using the kinematic bicycle model and assume their is no hazard to
+            check subsequently whether the ego vehicle would collide.
 
             Args:
-                traffic_light (carla.Actor): The traffic light actor.
+                current_ego_transform (carla.Transform): The current transform of the ego vehicle.
+                current_ego_speed (float): The current speed of the ego vehicle in m/s.
+                num_future_frames (int): The number of future frames to forecast.
+                initial_target_speed (float): The initial target speed for the ego vehicle.
+                route_points (numpy.ndarray): An array of waypoints representing the planned route.
 
             Returns:
-                dict: A dictionary containing the traffic light data.
+                list: A list of bounding boxes representing the future states of the ego vehicle.
             """
-            traffic_light_data = None
+        self._turn_controller.save_state()
 
-            if traffic_light and distance_to_light < self.config.traffic_light_distance_threshold:
-              state = traffic_light.get_state()
+        # Initialize the initial state without braking
+        ego_location = np.array(
+            [ego_data['location'].x, ego_data['location'].y, ego_data['location'].z])
+        ego_heading_angle = np.array([ego_data['compass']])
+        ego_speed = np.array([ego_data['speed']])
 
-              if state == carla.TrafficLightState.Red:
-                light_state = "RED"
-              elif state == carla.TrafficLightState.Yellow:
-                light_state = "YELLOW"
-              elif state == carla.TrafficLightState.Green:
-                light_state = "GREEN"
-              else:
-                light_state = "UNKNOWN"
+        ego_target_speed = target_speed
+        ego_route_points = ego_data['route_points']
 
-              traffic_light_data = {
-                  "id": traffic_light.id,
-                  "distance_to_light": distance_to_light,
-                  "state": light_state,
-              }
-            return traffic_light_data
+        # Calculate the throttle command based on the target speed and current speed
+        throttle = self._longitudinal_controller.get_throttle_extrapolation(ego_target_speed, ego_speed)
+        steering = self._turn_controller.step(ego_route_points, ego_speed, ego_location, ego_heading_angle.item())
+        action = np.array([steering, throttle, 0.0]).flatten()
 
-        def __get_stop_sign_data(stop_sign, distance_to_stop_sign):
-            """
-            Get the stop sign data from the privileged simulator data.
+        future_bounding_boxes = []
+        # Iterate over the future frames and forecast the ego agent's state
+        route_index = 0
+        for i in range(num_future_frames):
+            # Forecast the next state using the kinematic bicycle model
+            ego_location, ego_heading_angle, ego_speed = self.ego_model.forecast_ego_vehicle(ego_location, ego_heading_angle, ego_speed, action)
+
+            # Update the route and extrapolate steering and throttle commands
+            ego_forecast_route, route_index_offset = self._get_nearest_vehicle_route_point(ego_route_points, ego_location, route_index)
+            route_index += route_index_offset
+
+            steering = self._turn_controller.step(ego_forecast_route, ego_speed, ego_location, ego_heading_angle.item())
+
+            throttle = self._longitudinal_controller.get_throttle_extrapolation(ego_target_speed, ego_speed)
+            action = np.array([steering, throttle, 0.0]).flatten()
+
+            # Calculate the heading angle in degrees
+            ego_heading_angle_degrees = np.rad2deg(ego_heading_angle).item()
+
+            # Decrease the ego vehicles bounding box if it is slow and resolve permanent bounding box
+            # intersectinos at collisions.
+            # In case of driving increase them for safety.
+            extent = self._ego_vehicle.bounding_box.extent
+            # Otherwise we would increase the extent of the bounding box of the vehicle
+            extent = carla.Vector3D(x=extent.x, y=extent.y, z=extent.z)
+            extent.x *= self.config.slow_speed_extent_factor_ego \
+                if ego_speed < self.config.extent_ego_bbs_speed_threshold \
+                else self.config.high_speed_extent_factor_ego_x
+            extent.y *= self.config.slow_speed_extent_factor_ego \
+                if ego_speed < self.config.extent_ego_bbs_speed_threshold \
+                else self.config.high_speed_extent_factor_ego_y
+
+            ego_carla_location = carla.Location(x=ego_location[0].item(), y=ego_location[1].item(), z=ego_location[2].item())
+            ego_bounding_box = carla.BoundingBox(ego_carla_location, extent)
+            ego_bounding_box.rotation = carla.Rotation(pitch=0, yaw=ego_heading_angle_degrees, roll=0)
+
+            future_bounding_boxes.append(ego_bounding_box)
+
+        self._turn_controller.load_state()
+
+        return future_bounding_boxes
+
+    def forecast_npc_vehicle_bounding_boxes(self, npc_vehicles_dict, npc_predicted_paths, num_future_frames):
+        """
+            Forecast the future states of the NPC agents using the kinematic bicycle model.
 
             Args:
-                stop_sign (carla.Actor): The stop sign actor.
+                npc_predicted_paths (dict): A dictionary containing the predicted waypoints of NPC vehicles.
+                num_future_frames (int): The number of future frames to forecast.
 
             Returns:
-                dict: A dictionary containing the stop sign data.
+                dict: A dictionary containing the future states of the NPC agents.
             """
-            stop_sign_data = None
 
-            if stop_sign and distance_to_stop_sign < self.config.stop_sign_distance_threshold:
-              stop_sign_data = {
-                  "distance_to_stop_sign": distance_to_stop_sign
-              }
-            return stop_sign_data
+        npc_vehicles_future_bounding_boxes_dict = {}
+        for vehicle_id, predicted_path in npc_predicted_paths.items():
+            if len(predicted_path) > 1:
+                self._turn_controller.save_state()
 
-        traffic_data = {
-            "next_traffic_light": __get_traffic_light_data(traffic_context["next_traffic_light"], traffic_context["distance_to_next_traffic_light"]),
-            "next_stop_sign": __get_stop_sign_data(traffic_context["next_stop_sign"], traffic_context["distance_to_next_stop_sign"]),
-            "speed_limit": traffic_context["speed_limit"]
-        }
-        return traffic_data
+                vehicle = npc_vehicles_dict[vehicle_id]
+                vehicle_location = np.array(
+                    [vehicle.get_location().x, vehicle.get_location().y, vehicle.get_location().z]
+                )
+                vehicle_heading_angle = np.array([np.deg2rad(vehicle.get_transform().rotation.yaw)])
+                vehicle_speed = np.array([vehicle.get_velocity().length()])
 
-    def get_ego_data(self, ego_context):
-        """
-        Get the ego vehicle data from the privileged simulator data.
+                vehicle_target_speed = vehicle_speed
 
-        Returns:
-            dict: A dictionary containing the ego vehicle data.
-        """
-        ego_data = {
-            "speed": ego_context["speed"],
-            "orientation": ego_context["compass"],
-            "position": ego_context["gps"][:2].tolist(),
-            "route": ego_context["route"],
-            "waypoint": ego_context["waypoint"]
-        }
-        return ego_data
+                vehicle_route_points = [wp.transform.location for wp in predicted_path]
+                vehicle_route_points = np.array([[loc.x, loc.y, loc.z] for loc in vehicle_route_points])
+                vehicle_route_points, _ = self._waypoint_planner.smooth_and_supersample(vehicle_route_points)
 
-    def get_agent_data(self, agent_context, ego_context):
-        """
-        Get the agent data from the privileged simulator data.
+                # Calculate the throttle command based on the target speed and current speed
+                throttle = self._longitudinal_controller.get_throttle_extrapolation(vehicle_target_speed, vehicle_speed)
+                steering = self._turn_controller.step(vehicle_route_points, vehicle_speed, vehicle_location, vehicle_heading_angle.item())
+                action = np.array([steering, throttle, 0.0]).flatten()
 
-        Returns:
-            dict: A dictionary containing the agent data.
-        """
+                future_bounding_boxes = []
+                # Iterate over the future frames and forecast the npc vehicle's state
+                route_index = 0
+                for i in range(num_future_frames):
+                    # Forecast the next state using the kinematic bicycle model
+                    vehicle_location, vehicle_heading_angle, vehicle_speed = self.vehicle_model.forecast_ego_vehicle(vehicle_location, vehicle_heading_angle, vehicle_speed, action)
 
-        agent_data = self._group_npc_vehicles(agent_context, ego_context, agent_context["ongoing_leading_vehicles"])
-        # agent_data = {
-        #     "leading_vehicles": __get_npc_vehicle_data(agent_context["leading_vehicles"]),
-        #     "trailing_vehicles": __get_npc_vehicle_data(agent_context["trailing_vehicles"]),
-        # }
-        return agent_data
+                    # Update the route and extrapolate steering and throttle commands
+                    vehicle_forecast_route, route_index_offset = self._get_nearest_vehicle_route_point(vehicle_route_points, vehicle_location, route_index)
+                    route_index += route_index_offset
 
-    def get_structured_data(self, traffic_context, ego_context, agent_context):
-        """
-        Convert the privileged simulator data into a structured JSON-like format.
+                    steering = self._turn_controller.step(vehicle_forecast_route, vehicle_speed, vehicle_location, vehicle_heading_angle.item())
+                    throttle = self._longitudinal_controller.get_throttle_extrapolation(vehicle_target_speed, vehicle_speed)
+                    action = np.array([steering, throttle, 0.0]).flatten()
 
-        Returns:
-            dict: A dictionary containing the structured data.
-        """
-        ego_data = self.get_ego_data(ego_context)
+                    # Calculate the heading angle in degrees
+                    vehicle_heading_angle_degrees = np.rad2deg(vehicle_heading_angle).item()
 
-        data = {
-            "traffic": self.get_traffic_data(traffic_context),
-            "ego": ego_data,
-            "agent": self.get_agent_data(agent_context, ego_data)
-        }
-        return data
+                    # Decrease the NPC vehicles bounding box if it is slow and resolve permanent bounding box
+                    # intersectinos at collisions.
+                    # In case of driving increase them for safety.
+                    extent = vehicle.bounding_box.extent
+                    # Otherwise we would increase the extent of the bounding box of the vehicle
+                    extent = carla.Vector3D(x=extent.x, y=extent.y, z=extent.z)
+                    extent.x *= self.config.slow_speed_extent_factor_ego \
+                        if vehicle_speed < self.config.extent_ego_bbs_speed_threshold \
+                        else self.config.high_speed_extent_factor_ego_x
+                    extent.y *= self.config.slow_speed_extent_factor_ego \
+                        if vehicle_speed < self.config.extent_ego_bbs_speed_threshold \
+                        else self.config.high_speed_extent_factor_ego_y
 
-    def to_json(self, structured_data):
-        """
-        Convert the structured data into a JSON string.
+                    vehicle_carla_location = carla.Location(x=vehicle_location[0].item(), y=vehicle_location[1].item(), z=vehicle_location[2].item())
+                    vehicle_bounding_box = carla.BoundingBox(vehicle_carla_location, extent)
+                    vehicle_bounding_box.rotation = carla.Rotation(pitch=0, yaw=vehicle_heading_angle_degrees, roll=0)
 
-        Returns:
-            str: A JSON string containing the structured data.
-        """
-        return json.dumps(structured_data, indent=4)
+                    future_bounding_boxes.append(vehicle_bounding_box)
 
-        # ...existing code...
+                self._turn_controller.load_state()
+                npc_vehicles_future_bounding_boxes_dict[vehicle_id] = future_bounding_boxes
 
-    def to_formatted_string(self, structured_data):
-      """
-      Convert the structured data to a formatted string.
-
-      Args:
-        structured_data (dict): The structured data.
-
-      Returns:
-        str: A formatted string representation of the data.
-      """
-      traffic_data = structured_data['traffic']
-      ego_data = structured_data['ego']
-      agent_data = structured_data['agent']
-
-      formatted_string = "Traffic Data:\n"
-      formatted_string += "    Next Traffic Light:\n"
-      if traffic_data['next_traffic_light']:
-        formatted_string += f"        Traffic Light ID: {traffic_data['next_traffic_light'].get('id', 'N/A')}, State: {traffic_data['next_traffic_light'].get('state', 'N/A')}, Relative Distance: {traffic_data['next_traffic_light'].get('distance_to_light', 'N/A')}\n"
-      else:
-        formatted_string += "        No data available\n"
-      formatted_string += "    Next Stop Sign:\n"
-      if traffic_data['next_stop_sign']:
-        formatted_string += f"        Distance to Stop Sign: {traffic_data['next_stop_sign'].get('distance_to_stop_sign', 'N/A')}\n"
-      else:
-        formatted_string += "        No data available\n"
-      formatted_string += f"    Speed Limit: {traffic_data.get('speed_limit', 'N/A')}\n"
-
-      formatted_string += "Ego Data:\n"
-      formatted_string += f"    Speed: {ego_data.get('speed', 'N/A')}\n"
-      formatted_string += f"    Orientation: {ego_data.get('orientation', 'N/A')}\n"
-      formatted_string += f"    Position: {ego_data.get('position', 'N/A')}\n"
-
-      formatted_string += "Agent Data:\n"
-      formatted_string += "    Ongoing Traffic:\n"
-      for lane, vehicles in agent_data["Ongoing Traffic"].items():
-        formatted_string += f"        {lane}:\n"
-        formatted_string += "            Leading Vehicles:\n"
-        if vehicles["leading_vehicles"]:
-            for vehicle in vehicles["leading_vehicles"]:
-                formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-        else:
-            formatted_string += "                No data available\n"
-
-        formatted_string += "            Trailing Vehicles:\n"
-        if vehicles["trailing_vehicles"]:
-            for vehicle in vehicles["trailing_vehicles"]:
-                formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-        else:
-            formatted_string += "                No data available\n"
-
-      formatted_string += "    Oncoming Traffic:\n"
-      for lane, vehicles in agent_data["Oncoming Traffic"].items():
-        formatted_string += f"        {lane}:\n"
-        formatted_string += "            Leading Vehicles:\n"
-        for vehicle in vehicles["leading_vehicles"]:
-            formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-        formatted_string += "            Trailing Vehicles:\n"
-        for vehicle in vehicles["trailing_vehicles"]:
-            formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-
-    #   formatted_string += "    Cross Traffic:\n"
-    #   for lane, vehicles in agent_data["Cross Traffic"].items():
-    #     formatted_string += f"        {lane}:\n"
-    #     formatted_string += "            Leading Vehicles:\n"
-    #     for vehicle in vehicles["leading_vehicles"]:
-    #         formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-    #     formatted_string += "            Trailing Vehicles:\n"
-    #     for vehicle in vehicles["trailing_vehicles"]:
-    #         formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-
-      return formatted_string
-
-    # Example usage:
-    # autopilot_instance = AutoPilot(...)
-    # interface = SimulatorDataInterface(autopilot_instance)
-    # structured_data = interface.get_structured_data(traffic_context, ego_context, agent_context)
-    # formatted_string = interface.to_formatted_string(structured_data)
-    # print(formatted_string)
-
-    # ...existing code...
+        return npc_vehicles_future_bounding_boxes_dict

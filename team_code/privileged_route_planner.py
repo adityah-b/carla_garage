@@ -468,7 +468,7 @@ class PrivilegedRoutePlanner(object):
 
     return yaws
 
-  def smooth_and_supersample(self, original_route_points, commands):
+  def smooth_and_supersample(self, original_route_points, commands=None):
     """
         Smooths and supersamples the given route to increase density and matches commands accordingly.
 
@@ -508,11 +508,13 @@ class PrivilegedRoutePlanner(object):
     smoothed_points = route_supersampled[segment_indices]
 
     # Interpolate commands for the smoothed points
-    num_original_commands = len(commands)
-    command_indices = np.minimum(
-        np.round(segment_indices.astype("float") / self.points_per_meter / num_supersample_per_point),
-        num_original_commands - 1).astype("int")
-    smoothed_commands = np.array([commands[idx] for idx in command_indices])
+    smoothed_commands = np.array([])
+    if commands:
+      num_original_commands = len(commands)
+      command_indices = np.minimum(
+          np.round(segment_indices.astype("float") / self.points_per_meter / num_supersample_per_point),
+          num_original_commands - 1).astype("int")
+      smoothed_commands = np.array([commands[idx] for idx in command_indices])
 
     return smoothed_points, smoothed_commands
 

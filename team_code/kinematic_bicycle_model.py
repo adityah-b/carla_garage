@@ -74,6 +74,10 @@ class KinematicBicycleModel():
         Returns:
             tuple: A tuple containing the forecasted location, heading, and speed for the ego vehicle.
         """
+    # Typecast to floats
+    speed = float(speed)
+    heading = float(heading)
+
     steer, throttle, brake = action
     wheel_angle = self.steering_gain * steer
     slip_angle = np.arctan(self.rear_wheel_base / (self.front_wheel_base + self.rear_wheel_base) * np.tan(wheel_angle))
@@ -96,7 +100,7 @@ class KinematicBicycleModel():
       if throttle < self.throttle_threshold_during_forecasting:
         next_speed = speed
       else:
-        speed_kph = (speed * 3.6).item()
+        speed_kph = speed * 3.6
         features = np.array([
             speed_kph, speed_kph**2, throttle, throttle**2, speed_kph * throttle, speed_kph * throttle**2,
             speed_kph**2 * throttle, speed_kph**2 * throttle**2
@@ -106,6 +110,6 @@ class KinematicBicycleModel():
         next_speed = next_speed_kph / 3.6
 
     next_speed = np.maximum(0.0, next_speed)
-    next_location = np.array([next_x[0], next_y[0], location[2]])
+    next_location = np.array([next_x, next_y, location[2]])
 
     return next_location, next_heading, next_speed

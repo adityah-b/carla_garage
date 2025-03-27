@@ -85,7 +85,7 @@ class LongitudinalPIDController(LongitudinalController):
 
   def get_throttle_and_brake(self, hazard_brake, target_speed, current_speed):
     """
-        Get the throttle and brake values based on the target speed, current speed, 
+        Get the throttle and brake values based on the target speed, current speed,
         and hazard brake condition using a PID controller.
 
         Args:
@@ -222,6 +222,10 @@ class LongitudinalLinearRegressionController(LongitudinalController):
         Returns:
             float: The throttle value.
         """
+    # Typecast to floats
+    target_speed = float(target_speed)
+    current_speed = float(current_speed)
+
     current_speed = current_speed * 3.6  # Convertion to km/h
     target_speed = target_speed * 3.6  # Convertion to km/h
     params = self.params
