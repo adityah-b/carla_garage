@@ -209,36 +209,32 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     print("Sparse Waypoints:", len(self._global_plan))
     print("Dense Waypoints:", len(self.org_dense_route_world_coord))
 
+    print(f"Waypoint Commands")
+    for point in self._global_plan_world_coord:
+      wp = hd_map.get_waypoint(point[0].location)
+      cmd = point[1]
+      if cmd == RoadOption.VOID:
+        cmd_str = "VOID"
+      elif cmd == RoadOption.LEFT:
+        cmd_str = "LEFT"
+      elif cmd == RoadOption.RIGHT:
+        cmd_str = "RIGHT"
+      elif cmd == RoadOption.STRAIGHT:
+        cmd_str = "STRAIGHT"
+      elif cmd == RoadOption.LANEFOLLOW:
+        cmd_str = "LANEFOLLOW"
+      elif cmd == RoadOption.CHANGELANELEFT:
+        cmd_str = "CHANGELANELEFT"
+      elif cmd == RoadOption.CHANGELANERIGHT:
+        cmd_str = "CHANGELANERIGHT"
+      print(f"\tCMD: {cmd_str}, ROAD_ID: {wp.road_id}, LANE_ID: {wp.lane_id}, LOCATION: \n \t\tX: {wp.transform.location.x}, Y: {wp.transform.location.y}, Z: {wp.transform.location.z}")
+
     # Get the hero vehicle and the CARLA world
     self._vehicle = CarlaDataProvider.get_hero_actor()
     self._world = self._vehicle.get_world()
 
     # Visualizer
-    self.visualizer = Visualizer(self._vehicle)
-
-    # BEV Visualizer
-    obs_config = {
-        'width_in_pixels': self.config.lidar_resolution_width,
-        'pixels_ev_to_bottom': self.config.lidar_resolution_height / 2.0,
-        'pixels_per_meter': self.config.pixels_per_meter_collection,
-        'history_idx': [-1],
-        'scale_bbox': True,
-        'scale_mask_col': 1.0,
-        'map_folder': 'maps_2ppm_cv'
-    }
-
-    self.stop_sign_criteria = RunStopSign(self._world)
-    self.ss_bev_manager = ObsManager(obs_config, self.config)
-    self.ss_bev_manager.attach_ego_vehicle(self._vehicle, criteria_stop=self.stop_sign_criteria)
-
-    # # BEV Renderer
-    # self.birdview_producer = BirdViewProducer(
-    #     CarlaDataProvider.get_client(),  # carla.Client
-    #     target_size=PixelDimensions(width=150, height=336),
-    #     render_lanes_on_junctions=True,
-    #     pixels_per_meter=4,
-    #     crop_type=BirdViewCropType.FRONT_AND_REAR_AREA
-    # )
+    # self.visualizer = Visualizer(self._vehicle)
 
     # Check if the vehicle starts from a parking spot
     distance_to_road = self.org_dense_route_world_coord[0][0].location.distance(self._vehicle.get_location())
@@ -321,6 +317,18 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         'fov': self.config.camera_fov,
         'id': 'rgb'
       }, {
+        'type': 'sensor.camera.rgb',
+        'x': self.config.camera_pos[0],
+        'y': self.config.camera_pos[1],
+        'z': 20.0,
+        'roll': self.config.camera_rot_0[0],
+        'pitch': -90,
+        'yaw': 0,
+        'width': self.config.camera_width,
+        'height': self.config.camera_height,
+        'fov': self.config.camera_fov,
+        'id': 'rgb_bev'
+      }, {
         "type": "sensor.speedometer",
         "reading_frequency": 20,
         "id": "speed"
@@ -386,15 +394,12 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     # Get the control commands and driving data for the current step
     control, driving_data = self._get_control(input_data, plant)
 
-    bev_semantics = self.ss_bev_manager.get_observation(self.close_traffic_lights)
     rgb = input_data['rgb'][1][:, :, :3]
-    bev_img = bev_semantics['rendered'] # debug_challenge=1 otherwise crashes
+    rgb_bev = input_data['rgb_bev'][1][:, :, :3]
 
-    bev_img = cv2.cvtColor(bev_img, cv2.COLOR_BGR2RGB)
-    rendered = cv2.resize(bev_img, dsize=(rgb.shape[1], rgb.shape[1]), interpolation=cv2.INTER_LINEAR)
-    visu_img = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-
-    final = np.concatenate((visu_img, rendered), axis=0)
+    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+    rgb_bev = cv2.cvtColor(rgb_bev, cv2.COLOR_BGR2RGB)
+    final = np.concatenate((rgb, rgb_bev), axis=0)
 
     cv2.namedWindow("BirdView RGB", cv2.WINDOW_NORMAL)
     cv2.imshow("BirdView RGB", final)
@@ -464,6 +469,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     oncoming_leading_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "oncoming")
     oncoming_trailing_vehicles = self._waypoint_planner.get_trailing_vehicles(self.world_map, npc_vehicles, "oncoming")
 
+    lane_change_data = self._waypoint_planner.get_upcoming_lane_change(ego_speed)
+    print(f"Lane Change Data: {lane_change_data}")
     # print(f'Ongoing Leading Vehicles: {ongoing_leading_vehicles}')
     # print(f'Ongoing Trailing Vehicles: {ongoing_trailing_vehicles}')
     # print(f'Oncoming Leading Vehicles: {oncoming_leading_vehicles}')
@@ -475,13 +482,35 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         "gps": tick_data["gps"],
         "route": route_wp,
         "route_points" : route_np,
+        "route_index": self._waypoint_planner.route_index,
         "waypoint": self.world_map.get_waypoint(self._vehicle.get_location()),
         "location": self._vehicle.get_location(),
+        "lane_change": lane_change_data,
     }
 
-    # predicted_paths = self.agent_prediction.run_step(ego_context, npc_vehicles)
+    num_future_frames = int(self.config.bicycle_frame_rate * self.config.default_forecast_length)
+
+    npc_predicted_paths, npc_vehicles_dict = self.agent_prediction.predict_npc_vehicle_waypoints(ego_context, npc_vehicles)
+    npc_predicted_vehicle_bounding_boxes = self.agent_prediction.forecast_npc_vehicle_bounding_boxes(npc_vehicles_dict, npc_predicted_paths, num_future_frames)
+
+    # for actor_idx, actors_forecasted_bounding_boxes in npc_predicted_vehicle_bounding_boxes.items():
+    #       for bb in actors_forecasted_bounding_boxes:
+    #         self._world.debug.draw_box(box=bb,
+    #                                     rotation=bb.rotation,
+    #                                     thickness=0.1,
+    #                                     color=self.config.other_vehicles_forecasted_bbs_color,
+    #                                     life_time=self.config.draw_life_time)
+
+    # ego_bounding_boxes = self.agent_prediction.forecast_ego_vehicle_bounding_boxes(ego_context, target_speed, num_future_frames)
+    # for bb in ego_bounding_boxes:
+    #   self._world.debug.draw_box(box=bb,
+    #                              rotation=bb.rotation,
+    #                              thickness=0.1,
+    #                              color=self.config.ego_vehicle_forecasted_bbs_normal_color,
+    #                              life_time=self.config.draw_life_time)
+
     # # if self.visualize == 1:
-    # for vehicle_id, predicted_path in predicted_paths.items():
+    # for vehicle_id, predicted_path in npc_predicted_paths.items():
     #   for predicted_wp in predicted_path:
     #     predicted_loc = predicted_wp.transform.location
     #     predicted_loc = carla.Location(predicted_loc.x, predicted_loc.y, predicted_loc.z + 0.1)
@@ -509,31 +538,31 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     structured_data = self.scene_descriptor.get_structured_data(traffic_context, ego_context, agent_context)
     # print(f"Structured Data: {structured_data}")
-    formatted_data = self.scene_descriptor.to_formatted_string(structured_data)
+    scenario_prompt = """
+Scenario Name: EnterActorFlowV2
+Scenario Description: The ego vehicle is expected to merge onto a highway from a ramp.\n
+"""
+    formatted_data = scenario_prompt + self.scene_descriptor.to_formatted_string(structured_data)
     # print(f"Structured Data: {formatted_data}")
 
-    bev_semantics = self.ss_bev_manager.get_observation(self.close_traffic_lights)
     rgb = input_data['rgb'][1][:, :, :3]
-    bev_img = bev_semantics['rendered'] # debug_challenge=1 otherwise crashes
-
-    bev_img = cv2.cvtColor(bev_img, cv2.COLOR_BGR2RGB)
-    rendered = cv2.resize(bev_img, dsize=(rgb.shape[1], rgb.shape[1]), interpolation=cv2.INTER_LINEAR)
+    visu_img = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
 
     # Execute at 1Hz
     high_level_cmd = None
     if self.step % int(self.config.carla_fps) == 0:
       print(f"Structured Data: {formatted_data}")
-      high_level_cmd = self.scene_interpreter.run_step(formatted_data, rendered)
+      high_level_cmd = self.scene_interpreter.run_step(formatted_data, visu_img)
 
     # Translate the high-level command to low-level commands
     brake = False
     if high_level_cmd:
-      self.trajectory_planner.update_state(agent_context, traffic_context, ego_context)
-      llm_target_speed = self.trajectory_planner.run_command(high_level_cmd)
+      self.trajectory_planner.update_state(agent_context, traffic_context, ego_context, self._waypoint_planner)
+      llm_target_speed, route_points, route_wps = self.trajectory_planner.run_command(high_level_cmd)
       self.prev_cmd = high_level_cmd
 
     else:
-      llm_target_speed = self.trajectory_planner.run_command(self.prev_cmd)
+      llm_target_speed, route_points, route_wps = self.trajectory_planner.run_command(self.prev_cmd)
 
     # if llm_target_speed < 0.1:
     #     brake = True
@@ -542,10 +571,13 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     # NEW CODE
 
     # Manage route obstacle scenarios and adjust target speed
+    # target_speed_route_obstacle, keep_driving, speed_reduced_by_obj = self._manage_route_obstacle_scenarios(
+    #     target_speed, ego_speed, route_wp, vehicles, route_np)
     target_speed_route_obstacle, keep_driving, speed_reduced_by_obj = self._manage_route_obstacle_scenarios(
-        target_speed, ego_speed, route_wp, vehicles, route_np)
+        target_speed, ego_speed, route_wps, vehicles, route_points)
 
-    print(f'Target Speed Route Obstacle: {target_speed_route_obstacle}')
+
+    # print(f'Target Speed Route Obstacle: {target_speed_route_obstacle}')
     # In case the agent overtakes an obstacle, keep driving in case the opposite lane is free instead of using idm
     # and the kinematic bicycle model forecasts
     if keep_driving:
@@ -558,8 +590,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
           plant, route_np, distance_to_next_traffic_light, next_traffic_light, distance_to_next_stop_sign,
           next_stop_sign, vehicles, actors, target_speed, speed_reduced_by_obj)
 
-    print(f'Speed Reduced by Object: {speed_reduced_by_obj}')
-    print(f'IDM Target Speed: {target_speed}')
+    # print(f'Speed Reduced by Object: {speed_reduced_by_obj}')
+    # print(f'IDM Target Speed: {target_speed}')
     target_speed = min(target_speed, target_speed_route_obstacle)
 
     # Determine if the ego vehicle is at a junction
@@ -1181,7 +1213,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
             results (optional): Any additional results to be processed or saved.
         """
 
-    self.visualizer.reset()
+    # self.visualizer.reset()
 
     if self.save_path is not None:
       self.lon_logger.dump_to_json()
@@ -1498,21 +1530,21 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
             extent = vehicle.bounding_box.extent
             bb = carla.BoundingBox(vehicle.get_location(), extent)
             bb.rotation = carla.Rotation(pitch=0, yaw=vehicle.get_transform().rotation.yaw, roll=0)
-            self._world.debug.draw_box(box=bb,
-                                       rotation=bb.rotation,
-                                       thickness=0.5,
-                                       color=self.config.leading_vehicle_color,
-                                       life_time=self.config.draw_life_time)
+            # self._world.debug.draw_box(box=bb,
+            #                            rotation=bb.rotation,
+            #                            thickness=0.5,
+            #                            color=self.config.leading_vehicle_color,
+            #                            life_time=self.config.draw_life_time)
           elif vehicle_id in rear_vehicle_ids:
             vehicle = self._world.get_actor(vehicle_id)
             extent = vehicle.bounding_box.extent
             bb = carla.BoundingBox(vehicle.get_location(), extent)
             bb.rotation = carla.Rotation(pitch=0, yaw=vehicle.get_transform().rotation.yaw, roll=0)
-            self._world.debug.draw_box(box=bb,
-                                       rotation=bb.rotation,
-                                       thickness=0.5,
-                                       color=self.config.trailing_vehicle_color,
-                                       life_time=self.config.draw_life_time)
+            # self._world.debug.draw_box(box=bb,
+            #                            rotation=bb.rotation,
+            #                            thickness=0.5,
+            #                            color=self.config.trailing_vehicle_color,
+            #                            life_time=self.config.draw_life_time)
 
     return target_speed_wrt_leading_vehicle, speed_reduced_by_obj
 
@@ -1668,12 +1700,12 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     ego_bb_global = carla.BoundingBox(center_ego_bb_global, self._vehicle.bounding_box.extent)
     ego_bb_global.rotation = ego_vehicle_transform.rotation
 
-    if self.visualize == 1:
-      self._world.debug.draw_box(box=ego_bb_global,
-                                 rotation=ego_bb_global.rotation,
-                                 thickness=0.1,
-                                 color=self.config.ego_vehicle_bb_color,
-                                 life_time=self.config.draw_life_time)
+    # if self.visualize == 1:
+    #   self._world.debug.draw_box(box=ego_bb_global,
+    #                              rotation=ego_bb_global.rotation,
+    #                              thickness=0.1,
+    #                              color=self.config.ego_vehicle_bb_color,
+    #                              life_time=self.config.draw_life_time)
 
     # Reset hazard flags
     self.stop_sign_close = False

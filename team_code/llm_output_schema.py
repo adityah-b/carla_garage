@@ -19,9 +19,21 @@ class LongitudinalCommand(enum.Enum):
     Enum for longitudinal driving commands.
     """
     MAINTAIN_SPEED = "maintain_speed"
-    ACCELERATE = "accelerate"
-    DECELERATE = "decelerate"
+    # ACCELERATE = "accelerate"
+    # DECELERATE = "decelerate"
+    CHANGE_LANE_LEFT = "change_lane_left"
     # STOP = "stop"
+
+# class LongitudinalCommand(enum.Enum):
+#     """
+#     Enum for longitudinal driving commands.
+#     """
+#     FOLLOW_LEAD_VEHICLE = "follow_lead_vehicle"
+#     FOLLOW_SPEED_LIMIT = "follow_speed_limit"
+#     # ACCELERATE = "accelerate"
+#     # DECELERATE = "decelerate"
+#     CHANGE_LANE_LEFT = "change_lane_left"
+#     # STOP = "stop"
 
 class LongitudinalCommandParams(BaseModel):
     """

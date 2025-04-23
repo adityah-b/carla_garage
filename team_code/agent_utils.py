@@ -7,9 +7,120 @@ from lateral_controller import LateralPIDController
 from longitudinal_controller import LongitudinalLinearRegressionController
 from privileged_route_planner import PrivilegedRoutePlanner
 
+class AgentGeometricUtils:
+    def __init__(self):
+        pass
+
+    def dot_product(self, vector1, vector2):
+        """
+        Calculate the dot product of two vectors.
+
+        Args:
+            vector1 (carla.Vector3D): The first vector.
+            vector2 (carla.Vector3D): The second vector.
+
+        Returns:
+            float: The dot product of the two vectors.
+        """
+        return vector1.x * vector2.x + vector1.y * vector2.y + vector1.z * vector2.z
+
+    def cross_product(self, vector1, vector2):
+        """
+        Calculate the cross product of two vectors.
+
+        Args:
+            vector1 (carla.Vector3D): The first vector.
+            vector2 (carla.Vector3D): The second vector.
+
+        Returns:
+            carla.Vector3D: The cross product of the two vectors.
+        """
+        x = vector1.y * vector2.z - vector1.z * vector2.y
+        y = vector1.z * vector2.x - vector1.x * vector2.z
+        z = vector1.x * vector2.y - vector1.y * vector2.x
+
+        return carla.Vector3D(x=x, y=y, z=z)
+
+    def get_separating_plane(self, relative_position, plane_normal, obb1, obb2):
+        """
+        Check if there is a separating plane between two oriented bounding boxes (OBBs).
+
+        Args:
+            relative_position (carla.Vector3D): The relative position between the two OBBs.
+            plane_normal (carla.Vector3D): The normal vector of the plane.
+            obb1 (carla.BoundingBox): The first oriented bounding box.
+            obb2 (carla.BoundingBox): The second oriented bounding box.
+
+        Returns:
+            bool: True if there is a separating plane, False otherwise.
+        """
+        # Calculate the projection of the relative position onto the plane normal
+        projection_distance = abs(self.dot_product(relative_position, plane_normal))
+
+        # Calculate the sum of the projections of the OBB extents onto the plane normal
+        obb1_projection = (abs(self.dot_product(obb1.rotation.get_forward_vector() * obb1.extent.x, plane_normal)) +
+                        abs(self.dot_product(obb1.rotation.get_right_vector() * obb1.extent.y, plane_normal)) +
+                        abs(self.dot_product(obb1.rotation.get_up_vector() * obb1.extent.z, plane_normal)))
+
+        obb2_projection = (abs(self.dot_product(obb2.rotation.get_forward_vector() * obb2.extent.x, plane_normal)) +
+                        abs(self.dot_product(obb2.rotation.get_right_vector() * obb2.extent.y, plane_normal)) +
+                        abs(self.dot_product(obb2.rotation.get_up_vector() * obb2.extent.z, plane_normal)))
+
+        # Check if the projection distance is greater than the sum of the OBB projections
+        return projection_distance > obb1_projection + obb2_projection
+
+    def check_obb_intersection(self, obb1, obb2):
+        """
+        Check if two 3D oriented bounding boxes (OBBs) intersect.
+
+        Args:
+            obb1 (carla.BoundingBox): The first oriented bounding box.
+            obb2 (carla.BoundingBox): The second oriented bounding box.
+
+        Returns:
+            bool: True if the two OBBs intersect, False otherwise.
+        """
+        relative_position = obb2.location - obb1.location
+
+        # Check for separating planes along the axes of both OBBs
+        if (self.get_separating_plane(relative_position, obb1.rotation.get_forward_vector(), obb1, obb2) or
+            self.get_separating_plane(relative_position, obb1.rotation.get_right_vector(), obb1, obb2) or
+            self.get_separating_plane(relative_position, obb1.rotation.get_up_vector(), obb1, obb2) or
+            self.get_separating_plane(relative_position, obb2.rotation.get_forward_vector(), obb1, obb2) or
+            self.get_separating_plane(relative_position, obb2.rotation.get_right_vector(), obb1, obb2) or
+            self.get_separating_plane(relative_position, obb2.rotation.get_up_vector(), obb1, obb2)):
+
+            return False
+
+        # Check for separating planes along the cross products of the axes of both OBBs
+        if (self.get_separating_plane(relative_position, self.cross_product(obb1.rotation.get_forward_vector(), \
+                                                            obb2.rotation.get_forward_vector()), obb1,obb2) or
+            self.get_separating_plane(relative_position, self.cross_product(obb1.rotation.get_forward_vector(), \
+                                                            obb2.rotation.get_right_vector()), obb1,obb2) or
+            self.get_separating_plane(relative_position, self.cross_product(obb1.rotation.get_forward_vector(), \
+                                                            obb2.rotation.get_up_vector()), obb1,obb2) or
+            self.get_separating_plane(relative_position, self.cross_product(obb1.rotation.get_right_vector(), \
+                                                            obb2.rotation.get_forward_vector()), obb1,obb2) or
+            self.get_separating_plane(relative_position, self.cross_product(obb1.rotation.get_right_vector(), \
+                                                            obb2.rotation.get_right_vector()), obb1, obb2) or
+            self.get_separating_plane(relative_position, self.cross_product(obb1.rotation.get_right_vector(), \
+                                                            obb2.rotation.get_up_vector()), obb1, obb2) or
+            self.get_separating_plane(relative_position, self.cross_product(obb1.rotation.get_up_vector(), \
+                                                            obb2.rotation.get_forward_vector()), obb1,obb2) or
+            self.get_separating_plane(relative_position, self.cross_product(obb1.rotation.get_up_vector(), \
+                                                            obb2.rotation.get_right_vector()), obb1,obb2) or
+            self.get_separating_plane(relative_position, self.cross_product(obb1.rotation.get_up_vector(), \
+                                                            obb2.rotation.get_up_vector()), obb1, obb2)):
+
+            return False
+
+        # If no separating plane is found, the OBBs intersect
+        return True
+
 class AgentPrediction:
     def __init__(self, config):
         self.config = config
+        self.agent_utils = AgentGeometricUtils()
 
         # Dummy waypoint planner
         self._waypoint_planner = PrivilegedRoutePlanner(self.config)
@@ -27,6 +138,14 @@ class AgentPrediction:
         self._world_map = world_map
         self._global_route_planner = global_route_planner
         self._ego_vehicle = ego_vehicle
+
+    def update_state(self, vehicle_context, ego_context):
+        self.vehicle_context = vehicle_context
+        self.ego_context = ego_context
+
+        self.npc_vehicle_dict = {
+            vehicle.id: vehicle for vehicle in vehicle_context['npc_vehicles']
+        }
 
     def _group_npc_vehicles_by_road_and_lane(self, vehicles_list):
         """
@@ -280,7 +399,7 @@ class AgentPrediction:
 
             # Get vehicle data
             vehicle_loc = vehicle.get_location()
-            vehicle_speed = np.sqrt(vehicle.get_velocity().x**2 + vehicle.get_velocity().y**2) # Maybe a different way to calculate speed is required
+            vehicle_speed = vehicle.get_velocity().length()
             vehicle_predicted_distance = vehicle_speed * self.config.prediction_horizon
 
             # Locate NPC vehicle waypoint in the map
@@ -296,6 +415,7 @@ class AgentPrediction:
 
             # Vehicle not controlled by TrafficManager (either static vehicle or scenario vehicle)
             if not next_vehicle_actions:
+                vehicle_plan = [vehicle_wp]
                 # Check if scenario vehicle
                 # TODO: Implement scenario vehicle check
                 pass
@@ -521,3 +641,59 @@ class AgentPrediction:
                 npc_vehicles_future_bounding_boxes_dict[vehicle_id] = future_bounding_boxes
 
         return npc_vehicles_future_bounding_boxes_dict
+
+    def check_ego_collision_vehicles(self, near_lane_change, ego_bounding_boxes, npc_vehicles_future_bounding_boxes_dict, npc_vehicles_lanes):
+        """
+        Check if the ego vehicle will collide with any NPC vehicles in the future.
+
+        Args:
+            near_lane_change (bool): Flag indicating if the ego vehicle is near a lane change.
+            ego_bounding_boxes (list): A list of bounding boxes representing the future states of the ego vehicle.
+            npc_vehicles_future_bounding_boxes_dict (dict): A dictionary containing the future states of the NPC agents.
+            npc_vehicles_lanes (dict): A dictionary containing the lanes of the NPC vehicles.
+        Returns:
+
+        """
+        npc_vehicle_collisions = {}
+
+        ego_vehicle_location = self.ego_context['location']
+        ego_speed = self.ego_context['speed']
+
+        leading_vehicle_ids = npc_vehicles_lanes['ego']['leading_vehicles']
+        trailing_vehicle_ids = npc_vehicles_lanes['ego']['trailing_vehicles']
+
+        for i, ego_bounding_box in enumerate(ego_bounding_boxes):
+            for vehicle_id, future_bounding_boxes in npc_vehicles_future_bounding_boxes_dict.items():
+                # Skip leading and rear vehicles if not near a lane change
+                if vehicle_id in leading_vehicle_ids and not near_lane_change:
+                    continue
+                elif vehicle_id in trailing_vehicle_ids and not near_lane_change:
+                    continue
+                else:
+                    # Check if the ego bounding box intersects with the predicted bounding box of the actor
+                    intersects_with_ego = self.agent_utils.check_obb_intersection(ego_bounding_box, future_bounding_boxes[i])
+
+                    if intersects_with_ego:
+                        target_vehicle = self.npc_vehicle_dict[vehicle_id]
+                        collision_point = future_bounding_boxes[i].location
+
+                        vehicle_spacing = max(2 * target_vehicle.bounding_box.extent.x, 2 * ego_bounding_box.extent.x)
+                        distance_to_collision = collision_point.distance(ego_vehicle_location) - vehicle_spacing
+                        time_to_collision = distance_to_collision / ego_speed
+
+                        collision_entry = {
+                            "vehicle_id": vehicle_id,
+                            "collision_point": collision_point,
+                            "distance_to_collision": distance_to_collision,
+                            "time_to_collision": time_to_collision,
+                        }
+                        if vehicle_id not in npc_vehicle_collisions:
+                            npc_vehicle_collisions[vehicle_id] = collision_entry
+
+        return npc_vehicle_collisions
+
+    def check_ego_collisions_cyclists(self, ego_bounding_boxes, npc_cyclists_future_bounding_boxes_dict):
+        pass
+
+    def check_ego_collisions_peds(self, ego_bounding_boxes, npc_peds_future_bounding_boxes_dict):
+        pass

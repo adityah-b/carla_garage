@@ -196,12 +196,54 @@ class SceneDescriptor:
         Returns:
             dict: A dictionary containing the ego vehicle data.
         """
+        def __get_lane_change_data(lane_change_data):
+            has_lane_change = False
+            lane_change_direction = None
+            can_change_lane = False
+            available_lane_change_distance = -1.0
+
+            if lane_change_data:
+                has_lane_change = lane_change_data["has_lane_change"]
+                if has_lane_change:
+                    lane_change_direction = lane_change_data["lane_change_direction"]
+                    lane_change_early_start_point = lane_change_data["lane_change_early_start_point"]
+                    lane_change_late_start_point = lane_change_data["lane_change_late_start_point"]
+                    lane_change_end_point = lane_change_data["lane_change_end_point"]
+
+                    ego_wp = ego_context["route"][0]
+                    lane_change_early_start_point_loc = lane_change_early_start_point.transform.location
+                    lane_change_late_start_point_loc = lane_change_late_start_point.transform.location
+
+                    # Check if ego has crossed the lane change early start point
+                    has_passed_start_point = False
+                    print(f'Distance to early start point: {lane_change_early_start_point_loc.distance(ego_wp.transform.location)}')
+                    ego_transform = ego_wp.transform
+                    ego_heading = ego_transform.get_forward_vector()
+                    ego_actor_vec = lane_change_early_start_point_loc - ego_transform.location
+                    if ego_heading.dot(ego_actor_vec) < 0:
+                        has_passed_start_point = True
+
+                    # Check if road network allows for lane change
+                    target_lane = ego_wp.get_left_lane() if lane_change_direction == "left" else ego_wp.get_right_lane()
+                    if target_lane and has_passed_start_point:
+                        can_change_lane = True
+                        available_lane_change_distance = lane_change_late_start_point_loc.distance(ego_transform.location)
+
+            lane_change_info = {
+                "has_upcoming_lane_change": has_lane_change,
+                "lane_change_direction": lane_change_direction,
+                "can_change_lane": can_change_lane,
+                "available_lane_change_distance": available_lane_change_distance,
+            }
+            return lane_change_info
+
         ego_data = {
             "speed": ego_context["speed"],
             "orientation": ego_context["compass"],
             "position": ego_context["gps"][:2].tolist(),
             "route": ego_context["route"],
-            "waypoint": ego_context["waypoint"]
+            "waypoint": ego_context["waypoint"],
+            "lane_change": __get_lane_change_data(ego_context["lane_change"]),
         }
         return ego_data
 
@@ -278,6 +320,12 @@ class SceneDescriptor:
       formatted_string += f"    Speed: {ego_data.get('speed', 'N/A')}\n"
       formatted_string += f"    Orientation: {ego_data.get('orientation', 'N/A')}\n"
       formatted_string += f"    Position: {ego_data.get('position', 'N/A')}\n"
+      formatted_string += f"    Lane Change:\n"
+      lane_change = ego_data.get('lane_change', {})
+      formatted_string += f"        Has Upcoming Lane Change: {lane_change.get('has_upcoming_lane_change', 'N/A')}\n"
+      formatted_string += f"        Lane Change Direction: {lane_change.get('lane_change_direction', 'N/A')}\n"
+      formatted_string += f"        Can Change Lane: {lane_change.get('can_change_lane', 'N/A')}\n"
+      formatted_string += f"        Available Lane Change Distance: {lane_change.get('available_lane_change_distance', 'N/A')}\n"
 
       formatted_string += "Agent Data:\n"
       formatted_string += "    Ongoing Traffic:\n"

@@ -938,9 +938,15 @@ class PrivilegedRoutePlanner(object):
             ego_fwd_vec = np.array([ego_fwd_vec.x, ego_fwd_vec.y])
 
             # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' forward vectors
-            dot_products = np.sum(vehicle_fwd_vecs * ego_fwd_vec, axis=1)
+            # Used to assert leading vehicles are traveling in the opposite direction to the ego vehicle
+            heading_dot_products = np.sum(vehicle_fwd_vecs * ego_fwd_vec, axis=1)
 
-            yaw_indices = np.where((yaw_differences > max_yaw_difference) & (dot_products < 0))[0]
+            # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' relative locations to the ego
+            # Used to assert leading vehicles are in front of the ego vehicle
+            ego_actor_vec = vehicle_locations[:, :2] - self.route_points[self.route_index, :2]
+            loc_dot_products = np.sum(ego_actor_vec * ego_fwd_vec, axis=1)
+
+            yaw_indices = np.where((yaw_differences > max_yaw_difference) & (heading_dot_products < 0) & (loc_dot_products >= 0))[0]
 
         yaw_mask = np.zeros_like(vehicle_ids, dtype=bool)
         yaw_mask[yaw_indices] = True
@@ -1075,6 +1081,79 @@ class PrivilegedRoutePlanner(object):
     else:
         return {}
 
+  def get_upcoming_lane_change(self, ego_velocity):
+    """
+      Computes if the ego agent is/was close to a lane change maneuver.
+
+      Args:
+          ego_velocity (float): The current velocity of the ego agent in m/s.
+
+      Returns:
+          bool: True if the ego agent is close to a lane change, False otherwise.
+    """
+    lane_change_data = {}
+    has_lane_change = False
+    lane_change_direction = None
+    lane_change_early_start_point = None
+    lane_change_late_start_point = None
+    lane_change_end_point = None
+
+    # Calculate the braking distance based on the ego velocity
+    braking_distance = ((
+        (ego_velocity * 3.6) / 10.0)**2 / 2.0) + self.config.braking_distance_calculation_safety_distance
+
+    # Determine the number of waypoints to look ahead based on the braking distance
+    look_ahead_points = max(self.config.minimum_lookahead_distance_to_compute_near_lane_change,
+        min(self.route_points.shape[0], self.config.points_per_meter * int(braking_distance)))
+    current_route_index = self.route_index
+    max_route_length = len(self.commands_orig)
+
+    from_index = current_route_index
+    to_index = min(max_route_length - 1, current_route_index + look_ahead_points)
+
+    # Iterate over the points around the current position, checking for lane change commands
+    lane_change_idx = from_index
+    for i in range(from_index, to_index, 1):
+        if self.commands_orig[i] in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
+            # Set the lane change direction and mandatory start point to begin the maneuver
+            has_lane_change = True
+            lane_change_direction = "left" if self.commands_orig[i] == RoadOption.CHANGELANELEFT else "right"
+            lane_change_idx = i
+            break
+
+    if has_lane_change:
+      lane_change_late_start_point = self.route_waypoints[lane_change_idx]
+      cur_idx = lane_change_idx
+      traveled_distance = 0
+
+      # Find the early start point of the lane change, where the ego can execute the maneuver in advance
+      while (cur_idx >= from_index) and \
+        self.route_waypoints[cur_idx].road_id == lane_change_late_start_point.road_id and \
+        traveled_distance < self.config.minimum_lookahead_distance_to_compute_near_lane_change / self.config.points_per_meter:
+          cur_idx -= 1
+          lane_change_early_start_point = self.route_waypoints[cur_idx]
+          traveled_distance = lane_change_late_start_point.transform.location.distance(
+              lane_change_early_start_point.transform.location)
+
+      # Find the end point of the lane change, where the lane change is completed
+      lane_change_cmd = self.commands_orig[lane_change_idx]
+      cur_idx = lane_change_idx
+      while (cur_idx < max_route_length) and \
+        self.commands_orig[cur_idx] == lane_change_cmd:
+          cur_idx += 1
+          lane_change_end_point = self.route_waypoints[cur_idx]
+
+      print(f'EARLY START ROAD ID: {lane_change_early_start_point.road_id}, LANE ID: {lane_change_early_start_point.lane_id}, LOC: \n\tX: {lane_change_early_start_point.transform.location.x}, Y: {lane_change_early_start_point.transform.location.y}, Z: {lane_change_early_start_point.transform.location.z}')
+      print(f'LATE START ROAD ID: {lane_change_late_start_point.road_id}, LANE ID: {lane_change_late_start_point.lane_id}, LOC: \n\tX: {lane_change_late_start_point.transform.location.x}, Y: {lane_change_late_start_point.transform.location.y}, Z: {lane_change_late_start_point.transform.location.z}')
+      print(f'END ROAD ID: {lane_change_end_point.road_id}, LANE ID: {lane_change_end_point.lane_id}, LOC: \n\tX: {lane_change_end_point.transform.location.x}, Y: {lane_change_end_point.transform.location.y}, Z: {lane_change_end_point.transform.location.z}')
+    lane_change_data = {
+        "has_lane_change": has_lane_change,
+        "lane_change_direction": lane_change_direction,
+        "lane_change_early_start_point": lane_change_early_start_point,
+        "lane_change_late_start_point": lane_change_late_start_point,
+        "lane_change_end_point": lane_change_end_point,
+    }
+    return lane_change_data
 
   def compute_leading_vehicles(self, list_vehicles, ego_vehicle_id):
     """

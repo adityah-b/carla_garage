@@ -4,23 +4,31 @@ import traceback
 
 from scipy.integrate import RK45
 from scene_interpreter import *
+from privileged_route_planner import PrivilegedRoutePlanner
 
 class TrajectoryPlanner:
     def __init__(self, config):
         self.config = config
+        # self.command_mapping = {
+        #     "longitudinal": {
+        #         "maintain_speed": self._maintain_speed,
+        #         # "stop": self._stop,
+        #         "accelerate": self._accelerate,
+        #         "decelerate": self._decelerate,
+        #     },
+        #     # "lateral": {
+        #     #     "turn_left": self._turn_left,
+        #     #     "turn_right": self._turn_right,
+        #     #     "change_lane_left": self._change_lane_left,
+        #     #     "change_lane_right": self._change_lane_right,
+        #     # },
+        # }
         self.command_mapping = {
-            "longitudinal": {
-                "maintain_speed": self._maintain_speed,
-                # "stop": self._stop,
-                "accelerate": self._accelerate,
-                "decelerate": self._decelerate,
-            },
-            # "lateral": {
-            #     "turn_left": self._turn_left,
-            #     "turn_right": self._turn_right,
-            #     "change_lane_left": self._change_lane_left,
-            #     "change_lane_right": self._change_lane_right,
-            # },
+            "maintain_speed": self._maintain_speed,
+            # "stop": self._stop,
+            "accelerate": self._accelerate,
+            "decelerate": self._decelerate,
+            "change_lane_left": self._change_lane,
         }
         self.all_actors = {
             "vehicle": {},
@@ -30,6 +38,9 @@ class TrajectoryPlanner:
             "stop_sign": {},
         }
         self.target_speed = 0.0
+
+        # Dummy waypoint planner
+        self._waypoint_planner = PrivilegedRoutePlanner(self.config)
 
     def _compute_target_speed_idm(
             self,
@@ -103,7 +114,8 @@ class TrajectoryPlanner:
     Interface for translating high-level text commands into low-level outputs.
     """
 
-    def update_state(self, vehicle_context, traffic_context, ego_context):
+    def update_state(self, vehicle_context, traffic_context, ego_context, waypoint_planner):
+        self._waypoint_planner = waypoint_planner
         self.vehicle_context = vehicle_context
         self.traffic_context = traffic_context
         self.ego_context = ego_context
@@ -125,13 +137,14 @@ class TrajectoryPlanner:
             return None
 
         # TODO: Only longitudinal commands are supported for now, add lateral ones
-        command_type = "longitudinal"
+        # command_type = "longitudinal"
         command = high_level_command.command.value
         params = high_level_command.params
         key_actors = high_level_command.key_actors
         reasoning = high_level_command.reasoning
 
-        command_mapping = self.command_mapping[command_type]
+        # command_mapping = self.command_mapping[command_type]
+        command_mapping = self.command_mapping
         try:
             print(f'Executing command: {command} with params: {params} and key actors: {key_actors} with reasoning: {reasoning}')
             return command_mapping[command](params, key_actors)
@@ -219,7 +232,8 @@ class TrajectoryPlanner:
                 target_speeds.append(target_speed)
 
         self.target_speed = min(target_speeds)
-        return self.target_speed
+        start_index = self.ego_context['route_index']
+        return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
 
 
     def _maintain_speed(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor]):
@@ -276,7 +290,8 @@ class TrajectoryPlanner:
                 target_speeds.append(target_speed)
 
         self.target_speed = min(target_speeds)
-        return self.target_speed
+        start_index = self.ego_context['route_index']
+        return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
 
 
     def _decelerate(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor]):
@@ -339,5 +354,50 @@ class TrajectoryPlanner:
                 target_speeds.append(target_speed)
 
         self.target_speed = min(target_speeds)
-        return self.target_speed
+        start_index = self.ego_context['route_index']
+        return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
 
+    def _change_lane(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor], shift_to_left_lane = True):
+        target_speed_initial = 25.0
+        target_speed = target_speed_initial
+
+        from_index = self.ego_context['route_index']
+        start_wp = self.ego_context['route'][0]
+
+        index_offset = 1
+        while index_offset < len(self.ego_context['route']):
+            end_wp = self.ego_context['route'][index_offset]
+            if start_wp.lane_id != end_wp.lane_id:
+                break
+            index_offset += 1
+
+        to_index = from_index + index_offset
+        transition_length = self.config.transition_smoothness_distance
+
+        self._waypoint_planner.shift_route_smoothly(from_index, to_index, True, transition_length)
+
+        ongoing_leading_vehicles = self.vehicle_context['ongoing_leading_vehicles']
+        target_lane_id = end_wp.lane_id
+
+        if target_lane_id in ongoing_leading_vehicles:
+            lane_leading_vehicles_list = ongoing_leading_vehicles[target_lane_id]
+            for leading_vehicle in lane_leading_vehicles_list:
+                leading_actor_speed = leading_vehicle.get_velocity().length()
+                leading_actor_length = leading_vehicle.bounding_box.extent.x * 2
+
+                ego_location = self.ego_context['location']
+                distance_to_leading_actor = ego_location.distance(leading_vehicle.get_location())
+
+                desired_following_distance = self.config.idm_leading_vehicle_minimum_distance
+
+                target_speed = min(target_speed, self._compute_target_speed_idm(
+                    desired_speed = target_speed_initial,
+                    leading_actor_length = leading_actor_length,
+                    ego_speed = self.ego_context['speed'],
+                    leading_actor_speed = leading_actor_speed,
+                    distance_to_leading_actor = distance_to_leading_actor,
+                    s0 = desired_following_distance
+                ))
+
+        self.target_speed = target_speed
+        return self.target_speed, self._waypoint_planner.route_points[from_index:], self._waypoint_planner.route_waypoints[from_index:]

@@ -395,9 +395,8 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
       Reasoning for the command.
 
 `LongitudinalCommand` ACTIONS:
-1. `accelerate`: Increase the ego vehicle's speed.
-2. `decelerate`: Decrease the ego vehicle's speed.
-3. `maintain_speed`: Maintain the ego vehicle's current speed
+- `maintain_speed`: Maintain the ego vehicle's current speed
+- `change_lane_left`: Change the ego vehicle's lane to the left.
 
 `LongitudinalCommandParams` PARAMETERS:
 1. `desired_following_distance`: The desired following distance to the leading vehicle, in meters.
