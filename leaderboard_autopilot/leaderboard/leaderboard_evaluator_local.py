@@ -286,7 +286,8 @@ class LeaderboardEvaluator(object):
         # Load the world and the scenario
         try:
             self._load_and_wait_for_world(args, config.town)
-            self.route_scenario = RouteScenario(world=self.world, config=config, debug_mode=args.debug)
+            # self.route_scenario = RouteScenario(world=self.world, config=config, debug_mode=args.debug)
+            self.route_scenario = RouteScenario(world=self.world, config=config)
             self.statistics_manager.set_scenario(self.route_scenario)
 
         except Exception:
@@ -421,10 +422,11 @@ class LeaderboardEvaluator(object):
         """
         route_indexer = RouteIndexer(args.routes, args.repetitions, args.routes_subset)
 
-        if args.resume:
-            resume = route_indexer.validate_and_resume(args.checkpoint)
-        else:
-            resume = False
+        resume = False
+        # if args.resume:
+        #     resume = route_indexer.validate_and_resume(args.checkpoint)
+        # else:
+        #     resume = False
 
         if resume:
             self.statistics_manager.add_file_records(args.checkpoint)

@@ -445,6 +445,8 @@ class PrivilegedRoutePlanner(object):
 
     self.compute_route_info(carla_world, carla_map)
 
+    self._world = carla_world
+
   def compute_rotation_angles(self, route_points):
     """
         Computes the yaw angles corresponding to the ego vehicle's orientation at individual route points in degrees.
@@ -920,11 +922,20 @@ class PrivilegedRoutePlanner(object):
         max_lane_offset = max(abs(min_lane_id - ego_wp.lane_id), abs(max_lane_id - ego_wp.lane_id))
         max_distance = self.leading_vehicles_max_route_distance * (1 + max_lane_offset)
 
+        ego_fwd_vec = self.route_waypoints[self.route_index].transform.get_forward_vector()
+        ego_fwd_vec = np.array([ego_fwd_vec.x, ego_fwd_vec.y])
+
         # Filter leading vehicles based on traffic type
         yaw_indices = []
         if traffic_type == "ongoing":
             max_yaw_difference = self.config.leading_vehicles_max_route_angle_ongoing
-            yaw_indices = np.where(yaw_differences < max_yaw_difference)[0]
+            # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' relative locations to the ego
+            # Used to assert leading vehicles are in front of the ego vehicle
+            ego_actor_vec = vehicle_locations[:, :2] - self.route_points[self.route_index, :2]
+            loc_dot_products = np.sum(ego_actor_vec * ego_fwd_vec, axis=1)
+
+            yaw_indices = np.where((yaw_differences < max_yaw_difference) & (loc_dot_products >= 0))[0]
+
         elif traffic_type == "oncoming":
             # print(f'Yaw differences: {yaw_differences}, Max yaw difference: {self.config.leading_vehicles_max_route_angle_oncoming}')
             # print(f'Distance: {min_distances}, Max distance: {max_distance}')
@@ -934,9 +945,6 @@ class PrivilegedRoutePlanner(object):
               [vehicle.get_transform().get_forward_vector().x, vehicle.get_transform().get_forward_vector().y]
               for vehicle, _ in valid_npc_vehicles
             ])
-            ego_fwd_vec = self.route_waypoints[self.route_index].transform.get_forward_vector()
-            ego_fwd_vec = np.array([ego_fwd_vec.x, ego_fwd_vec.y])
-
             # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' forward vectors
             # Used to assert leading vehicles are traveling in the opposite direction to the ego vehicle
             heading_dot_products = np.sum(vehicle_fwd_vecs * ego_fwd_vec, axis=1)
@@ -1128,8 +1136,9 @@ class PrivilegedRoutePlanner(object):
 
       # Find the early start point of the lane change, where the ego can execute the maneuver in advance
       while (cur_idx >= from_index) and \
+        self.route_waypoints[cur_idx].lane_id == lane_change_late_start_point.lane_id and \
         self.route_waypoints[cur_idx].road_id == lane_change_late_start_point.road_id and \
-        traveled_distance < self.config.minimum_lookahead_distance_to_compute_near_lane_change / self.config.points_per_meter:
+        traveled_distance < 50.0:
           cur_idx -= 1
           lane_change_early_start_point = self.route_waypoints[cur_idx]
           traveled_distance = lane_change_late_start_point.transform.location.distance(
@@ -1154,6 +1163,66 @@ class PrivilegedRoutePlanner(object):
         "lane_change_end_point": lane_change_end_point,
     }
     return lane_change_data
+
+  def change_lane(self,
+                  start_index,
+                  lane_change_index,
+                  end_index,
+                  lane_change_direction,
+                  transition_length=120.,
+                  lane_transition_factor=1.):
+      shift_to_left_lane = True if lane_change_direction == "left" else False
+      for idx in range(start_index, lane_change_index):
+        # Get target lane waypoint (left or right)
+        if shift_to_left_lane:
+            target_wp = self.route_waypoints[idx].get_left_lane()
+            command = RoadOption.CHANGELANELEFT
+        else:
+            target_wp = self.route_waypoints[idx].get_right_lane()
+            command = RoadOption.CHANGELANERIGHT
+
+        # Fallback to current if neighbor lane not available
+        current_wp = self.route_waypoints[idx]
+        target_loc = target_wp.transform.location if target_wp else current_wp.transform.location
+        target_loc = np.array([target_loc.x, target_loc.y, target_loc.z])
+        current_loc = self.route_points[idx]
+
+        # Compute transition factor (0 → 1 over transition_length)
+        if idx - start_index < transition_length:
+            transition_factor = self._smooth_transition(float(idx - start_index) / transition_length)
+        else:
+            transition_factor = 1.0
+
+        # Interpolate between current lane and target lane
+        self.route_points[idx] = (
+            lane_transition_factor * transition_factor * target_loc +
+            (1. - lane_transition_factor * transition_factor) * current_loc
+        )
+
+        # Set the lane change command during transition
+        if transition_factor < 1.0:
+            self.commands[idx] = command
+        else:
+            # After transition, assume straight drive in new lane
+            self.commands[idx] = RoadOption.LANEFOLLOW
+
+      lane_change_start_target_wp = self.route_waypoints[lane_change_index].get_left_lane() if shift_to_left_lane else self.route_waypoints[lane_change_index].get_right_lane()
+      base_point = np.array([lane_change_start_target_wp.transform.location.x,
+                             lane_change_start_target_wp.transform.location.y,
+                             lane_change_start_target_wp.transform.location.z])
+      lane_change_end_wp = self.route_waypoints[end_index]
+
+      lane_vec = lane_change_end_wp.transform.location - lane_change_start_target_wp.transform.location
+      lane_vec = np.array([lane_vec.x, lane_vec.y, lane_vec.z])
+      lane_vec = lane_vec / np.linalg.norm(lane_vec)  # normalize
+
+      for idx in range(lane_change_index, end_index):
+        wp_vec = self.route_waypoints[idx].transform.location - lane_change_start_target_wp.transform.location
+        wp_vec = np.array([wp_vec.x, wp_vec.y, wp_vec.z])
+
+        wp_proj = np.dot(lane_vec, wp_vec) * lane_vec
+        self.route_points[idx] = base_point + wp_proj
+        self.commands[idx] = RoadOption.LANEFOLLOW
 
   def compute_leading_vehicles(self, list_vehicles, ego_vehicle_id):
     """

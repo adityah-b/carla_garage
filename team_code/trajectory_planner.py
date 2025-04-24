@@ -361,23 +361,36 @@ class TrajectoryPlanner:
         target_speed_initial = 25.0
         target_speed = target_speed_initial
 
+        lane_change = self.ego_context['lane_change']
+        lane_change_direction = lane_change['lane_change_direction']
+        lane_change_late_start_point_loc = lane_change['lane_change_late_start_point'].transform.location
+
+        # Implement sanity check for no lane change
+        if lane_change is None:
+            pass
+
         from_index = self.ego_context['route_index']
         start_wp = self.ego_context['route'][0]
 
-        index_offset = 1
-        while index_offset < len(self.ego_context['route']):
-            end_wp = self.ego_context['route'][index_offset]
-            if start_wp.lane_id != end_wp.lane_id:
-                break
-            index_offset += 1
+        lane_change_late_start_wp = lane_change['lane_change_late_start_point']
+        lane_change_end_wp = lane_change['lane_change_end_point']
+        lane_change_index = from_index
+        to_index = from_index
+        while to_index < len(self._waypoint_planner.route_waypoints) and \
+          lane_change_end_wp != self._waypoint_planner.route_waypoints[to_index]:
+            if lane_change_late_start_wp == self._waypoint_planner.route_waypoints[to_index]:
+                lane_change_index = to_index
+            to_index += 1
 
-        to_index = from_index + index_offset
-        transition_length = self.config.transition_smoothness_distance
+        available_lane_change_distance = lane_change_late_start_point_loc.distance(start_wp.transform.location)
+        # transition_length = self.config.transition_smoothness_distance
+        transition_length = available_lane_change_distance * self.config.points_per_meter
 
-        self._waypoint_planner.shift_route_smoothly(from_index, to_index, True, transition_length)
+        print(f'From Index: {from_index}, Lane Change Index: {lane_change_index}, To Index: {to_index}')
+        self._waypoint_planner.change_lane(from_index, lane_change_index, to_index, lane_change_direction, transition_length)
 
         ongoing_leading_vehicles = self.vehicle_context['ongoing_leading_vehicles']
-        target_lane_id = end_wp.lane_id
+        target_lane_id = lane_change_end_wp.lane_id
 
         if target_lane_id in ongoing_leading_vehicles:
             lane_leading_vehicles_list = ongoing_leading_vehicles[target_lane_id]

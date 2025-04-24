@@ -1,11 +1,82 @@
 import numpy as np
 import carla
 import transfuser_utils as t_u
+import cv2
 
 class SceneDescriptor:
     """
     Interface class to convert privileged simulator data into a structured JSON-like format.
     """
+    # Dictionary of CameraInterface objects organized by their sensor tags
+    camera_objs = {}
+    camera_tags = []
+
+    class CameraInterface:
+        """
+        Class to handle camera data and projection matrices.
+        """
+        def __init__(self, camera_actor_obj):
+            self.obj = camera_actor_obj
+            self.width = int(camera_actor_obj.attributes['image_size_x'])
+            self.height = int(camera_actor_obj.attributes['image_size_y'])
+            self.fov = float(camera_actor_obj.attributes['fov'])
+
+            print(f"Camera Width: {self.width} type: {type(self.width)}, Height: {self.height} type: {type(self.height)}, FOV: {self.fov} type: {type(self.fov)}")
+
+            self.K = self._build_projection_matrix(self.width, self.height, self.fov)
+            self.K_behind = self._build_projection_matrix(self.width, self.height, self.fov, is_behind_camera=True)
+
+            self.image = None
+
+        def _build_projection_matrix(self, w, h, fov, is_behind_camera=False):
+            focal = w / (2.0 * np.tan(fov * np.pi / 360.0))
+            K = np.identity(3)
+
+            if is_behind_camera:
+                K[0, 0] = K[1, 1] = -focal
+            else:
+                K[0, 0] = K[1, 1] = focal
+
+            K[0, 2] = w / 2.0
+            K[1, 2] = h / 2.0
+            return K
+
+        def _point_in_canvas(self, pos, img_h, img_w):
+            """Return true if point is in canvas"""
+            if (pos[0] >= 0) and (pos[0] < img_w) and (pos[1] >= 0) and (pos[1] < img_h):
+                return True
+            return False
+
+        def _get_image_point(self, loc, K, w2c):
+            # Calculate 2D projection of 3D coordinate
+
+            # Format the input coordinate (loc is a carla.Position object)
+            point = np.array([loc.x, loc.y, loc.z, 1])
+            # transform to camera coordinates
+            point_camera = np.dot(w2c, point)
+
+            # New we must change from UE4's coordinate system to an "standard"
+            # (x, y ,z) -> (y, -z, x)
+            # and we remove the fourth componebonent also
+            point_camera = [point_camera[1], -point_camera[2], point_camera[0]]
+
+            # now project 3D->2D using the camera matrix
+            point_img = np.dot(K, point_camera)
+            # normalize
+            point_img[0] /= point_img[2]
+            point_img[1] /= point_img[2]
+
+            return point_img[0:2]
+
+        def _set_image(self, image):
+            """
+            Update the camera observation with the new image data.
+
+            Args:
+                image (numpy.ndarray): The image data from the camera.
+            """
+            self.image = np.copy(image)
+
     def __init__(self, config):
         """
         Initialize the SceneDescriptor object.
@@ -14,6 +85,110 @@ class SceneDescriptor:
             config (object): The configuration object.
         """
         self.config = config
+
+    def setup_cameras(self, cameras):
+        for tag, camera_obj in cameras:
+           self.camera_objs[tag] = self.CameraInterface(camera_obj)
+           self.camera_tags.append(tag)
+
+    def set_camera_observations(self, images):
+        """
+        Set the camera observations with the new image data.
+
+        Args:
+            images (list): A list of tuples containing the camera tag and the image data.
+        """
+        for tag, image in images:
+            if tag in self.camera_tags:
+                self.camera_objs[tag]._set_image(image)
+            else:
+                print(f"Camera tag {tag} not found in camera tags.")
+
+    def _draw_bounding_box(self, camera, vehicle):
+        world_to_camera = np.array(camera.obj.get_transform().get_inverse_matrix())
+        edges = [[0,1], [1,3], [3,2], [2,0], [0,4], [4,5], [5,1], [5,7], [7,6], [6,4], [6,2], [7,3]]
+        verts = [v for v in vehicle.bounding_box.get_world_vertices(vehicle.get_transform())]
+
+        camera_transform = camera.obj.get_transform()
+        camera_fwd_vec = camera_transform.get_forward_vector()
+        camera_loc = camera_transform.location
+
+        for edge in edges:
+            p1 = camera._get_image_point(verts[edge[0]], camera.K, world_to_camera)
+            p2 = camera._get_image_point(verts[edge[1]], camera.K, world_to_camera)
+
+            p1_in_canvas = camera._point_in_canvas(p1, camera.height, camera.width)
+            p2_in_canvas = camera._point_in_canvas(p2, camera.height, camera.width)
+
+            if not p1_in_canvas and not p2_in_canvas:
+                continue
+
+            ray0 = verts[edge[0]] - camera_loc
+            ray1 = verts[edge[1]] - camera_loc
+
+            # One of the vertex is behind the camera
+            if not (camera_fwd_vec.dot(ray0) > 0):
+                p1 = camera._get_image_point(verts[edge[0]], camera.K_behind, world_to_camera)
+            if not (camera_fwd_vec.dot(ray1) > 0):
+                p2 = camera._get_image_point(verts[edge[1]], camera.K_behind, world_to_camera)
+
+            cv2.line(camera.image, (int(p1[0]),int(p1[1])), (int(p2[0]),int(p2[1])), (0,0,255), 1)
+
+    def _draw_label(self, camera, vehicle):
+        world_to_camera = np.array(camera.obj.get_transform().get_inverse_matrix())
+        vehicle_loc = vehicle.get_transform().location
+        vehicle_camera_loc = camera._get_image_point(vehicle_loc, camera.K, world_to_camera)
+
+        if camera._point_in_canvas(vehicle_camera_loc, camera.height, camera.width):
+            cx, cy = int(vehicle_camera_loc[0]), int(vehicle_camera_loc[1])
+
+            box_width, box_height = 60, 20
+            top_left = (cx - box_width // 2, cy - box_height // 2)
+            bottom_right = (cx + box_width // 2, cy + box_height // 2)
+
+            # Draw blue rectangle
+            cv2.rectangle(camera.image, top_left, bottom_right, (0, 0, 255), thickness=-1)
+
+            # Put the vehicle ID as text inside the box
+            text = str(vehicle.id)
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            font_thickness = 1
+            text_size = cv2.getTextSize(text, font, font_scale, font_thickness)[0]
+
+            # Center the text within the box
+            text_x = cx - text_size[0] // 2
+            text_y = cy + text_size[1] // 2
+
+            cv2.putText(camera.image, text, (text_x, text_y), font, font_scale, (255, 255, 255), font_thickness, cv2.LINE_AA)
+
+    def draw_actor_bbs(self, ego_context, agent_context):
+        ego_actor = ego_context['ego_actor']
+        ego_transform = ego_actor.get_transform()
+        ego_loc = ego_transform.location
+        ego_fwd_vec = ego_transform.get_forward_vector()
+
+        npc_vehicles = agent_context['npc_vehicles']
+        bb_images = {}
+
+        for tag, camera in self.camera_objs.items():
+            for vehicle in npc_vehicles:
+                vehicle_loc = vehicle.get_transform().location
+                ego_to_vehicle_vec = vehicle_loc - ego_loc
+                dist_to_vehicle = vehicle_loc.distance(ego_loc)
+
+                draw_boxes = (
+                    "bev" in tag or
+                    (ego_to_vehicle_vec.dot(ego_fwd_vec) > 0 and dist_to_vehicle < self.config.max_front_cam_draw_distance)
+                )
+
+                if draw_boxes:
+                    self._draw_bounding_box(camera, vehicle)
+                    self._draw_label(camera, vehicle)
+
+            bb_images[tag] = camera.image
+
+        return bb_images
 
     def _get_npc_vehicle_data(self, ego_context, vehicles):
         """
@@ -226,8 +401,9 @@ class SceneDescriptor:
                     # Check if road network allows for lane change
                     target_lane = ego_wp.get_left_lane() if lane_change_direction == "left" else ego_wp.get_right_lane()
                     if target_lane and has_passed_start_point:
-                        can_change_lane = True
                         available_lane_change_distance = lane_change_late_start_point_loc.distance(ego_transform.location)
+                        if available_lane_change_distance > 5.0:
+                            can_change_lane = True
 
             lane_change_info = {
                 "has_upcoming_lane_change": has_lane_change,

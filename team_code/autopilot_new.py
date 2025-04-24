@@ -41,6 +41,8 @@ from trajectory_planner import TrajectoryPlanner
 
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
+import os
+from datetime import datetime
 
 def get_entry_point():
   return "AutoPilot"
@@ -277,6 +279,11 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     grp = GlobalRoutePlanner(self.world_map, self.config.sampling_resolution)
     self.agent_prediction.setup(self.traffic_manager, self.world_map, grp, self._vehicle)
 
+    # Setup cameras
+    self.camera_tags = ['rgb', 'rgb_bev']
+    cameras = [(tag, self.sensor_interface._sensors_objects[tag]) for tag in self.camera_tags]
+    self.scene_descriptor.setup_cameras(cameras)
+
     self.initialized = True
 
   def sensors(self):
@@ -325,7 +332,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         'pitch': -90,
         'yaw': 0,
         'width': self.config.camera_width,
-        'height': self.config.camera_height,
+        'height': self.config.camera_height * 2,
         'fov': self.config.camera_fov,
         'id': 'rgb_bev'
       }, {
@@ -394,16 +401,16 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     # Get the control commands and driving data for the current step
     control, driving_data = self._get_control(input_data, plant)
 
-    rgb = input_data['rgb'][1][:, :, :3]
-    rgb_bev = input_data['rgb_bev'][1][:, :, :3]
+    # rgb = input_data['rgb'][1][:, :, :3]
+    # rgb_bev = input_data['rgb_bev'][1][:, :, :3]
 
-    rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-    rgb_bev = cv2.cvtColor(rgb_bev, cv2.COLOR_BGR2RGB)
-    final = np.concatenate((rgb, rgb_bev), axis=0)
+    # rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+    # rgb_bev = cv2.cvtColor(rgb_bev, cv2.COLOR_BGR2RGB)
+    # final = np.concatenate((rgb, rgb_bev), axis=0)
 
-    cv2.namedWindow("BirdView RGB", cv2.WINDOW_NORMAL)
-    cv2.imshow("BirdView RGB", final)
-    cv2.waitKey(1)
+    # cv2.namedWindow("BirdView RGB", cv2.WINDOW_NORMAL)
+    # cv2.imshow("BirdView RGB", final)
+    # cv2.waitKey(1)
 
     # self.visualizer.render()
 
@@ -452,14 +459,14 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     # NEW CODE
     npc_vehicles = [vehicle for vehicle in vehicles if vehicle.id != self._vehicle.id]
     # print(f'Printing All Vehicle IDs')
-    for vehicle in npc_vehicles:
-      vehicle_id = vehicle.id
-      # print(f"\tVehicle ID: {vehicle_id}")
-      # Draw vehicle ID as debug information
-      vehicle_location = vehicle.get_location()
-      self._world.debug.draw_string(vehicle_location, str(vehicle_id), draw_shadow=False,
-                                    color=carla.Color(r=255, g=0, b=0), life_time=self.config.draw_life_time,
-                                    persistent_lines=True)
+    # for vehicle in npc_vehicles:
+    #   vehicle_id = vehicle.id
+    #   # print(f"\tVehicle ID: {vehicle_id}")
+    #   # Draw vehicle ID as debug information
+    #   vehicle_location = vehicle.get_location()
+    #   self._world.debug.draw_string(vehicle_location, str(vehicle_id), draw_shadow=False,
+    #                                 color=carla.Color(r=255, g=0, b=0), life_time=self.config.draw_life_time,
+    #                                 persistent_lines=True)
     # print(f'\n')
 
     # Get leading and trailing vehicles for ongoing and oncoming traffic
@@ -470,13 +477,13 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     oncoming_trailing_vehicles = self._waypoint_planner.get_trailing_vehicles(self.world_map, npc_vehicles, "oncoming")
 
     lane_change_data = self._waypoint_planner.get_upcoming_lane_change(ego_speed)
-    print(f"Lane Change Data: {lane_change_data}")
     # print(f'Ongoing Leading Vehicles: {ongoing_leading_vehicles}')
     # print(f'Ongoing Trailing Vehicles: {ongoing_trailing_vehicles}')
     # print(f'Oncoming Leading Vehicles: {oncoming_leading_vehicles}')
     # print(f'Oncoming Trailing Vehicles: {oncoming_trailing_vehicles}')
 
     ego_context = {
+        "ego_actor": self._vehicle,
         "speed": tick_data["speed"],
         "compass": tick_data["compass"],
         "gps": tick_data["gps"],
@@ -545,14 +552,48 @@ Scenario Description: The ego vehicle is expected to merge onto a highway from a
     formatted_data = scenario_prompt + self.scene_descriptor.to_formatted_string(structured_data)
     # print(f"Structured Data: {formatted_data}")
 
+    # Get camera sensor object
+    image_obvs = []
+    for tag in self.camera_tags:
+      image_obvs.append((tag, input_data[tag][1][:, :, :3]))
+    self.scene_descriptor.set_camera_observations(image_obvs)
+
+    bb_images = self.scene_descriptor.draw_actor_bbs(ego_context, agent_context)
+
+    bb_rgb = bb_images['rgb']
+    bb_rgb_bev = bb_images['rgb_bev']
+
+    bb_rgb = cv2.cvtColor(bb_rgb, cv2.COLOR_BGR2RGB)
+    bb_rgb_bev = cv2.cvtColor(bb_rgb_bev, cv2.COLOR_BGR2RGB)
+    bb_final = np.concatenate((bb_rgb, bb_rgb_bev), axis=0)
+
+    cv2.namedWindow("BirdView RGB", cv2.WINDOW_NORMAL)
+    cv2.imshow("BirdView RGB", bb_final)
+    cv2.waitKey(1)
+
     rgb = input_data['rgb'][1][:, :, :3]
     visu_img = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
+
+    if self.step % int(self.config.carla_fps // 3) == 0:
+      # Ensure the output directory exists only once
+      if not hasattr(self, '_output_dir'):
+          current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+          self._output_dir = f"runs/run_{current_time}"
+          os.makedirs(self._output_dir, exist_ok=True)
+      output_dir = self._output_dir
+
+      # Save the image to the output directory
+      if not hasattr(self, '_image_counter'):
+          self._image_counter = 0
+      self._image_counter += 1
+      output_path = os.path.join(output_dir, f"rgb_bounding_boxes_{self._image_counter:04d}.png")
+      cv2.imwrite(output_path, bb_final)
 
     # Execute at 1Hz
     high_level_cmd = None
     if self.step % int(self.config.carla_fps) == 0:
       print(f"Structured Data: {formatted_data}")
-      high_level_cmd = self.scene_interpreter.run_step(formatted_data, visu_img)
+      high_level_cmd = self.scene_interpreter.run_step(formatted_data, bb_final)
 
     # Translate the high-level command to low-level commands
     brake = False

@@ -212,6 +212,8 @@ class GlobalConfig:
     self.sampling_resolution = 2.0
     self.prediction_horizon = 3.0
 
+    self.max_front_cam_draw_distance = 50.0
+
     # LLM GUIDED NEW CODE (WIP)
 
     # -----------------------------------------------------------------------------

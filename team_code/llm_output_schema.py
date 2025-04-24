@@ -18,8 +18,8 @@ class LongitudinalCommand(enum.Enum):
     """
     Enum for longitudinal driving commands.
     """
-    MAINTAIN_SPEED = "maintain_speed"
-    # ACCELERATE = "accelerate"
+    # MAINTAIN_SPEED = "maintain_speed"
+    ACCELERATE = "accelerate"
     # DECELERATE = "decelerate"
     CHANGE_LANE_LEFT = "change_lane_left"
     # STOP = "stop"
