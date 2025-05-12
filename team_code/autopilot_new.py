@@ -550,7 +550,7 @@ Scenario Name: EnterActorFlowV2
 Scenario Description: The ego vehicle is expected to merge onto a highway from a ramp.\n
 """
     formatted_data = scenario_prompt + self.scene_descriptor.to_formatted_string(structured_data)
-    # print(f"Structured Data: {formatted_data}")
+    print(f"Structured Data: {formatted_data}")
 
     # Get camera sensor object
     image_obvs = []
@@ -592,7 +592,7 @@ Scenario Description: The ego vehicle is expected to merge onto a highway from a
     # Execute at 1Hz
     high_level_cmd = None
     if self.step % int(self.config.carla_fps) == 0:
-      print(f"Structured Data: {formatted_data}")
+      # print(f"Structured Data: {formatted_data}")
       high_level_cmd = self.scene_interpreter.run_step(formatted_data, bb_final)
 
     # Translate the high-level command to low-level commands

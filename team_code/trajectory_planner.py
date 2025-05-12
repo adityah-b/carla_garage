@@ -167,203 +167,294 @@ class TrajectoryPlanner:
 
         return extracted_actors
 
+    # def _accelerate(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor]):
+    #     key_actors = self._get_key_actors(key_actors_llm)
+    #     target_speed_initial = params.target_speed \
+    #         if params.target_speed \
+    #         else self.ego_context['speed']
+
+    #     print(f'Ego Speed: {self.ego_context["speed"]}\n')
+    #     print(f'Target Speed Initial: {target_speed_initial}\n')
+
+    #     target_speeds = [target_speed_initial]
+    #     if key_actors:
+    #         for key_actor in key_actors:
+    #             actor_type, actor = key_actor
+    #             if actor_type == "vehicle":
+    #                 leading_actor_speed = actor.get_velocity().length()
+    #                 leading_actor_length = actor.bounding_box.extent.x * 2
+
+    #                 ego_location = self.ego_context['location']
+    #                 distance_to_leading_actor = ego_location.distance(actor.get_location())
+
+    #                 desired_following_distance = params.desired_following_distance \
+    #                     if params.desired_following_distance \
+    #                     else self.config.idm_leading_vehicle_minimum_distance
+
+    #                 target_speed = self._compute_target_speed_idm(
+    #                     desired_speed = target_speed_initial,
+    #                     leading_actor_length = leading_actor_length,
+    #                     ego_speed = self.ego_context['speed'],
+    #                     leading_actor_speed = leading_actor_speed,
+    #                     distance_to_leading_actor = distance_to_leading_actor,
+    #                     s0 = desired_following_distance
+    #                 )
+
+    #                 print(f'Leading Vehicle Speed: {target_speed}\n')
+    #             elif actor_type == "traffic_light":
+    #                 if actor.state == carla.TrafficLightState.Red:
+    #                     leading_actor_speed = 0.0
+    #                     leading_actor_length = 0.0
+
+    #                     ego_location = self.ego_context['location']
+    #                     ego_speed = self.ego_context['speed']
+    #                     distance_to_leading_actor = self.traffic_context['distance_to_next_traffic_light']
+
+    #                     desired_following_distance = params.desired_following_distance \
+    #                         if params.desired_following_distance \
+    #                         else self.config.idm_red_light_minimum_distance
+
+    #                     desired_time_headway = self.config.idm_red_light_desired_time_headway
+
+    #                     target_speed = self._compute_target_speed_idm(
+    #                         desired_speed = target_speed_initial,
+    #                         leading_actor_length = leading_actor_length,
+    #                         ego_speed = ego_speed,
+    #                         leading_actor_speed = leading_actor_speed,
+    #                         distance_to_leading_actor = distance_to_leading_actor,
+    #                         s0 = desired_following_distance,
+    #                         T=desired_time_headway
+    #                     )
+    #                 else:
+    #                     target_speed = target_speed_initial
+    #                 print(f'Traffic Light Speed: {target_speed}\n')
+
+    #             target_speeds.append(target_speed)
+
+    #     self.target_speed = min(target_speeds)
+    #     start_index = self.ego_context['route_index']
+    #     return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
+
+    def _get_target_speed(self, target_speed_initial, params: LongitudinalCommandParams):
+        ego_location = self.ego_context['location']
+        ego_speed = self.ego_context['speed']
+        ego_wp = self.ego_context['waypoint']
+        ego_lane_id = ego_wp.lane_id
+
+        print(f'Ego Speed: {ego_speed}\n')
+        print(f'Target Speed Initial: {target_speed_initial}\n')
+
+        target_speeds = [target_speed_initial]
+        ongoing_leading_vehicles = self.vehicle_context['ongoing_leading_vehicles']
+
+        # Check for leading vehicles in the ego lane
+        if ego_lane_id in ongoing_leading_vehicles:
+            ego_lane_leading_vehicles_list = ongoing_leading_vehicles[ego_lane_id]
+            for leading_vehicle in ego_lane_leading_vehicles_list:
+                leading_actor_speed = leading_vehicle.get_velocity().length()
+                leading_actor_length = leading_vehicle.bounding_box.extent.x * 2
+
+                distance_to_leading_actor = ego_location.distance(leading_vehicle.get_location())
+
+                desired_following_distance = self.config.idm_leading_vehicle_minimum_distance
+
+                target_speed_vehicle = self._compute_target_speed_idm(
+                    desired_speed = target_speed_initial,
+                    leading_actor_length = leading_actor_length,
+                    ego_speed = ego_speed,
+                    leading_actor_speed = leading_actor_speed,
+                    distance_to_leading_actor = distance_to_leading_actor,
+                    s0 = desired_following_distance
+                )
+                print(f'Leading Vehicle Speed: {target_speed_vehicle}\n')
+                target_speeds.append(target_speed_vehicle)
+        
+        # Check for traffic lights
+        next_traffic_light = self.traffic_context['next_traffic_light']
+        if next_traffic_light:
+            if next_traffic_light.state == carla.TrafficLightState.Red:
+                leading_actor_speed = 0.0
+                leading_actor_length = 0.0
+
+                distance_to_leading_actor = self.traffic_context['distance_to_next_traffic_light']
+
+                desired_following_distance = params.desired_following_distance \
+                    if params.desired_following_distance \
+                    else self.config.idm_red_light_minimum_distance
+
+                desired_time_headway = self.config.idm_red_light_desired_time_headway
+
+                target_speed = self._compute_target_speed_idm(
+                    desired_speed = target_speed_initial,
+                    leading_actor_length = leading_actor_length,
+                    ego_speed = ego_speed,
+                    leading_actor_speed = leading_actor_speed,
+                    distance_to_leading_actor = distance_to_leading_actor,
+                    s0 = desired_following_distance,
+                    T=desired_time_headway
+                )
+            else:
+                target_speed = target_speed_initial
+
+            print(f'Traffic Light Speed: {target_speed}\n')
+            target_speeds.append(target_speed)
+
+        return min(target_speeds)
+
     def _accelerate(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor]):
         key_actors = self._get_key_actors(key_actors_llm)
         target_speed_initial = params.target_speed \
             if params.target_speed \
-            else self.ego_context['speed']
+            else min(self.ego_context['speed'] * 1.1, self.traffic_context['speed_limit'])
 
-        print(f'Ego Speed: {self.ego_context["speed"]}\n')
-        print(f'Target Speed Initial: {target_speed_initial}\n')
-
-        target_speeds = [target_speed_initial]
-        if key_actors:
-            for key_actor in key_actors:
-                actor_type, actor = key_actor
-                if actor_type == "vehicle":
-                    leading_actor_speed = actor.get_velocity().length()
-                    leading_actor_length = actor.bounding_box.extent.x * 2
-
-                    ego_location = self.ego_context['location']
-                    distance_to_leading_actor = ego_location.distance(actor.get_location())
-
-                    desired_following_distance = params.desired_following_distance \
-                        if params.desired_following_distance \
-                        else self.config.idm_leading_vehicle_minimum_distance
-
-                    target_speed = self._compute_target_speed_idm(
-                        desired_speed = target_speed_initial,
-                        leading_actor_length = leading_actor_length,
-                        ego_speed = self.ego_context['speed'],
-                        leading_actor_speed = leading_actor_speed,
-                        distance_to_leading_actor = distance_to_leading_actor,
-                        s0 = desired_following_distance
-                    )
-
-                    print(f'Leading Vehicle Speed: {target_speed}\n')
-                elif actor_type == "traffic_light":
-                    if actor.state == carla.TrafficLightState.Red:
-                        leading_actor_speed = 0.0
-                        leading_actor_length = 0.0
-
-                        ego_location = self.ego_context['location']
-                        ego_speed = self.ego_context['speed']
-                        distance_to_leading_actor = self.traffic_context['distance_to_next_traffic_light']
-
-                        desired_following_distance = params.desired_following_distance \
-                            if params.desired_following_distance \
-                            else self.config.idm_red_light_minimum_distance
-
-                        desired_time_headway = self.config.idm_red_light_desired_time_headway
-
-                        target_speed = self._compute_target_speed_idm(
-                            desired_speed = target_speed_initial,
-                            leading_actor_length = leading_actor_length,
-                            ego_speed = ego_speed,
-                            leading_actor_speed = leading_actor_speed,
-                            distance_to_leading_actor = distance_to_leading_actor,
-                            s0 = desired_following_distance,
-                            T=desired_time_headway
-                        )
-                    else:
-                        target_speed = target_speed_initial
-                    print(f'Traffic Light Speed: {target_speed}\n')
-
-                target_speeds.append(target_speed)
-
-        self.target_speed = min(target_speeds)
+        self.target_speed = self._get_target_speed(target_speed_initial, params)
         start_index = self.ego_context['route_index']
         return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
-
-
-    def _maintain_speed(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor]):
-        key_actors = self._get_key_actors(key_actors_llm)
-        target_speed_initial = self.ego_context['speed']
-
-        target_speeds = [target_speed_initial]
-        if key_actors:
-            for key_actor in key_actors:
-                actor_type, actor = key_actor
-                if actor_type == "vehicle":
-                    leading_actor_speed = actor.get_velocity().length()
-                    leading_actor_length = actor.bounding_box.extent.x * 2
-
-                    ego_location = self.ego_context['location']
-                    distance_to_leading_actor = ego_location.distance(actor.get_location())
-
-                    desired_following_distance = params.desired_following_distance \
-                        if params.desired_following_distance \
-                        else self.config.idm_leading_vehicle_minimum_distance
-
-                    target_speed = self._compute_target_speed_idm(
-                        desired_speed = target_speed_initial,
-                        leading_actor_length = leading_actor_length,
-                        ego_speed = self.ego_context['speed'],
-                        leading_actor_speed = leading_actor_speed,
-                        distance_to_leading_actor = distance_to_leading_actor,
-                        s0 = desired_following_distance
-                    )
-                elif actor_type == "traffic_light":
-                    leading_actor_speed = 0.0
-                    leading_actor_length = 0.0
-
-                    ego_location = self.ego_context['location']
-                    ego_speed = self.ego_context['speed']
-                    distance_to_leading_actor = self.traffic_context['distance_to_next_traffic_light']
-
-                    desired_following_distance = params.desired_following_distance \
-                        if params.desired_following_distance \
-                        else self.config.idm_red_light_minimum_distance
-
-                    desired_time_headway = self.config.idm_red_light_desired_time_headway
-
-                    target_speed = self._compute_target_speed_idm(
-                        desired_speed = target_speed_initial,
-                        leading_actor_length = leading_actor_length,
-                        ego_speed = ego_speed,
-                        leading_actor_speed = leading_actor_speed,
-                        distance_to_leading_actor = distance_to_leading_actor,
-                        s0 = desired_following_distance,
-                        T=desired_time_headway
-                    )
-
-                target_speeds.append(target_speed)
-
-        self.target_speed = min(target_speeds)
-        start_index = self.ego_context['route_index']
-        return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
-
 
     def _decelerate(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor]):
         key_actors = self._get_key_actors(key_actors_llm)
         target_speed_initial = params.target_speed \
             if params.target_speed \
-            else self.ego_context['speed']
+            else max(0.0, min(self.ego_context['speed'] * 0.9, 0.25))
 
-        target_speeds = [target_speed_initial]
-        if key_actors:
-            for key_actor in key_actors:
-                actor_type, actor = key_actor
-                if actor_type == "vehicle":
-                    leading_actor_speed = actor.get_velocity().length()
-                    leading_actor_length = actor.bounding_box.extent.x * 2
-
-                    ego_location = self.ego_context['location']
-                    ego_speed = self.ego_context['speed']
-                    distance_to_leading_actor = ego_location.distance(actor.get_location())
-
-                    desired_following_distance = params.desired_following_distance \
-                        if params.desired_following_distance \
-                        else self.config.idm_leading_vehicle_minimum_distance
-
-                    desired_time_headway = self.config.idm_leading_vehicle_time_headway
-
-                    target_speed = self._compute_target_speed_idm(
-                        desired_speed = target_speed_initial,
-                        leading_actor_length = leading_actor_length,
-                        ego_speed = ego_speed,
-                        leading_actor_speed = leading_actor_speed,
-                        distance_to_leading_actor = distance_to_leading_actor,
-                        s0 = desired_following_distance,
-                        T=desired_time_headway
-                    )
-                elif actor_type == "traffic_light":
-                    leading_actor_speed = 0.0
-                    leading_actor_length = 0.0
-
-                    ego_location = self.ego_context['location']
-                    ego_speed = self.ego_context['speed']
-                    distance_to_leading_actor = self.traffic_context['distance_to_next_traffic_light']
-
-                    desired_following_distance = params.desired_following_distance \
-                        if params.desired_following_distance \
-                        else self.config.idm_red_light_minimum_distance
-
-                    desired_time_headway = self.config.idm_red_light_desired_time_headway
-
-                    target_speed = self._compute_target_speed_idm(
-                        desired_speed = target_speed_initial,
-                        leading_actor_length = leading_actor_length,
-                        ego_speed = ego_speed,
-                        leading_actor_speed = leading_actor_speed,
-                        distance_to_leading_actor = distance_to_leading_actor,
-                        s0 = desired_following_distance,
-                        T=desired_time_headway
-                    )
-
-                target_speeds.append(target_speed)
-
-        self.target_speed = min(target_speeds)
+        self.target_speed = self._get_target_speed(target_speed_initial, params)
         start_index = self.ego_context['route_index']
         return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
 
+    def _maintain_speed(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor]):
+        key_actors = self._get_key_actors(key_actors_llm)
+        target_speed_initial = self.ego_context['speed']
+
+        self.target_speed = self._get_target_speed(target_speed_initial, params)
+        start_index = self.ego_context['route_index']
+        return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
+    
+    # def _maintain_speed(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor]):
+    #     key_actors = self._get_key_actors(key_actors_llm)
+    #     target_speed_initial = self.ego_context['speed']
+
+    #     target_speeds = [target_speed_initial]
+    #     if key_actors:
+    #         for key_actor in key_actors:
+    #             actor_type, actor = key_actor
+    #             if actor_type == "vehicle":
+    #                 leading_actor_speed = actor.get_velocity().length()
+    #                 leading_actor_length = actor.bounding_box.extent.x * 2
+
+    #                 ego_location = self.ego_context['location']
+    #                 distance_to_leading_actor = ego_location.distance(actor.get_location())
+
+    #                 desired_following_distance = params.desired_following_distance \
+    #                     if params.desired_following_distance \
+    #                     else self.config.idm_leading_vehicle_minimum_distance
+
+    #                 target_speed = self._compute_target_speed_idm(
+    #                     desired_speed = target_speed_initial,
+    #                     leading_actor_length = leading_actor_length,
+    #                     ego_speed = self.ego_context['speed'],
+    #                     leading_actor_speed = leading_actor_speed,
+    #                     distance_to_leading_actor = distance_to_leading_actor,
+    #                     s0 = desired_following_distance
+    #                 )
+    #             elif actor_type == "traffic_light":
+    #                 leading_actor_speed = 0.0
+    #                 leading_actor_length = 0.0
+
+    #                 ego_location = self.ego_context['location']
+    #                 ego_speed = self.ego_context['speed']
+    #                 distance_to_leading_actor = self.traffic_context['distance_to_next_traffic_light']
+
+    #                 desired_following_distance = params.desired_following_distance \
+    #                     if params.desired_following_distance \
+    #                     else self.config.idm_red_light_minimum_distance
+
+    #                 desired_time_headway = self.config.idm_red_light_desired_time_headway
+
+    #                 target_speed = self._compute_target_speed_idm(
+    #                     desired_speed = target_speed_initial,
+    #                     leading_actor_length = leading_actor_length,
+    #                     ego_speed = ego_speed,
+    #                     leading_actor_speed = leading_actor_speed,
+    #                     distance_to_leading_actor = distance_to_leading_actor,
+    #                     s0 = desired_following_distance,
+    #                     T=desired_time_headway
+    #                 )
+
+    #             target_speeds.append(target_speed)
+
+    #     self.target_speed = min(target_speeds)
+    #     start_index = self.ego_context['route_index']
+    #     return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
+
+    # def _decelerate(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor]):
+    #     key_actors = self._get_key_actors(key_actors_llm)
+    #     target_speed_initial = params.target_speed \
+    #         if params.target_speed \
+    #         else self.ego_context['speed']
+
+    #     target_speeds = [target_speed_initial]
+    #     if key_actors:
+    #         for key_actor in key_actors:
+    #             actor_type, actor = key_actor
+    #             if actor_type == "vehicle":
+    #                 leading_actor_speed = actor.get_velocity().length()
+    #                 leading_actor_length = actor.bounding_box.extent.x * 2
+
+    #                 ego_location = self.ego_context['location']
+    #                 ego_speed = self.ego_context['speed']
+    #                 distance_to_leading_actor = ego_location.distance(actor.get_location())
+
+    #                 desired_following_distance = params.desired_following_distance \
+    #                     if params.desired_following_distance \
+    #                     else self.config.idm_leading_vehicle_minimum_distance
+
+    #                 desired_time_headway = self.config.idm_leading_vehicle_time_headway
+
+    #                 target_speed = self._compute_target_speed_idm(
+    #                     desired_speed = target_speed_initial,
+    #                     leading_actor_length = leading_actor_length,
+    #                     ego_speed = ego_speed,
+    #                     leading_actor_speed = leading_actor_speed,
+    #                     distance_to_leading_actor = distance_to_leading_actor,
+    #                     s0 = desired_following_distance,
+    #                     T=desired_time_headway
+    #                 )
+    #             elif actor_type == "traffic_light":
+    #                 leading_actor_speed = 0.0
+    #                 leading_actor_length = 0.0
+
+    #                 ego_location = self.ego_context['location']
+    #                 ego_speed = self.ego_context['speed']
+    #                 distance_to_leading_actor = self.traffic_context['distance_to_next_traffic_light']
+
+    #                 desired_following_distance = params.desired_following_distance \
+    #                     if params.desired_following_distance \
+    #                     else self.config.idm_red_light_minimum_distance
+
+    #                 desired_time_headway = self.config.idm_red_light_desired_time_headway
+
+    #                 target_speed = self._compute_target_speed_idm(
+    #                     desired_speed = target_speed_initial,
+    #                     leading_actor_length = leading_actor_length,
+    #                     ego_speed = ego_speed,
+    #                     leading_actor_speed = leading_actor_speed,
+    #                     distance_to_leading_actor = distance_to_leading_actor,
+    #                     s0 = desired_following_distance,
+    #                     T=desired_time_headway
+    #                 )
+
+    #             target_speeds.append(target_speed)
+
+    #     self.target_speed = min(target_speeds)
+    #     start_index = self.ego_context['route_index']
+    #     return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
+
     def _change_lane(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor], shift_to_left_lane = True):
-        target_speed_initial = 25.0
+        target_speed_initial = self.ego_context['speed']
         target_speed = target_speed_initial
 
         lane_change = self.ego_context['lane_change']
         lane_change_direction = lane_change['lane_change_direction']
-        lane_change_late_start_point_loc = lane_change['lane_change_late_start_point'].transform.location
 
         # Implement sanity check for no lane change
         if lane_change is None:
@@ -374,6 +465,8 @@ class TrajectoryPlanner:
 
         lane_change_late_start_wp = lane_change['lane_change_late_start_point']
         lane_change_end_wp = lane_change['lane_change_end_point']
+        lane_change_end_point_loc = lane_change_end_wp.transform.location
+
         lane_change_index = from_index
         to_index = from_index
         while to_index < len(self._waypoint_planner.route_waypoints) and \
@@ -382,9 +475,9 @@ class TrajectoryPlanner:
                 lane_change_index = to_index
             to_index += 1
 
-        available_lane_change_distance = lane_change_late_start_point_loc.distance(start_wp.transform.location)
+        available_lane_change_distance = lane_change_end_point_loc.distance(start_wp.transform.location)
         # transition_length = self.config.transition_smoothness_distance
-        transition_length = available_lane_change_distance * self.config.points_per_meter
+        transition_length = max(self.config.transition_smoothness_distance, available_lane_change_distance * self.config.points_per_meter)
 
         print(f'From Index: {from_index}, Lane Change Index: {lane_change_index}, To Index: {to_index}')
         self._waypoint_planner.change_lane(from_index, lane_change_index, to_index, lane_change_direction, transition_length)

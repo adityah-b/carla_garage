@@ -20,7 +20,7 @@ class LongitudinalCommand(enum.Enum):
     """
     # MAINTAIN_SPEED = "maintain_speed"
     ACCELERATE = "accelerate"
-    # DECELERATE = "decelerate"
+    DECELERATE = "decelerate"
     CHANGE_LANE_LEFT = "change_lane_left"
     # STOP = "stop"
 

@@ -65,6 +65,16 @@ class PrivilegedRoutePlanner(object):
     self.route_index = 0
     self.last_route_index = 0
 
+    self.previous_leading_vehicle_ids = {
+       "ongoing": np.array([]),
+       "oncoming": np.array([]),
+    }
+
+    self.previous_trailing_vehicle_ids = {
+        "ongoing": np.array([]),
+        "oncoming": np.array([]),
+    }
+
   def save(self):
     """
         Save the current route index location, which could be saved before forecasting the ego vehicle.
@@ -873,6 +883,8 @@ class PrivilegedRoutePlanner(object):
             target_lanes = same_lanes
         elif traffic_type == "oncoming":
             target_lanes = opposite_lanes
+            # Add the ego waypoint to the target lanes to check for oncoming vehicles invading the lane
+            target_lanes.append(ego_wp)
 
         target_lane_road_ids = {(wp.lane_id, wp.road_id) for wp in target_lanes}
         valid_npc_vehicles = [
@@ -882,10 +894,19 @@ class PrivilegedRoutePlanner(object):
         ]
 
         # Check if there are valid NPC vehicles
+        if self.previous_leading_vehicle_ids[traffic_type].size > 0:
+            # Check if previous leading vehicle IDs are still valid
+            for i, vehicle in enumerate(npc_vehicles):
+                if vehicle.id in self.previous_leading_vehicle_ids[traffic_type] and (vehicle, vehicle_waypoints[i].lane_id) not in valid_npc_vehicles:
+                    valid_npc_vehicles.append((vehicle, vehicle_waypoints[i].lane_id))
+
         if not valid_npc_vehicles:
-            print(f"No valid NPC vehicles found for {traffic_type} traffic.")
+            print(f"No valid NPC vehicles found for {traffic_type} leading traffic.")
             return {}
 
+        print(f"Valid NPC vehicles for {traffic_type} traffic:")
+        for vehicle, lane_id in valid_npc_vehicles:
+            print(f"\tID: {vehicle.id}")
         min_lane_id = min(valid_npc_vehicles, key=lambda x: x[1])[1]
         max_lane_id = max(valid_npc_vehicles, key=lambda x: x[1])[1]
 
@@ -919,8 +940,9 @@ class PrivilegedRoutePlanner(object):
         yaw_differences = np.minimum(yaw_differences, 360 - yaw_differences)
 
         # Define the maximum distance and yaw difference thresholds
+        # Get the maximum lane offset from the ego vehicle's lane id
         max_lane_offset = max(abs(min_lane_id - ego_wp.lane_id), abs(max_lane_id - ego_wp.lane_id))
-        max_distance = self.leading_vehicles_max_route_distance * (1 + max_lane_offset)
+        max_distance = self.config.leading_vehicles_max_route_distance * (1 + max_lane_offset)
 
         ego_fwd_vec = self.route_waypoints[self.route_index].transform.get_forward_vector()
         ego_fwd_vec = np.array([ego_fwd_vec.x, ego_fwd_vec.y])
@@ -961,6 +983,8 @@ class PrivilegedRoutePlanner(object):
 
         # Usually the road is 3.5 m wide, but in case of ParkingCrossingPedestrian it's less
         leading_vehicle_ids = vehicle_ids[(min_distances < max_distance) & yaw_mask]
+        print(f"Leading vehicle IDs for {traffic_type} traffic: {leading_vehicle_ids}")
+        self.previous_leading_vehicle_ids[traffic_type] = leading_vehicle_ids
 
         # Group leading vehicles by their target lane ids
         leading_vehicle_groups = {}
@@ -994,7 +1018,7 @@ class PrivilegedRoutePlanner(object):
         same_lanes = self.get_same_dir_lanes(ego_wp)
         opposite_lanes = self.get_opposite_dir_lanes(ego_wp)
 
-        trailing_max_detection_radius = self.tailing_vehicles_maximum_detection_radius
+        trailing_max_detection_radius = self.config.tailing_vehicles_maximum_detection_radius
 
         # Get NPC waypoints for lane filtering
         vehicle_waypoints = [carla_map.get_waypoint(vehicle.get_location()) for vehicle in npc_vehicles]
@@ -1005,6 +1029,8 @@ class PrivilegedRoutePlanner(object):
             target_lanes = same_lanes
         elif traffic_type == "oncoming":
             target_lanes = opposite_lanes
+            # Add the ego waypoint to the target lanes to check for oncoming vehicles invading the lane
+            target_lanes.append(ego_wp)
 
         target_lane_road_ids = {(wp.lane_id, wp.road_id) for wp in target_lanes}
         valid_npc_vehicles = [
@@ -1014,8 +1040,19 @@ class PrivilegedRoutePlanner(object):
         ]
 
         # Check if there are valid NPC vehicles
+        if self.previous_trailing_vehicle_ids[traffic_type].size > 0:
+            # Check if previous trailing vehicle IDs are still valid
+            for i, vehicle in enumerate(npc_vehicles):
+                if vehicle.id in self.previous_trailing_vehicle_ids[traffic_type] and (vehicle, vehicle_waypoints[i].lane_id) not in valid_npc_vehicles:
+                    valid_npc_vehicles.append((vehicle, vehicle_waypoints[i].lane_id))
+
         if not valid_npc_vehicles:
+            print(f"No valid NPC vehicles found for {traffic_type} trailing traffic.")
             return {}
+
+        print(f"Valid NPC vehicles for {traffic_type} traffic:")
+        for vehicle, lane_id in valid_npc_vehicles:
+            print(f"\tID: {vehicle.id}")
 
         min_lane_id = min(valid_npc_vehicles, key=lambda x: x[1])[1]
         max_lane_id = max(valid_npc_vehicles, key=lambda x: x[1])[1]
@@ -1029,7 +1066,7 @@ class PrivilegedRoutePlanner(object):
         # Returns a 3D array with shape (num_vehicles, num_route_points, 2)
         from_idx = max(0, self.route_index - trailing_max_detection_radius)
         relative_positions = vehicle_locations[:, np.newaxis, :2] - \
-          self.route_points[np.newaxis, from_idx:self.route_index, :2][:, ::self.points_per_meter, :]
+          self.route_points[np.newaxis, from_idx:self.route_index, :2][:, ::self.config.points_per_meter, :]
 
         # Compute the relative distances
         # Returns a 2D array with shape (num_vehicles, num_route_points)
@@ -1051,11 +1088,20 @@ class PrivilegedRoutePlanner(object):
         max_lane_offset = max(abs(min_lane_id - ego_wp.lane_id), abs(max_lane_id - ego_wp.lane_id))
         max_distance = self.config.trailing_vehicles_max_route_distance * (1 + max_lane_offset)
 
+        ego_fwd_vec = self.route_waypoints[self.route_index].transform.get_forward_vector()
+        ego_fwd_vec = np.array([ego_fwd_vec.x, ego_fwd_vec.y])
+
         # Filter trailing vehicles based on traffic type
         yaw_indices = []
         if traffic_type == "ongoing":
             max_yaw_difference = self.config.trailing_vehicles_max_route_angle_ongoing
-            yaw_indices = np.where(yaw_differences < max_yaw_difference)[0]
+            # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' relative locations to the ego
+            # Used to assert trailing vehicles are behind the ego vehicle
+            ego_actor_vec = vehicle_locations[:, :2] - self.route_points[self.route_index, :2]
+            loc_dot_products = np.sum(ego_actor_vec * ego_fwd_vec, axis=1)
+
+            yaw_indices = np.where((yaw_differences < max_yaw_difference) & (loc_dot_products < 0))[0]
+        
         elif traffic_type == "oncoming":
             max_yaw_difference = self.config.trailing_vehicles_max_route_angle_oncoming
 
@@ -1063,19 +1109,24 @@ class PrivilegedRoutePlanner(object):
               [vehicle.get_transform().get_forward_vector().x, vehicle.get_transform().get_forward_vector().y]
               for vehicle, _ in valid_npc_vehicles
             ])
-            ego_fwd_vec = self.route_waypoints[self.route_index].transform.get_forward_vector()
-            ego_fwd_vec = np.array([ego_fwd_vec.x, ego_fwd_vec.y])
-
             # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' forward vectors
-            dot_products = np.sum(vehicle_fwd_vecs * ego_fwd_vec, axis=1)
+            # Used to assert trailing vehicles are traveling in the opposite direction to the ego vehicle
+            heading_dot_products = np.sum(vehicle_fwd_vecs * ego_fwd_vec, axis=1)
 
-            yaw_indices = np.where((yaw_differences > max_yaw_difference) & (dot_products < 0))[0]
+            # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' relative locations to the ego
+            # Used to assert trailing vehicles are behind the ego vehicle
+            ego_actor_vec = vehicle_locations[:, :2] - self.route_points[self.route_index, :2]
+            loc_dot_products = np.sum(ego_actor_vec * ego_fwd_vec, axis=1)
+
+            yaw_indices = np.where((yaw_differences > max_yaw_difference) & (heading_dot_products < 0) & (loc_dot_products < 0))[0]
 
         yaw_mask = np.zeros_like(vehicle_ids, dtype=bool)
         yaw_mask[yaw_indices] = True
 
         # Usually the road is 3.5 m wide, but in case of ParkingCrossingPedestrian it's less
         trailing_vehicle_ids = vehicle_ids[(min_distances < max_distance) & yaw_mask]
+        print(f"Trailing vehicle IDs for {traffic_type} traffic: {trailing_vehicle_ids}")
+        self.previous_trailing_vehicle_ids[traffic_type] = trailing_vehicle_ids
 
         # Group trailing vehicles by their target lane ids
         trailing_vehicle_groups = {}
