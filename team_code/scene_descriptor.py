@@ -245,7 +245,7 @@ class SceneDescriptor:
     #         npc_vehicle_data.append(vehicle_data)
     #     return npc_vehicle_data
 
-    def _get_npc_vehicle_data(self, ego_context, vehicles):
+    def _get_npc_vehicle_data(self, ego_context, vehicles, ongoing_traffic=False):
         """
         Get the non-player vehicle data from the privileged simulator data.
 
@@ -286,24 +286,36 @@ class SceneDescriptor:
             # Calculate the relative yaw angles of the vehicles
             relative_yaws = (vehicle_yaws - ego_yaw + np.pi) % (2 * np.pi) - np.pi
             relative_yaws = np.round(relative_yaws, 2)
-            
+
             # Calculate the relative distances of the vehicles from the ego vehicle
             relative_distances = np.linalg.norm(relative_positions, axis=1)
             relative_distances = np.round(relative_distances, 2)
 
-            # Find the closest vehicle to the ego
-            min_distance_index = np.argmin(relative_distances)
-
-            vehicle_data = {
-                "vehicle_id": vehicle_ids[min_distance_index],
-                "data": {
-                    "speed": vehicle_speeds[min_distance_index],
-                    "relative orientation": relative_yaws[min_distance_index],
-                    "relative position": relative_positions[min_distance_index][:2].tolist(),
-                    "relative distance": relative_distances[min_distance_index]
+            if ongoing_traffic:
+                # Find the closest vehicle to the ego
+                min_distance_index = np.argmin(relative_distances)
+                vehicle_data = {
+                    "vehicle_id": vehicle_ids[min_distance_index],
+                    "data": {
+                        "speed": vehicle_speeds[min_distance_index],
+                        "relative orientation": relative_yaws[min_distance_index],
+                        "relative position": relative_positions[min_distance_index][:2].tolist(),
+                        "relative distance": relative_distances[min_distance_index]
+                    }
                 }
-            }
-            npc_vehicle_data.append(vehicle_data)
+                npc_vehicle_data.append(vehicle_data)
+            else:
+                for i in range(len(vehicles)):
+                    vehicle_data = {
+                        "vehicle_id": vehicle_ids[i],
+                        "data": {
+                            "speed": vehicle_speeds[i],
+                            "relative orientation": relative_yaws[i],
+                            "relative position": relative_positions[i][:2].tolist(),
+                            "relative distance": relative_distances[i]
+                        }
+                    }
+                    npc_vehicle_data.append(vehicle_data)
         return npc_vehicle_data
 
     def _group_npc_vehicles(self, agent_context, ego_context, npc_vehicles):
@@ -357,8 +369,8 @@ class SceneDescriptor:
                     offset = lane_id - ego_lane_id
                     key = f"Other-{abs(offset)}"
 
-            leading_vehicles = self._get_npc_vehicle_data(ego_context, lane_vehicles)
-            trailing_vehicles = self._get_npc_vehicle_data(ego_context, ongoing_trailing_vehicles[lane_id]) if lane_id in ongoing_trailing_vehicles else []
+            leading_vehicles = self._get_npc_vehicle_data(ego_context, lane_vehicles, ongoing_traffic=True)
+            trailing_vehicles = self._get_npc_vehicle_data(ego_context, ongoing_trailing_vehicles[lane_id], ongoing_traffic=True) if lane_id in ongoing_trailing_vehicles else []
 
             if leading_vehicles or trailing_vehicles:
                 grouped_npc_vehicles["Ongoing Traffic"][key] = {
@@ -498,7 +510,7 @@ class SceneDescriptor:
                     target_lane = ego_wp.get_left_lane() if lane_change_direction == "left" else ego_wp.get_right_lane()
                     if target_lane and has_passed_start_point:
                         available_lane_change_distance = lane_change_late_start_point_loc.distance(ego_transform.location)
-                        if available_lane_change_distance > 5.0:
+                        if available_lane_change_distance > 0.5:
                             can_change_lane = True
 
             lane_change_info = {
@@ -620,25 +632,25 @@ class SceneDescriptor:
             else:
                 formatted_string += "                No data available\n"
 
-      if agent_data["Oncoming Traffic"]:          
-        formatted_string += "    Oncoming Traffic:\n"
-        for lane, vehicles in agent_data["Oncoming Traffic"].items():
-            if not vehicles["leading_vehicles"] and not vehicles["trailing_vehicles"]:
-                continue
-            formatted_string += f"        {lane}:\n"
-            formatted_string += "            Leading Vehicles:\n"
-            if vehicles["leading_vehicles"]:
-                for vehicle in vehicles["leading_vehicles"]:
-                    formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-            else:
-                formatted_string += "                No data available\n"
+    #   if agent_data["Oncoming Traffic"]:
+    #     formatted_string += "    Oncoming Traffic:\n"
+    #     for lane, vehicles in agent_data["Oncoming Traffic"].items():
+    #         if not vehicles["leading_vehicles"] and not vehicles["trailing_vehicles"]:
+    #             continue
+    #         formatted_string += f"        {lane}:\n"
+    #         formatted_string += "            Leading Vehicles:\n"
+    #         if vehicles["leading_vehicles"]:
+    #             for vehicle in vehicles["leading_vehicles"]:
+    #                 formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
+    #         else:
+    #             formatted_string += "                No data available\n"
 
-            formatted_string += "            Trailing Vehicles:\n"
-            if vehicles["trailing_vehicles"]:
-                for vehicle in vehicles["trailing_vehicles"]:
-                    formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
-            else:
-                formatted_string += "                No data available\n"
+    #         formatted_string += "            Trailing Vehicles:\n"
+    #         if vehicles["trailing_vehicles"]:
+    #             for vehicle in vehicles["trailing_vehicles"]:
+    #                 formatted_string += f"                Vehicle ID: {vehicle.get('vehicle_id', 'N/A')}, Relative Position: {vehicle['data']['relative position']}, Relative Orientation: {vehicle['data']['relative orientation']}, Speed: {vehicle['data']['speed']}, Relative Distance: {vehicle['data']['relative distance']}\n"
+    #         else:
+    #             formatted_string += "                No data available\n"
 
     #   formatted_string += "    Cross Traffic:\n"
     #   for lane, vehicles in agent_data["Cross Traffic"].items():

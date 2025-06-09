@@ -1,14 +1,18 @@
 import carla
 import numpy as np
 import traceback
+import transfuser_utils as t_u
 
 from scipy.integrate import RK45
 from scene_interpreter import *
 from privileged_route_planner import PrivilegedRoutePlanner
 
+from agent_utils import AgentPrediction
+
 class TrajectoryPlanner:
     def __init__(self, config):
         self.config = config
+        self.agent_prediction = AgentPrediction(config)
         # self.command_mapping = {
         #     "longitudinal": {
         #         "maintain_speed": self._maintain_speed,
@@ -29,6 +33,7 @@ class TrajectoryPlanner:
             "accelerate": self._accelerate,
             "decelerate": self._decelerate,
             "change_lane_left": self._change_lane,
+            "change_lane_right": self._change_lane,
         }
         self.all_actors = {
             "vehicle": {},
@@ -41,6 +46,9 @@ class TrajectoryPlanner:
 
         # Dummy waypoint planner
         self._waypoint_planner = PrivilegedRoutePlanner(self.config)
+
+    def setup_agent_prediction(self, traffic_manager, world_map, global_route_planner, ego_vehicle):
+        self.agent_prediction.setup(traffic_manager, world_map, global_route_planner, ego_vehicle)
 
     def _compute_target_speed_idm(
             self,
@@ -115,6 +123,8 @@ class TrajectoryPlanner:
     """
 
     def update_state(self, vehicle_context, traffic_context, ego_context, waypoint_planner):
+        self.agent_prediction.update_state(vehicle_context, ego_context)
+
         self._waypoint_planner = waypoint_planner
         self.vehicle_context = vehicle_context
         self.traffic_context = traffic_context
@@ -131,7 +141,71 @@ class TrajectoryPlanner:
             self.all_actors['traffic_light'] = {next_traffic_light.id: next_traffic_light}
 
 
-    def run_command(self, high_level_command: HighLevelCommand):
+    def rollout_trajectory(self, command, params, key_actors, structured_data):
+        forecast_length = self.config.default_forecast_length
+        ego_context = self.ego_context
+        vehicle_context = self.vehicle_context
+        command_mapping = self.command_mapping
+        near_lane_change = False
+
+
+        if command in 'change_lane_left':
+            forecast_length = self.config.forecast_length_lane_change
+            near_lane_change = True
+
+        num_future_frames = int(self.config.bicycle_frame_rate * forecast_length)
+
+        # Run the command
+        target_speed, route_points, route_waypoints = command_mapping[command](params, key_actors)
+
+        ego_context["route"] = route_waypoints
+        ego_context["route_points"] = route_points
+
+        # Rollout the trajectory
+        npc_vehicles = vehicle_context['npc_vehicles']
+        npc_vehicles_predicted_paths, npc_vehicles_dict = self.agent_prediction.predict_npc_vehicle_waypoints(ego_context, npc_vehicles)
+        npc_vehicles_predicted_bounding_boxes = self.agent_prediction.forecast_npc_vehicle_bounding_boxes(npc_vehicles_dict, npc_vehicles_predicted_paths, num_future_frames)
+
+        ego_predicted_bounding_boxes = self.agent_prediction.forecast_ego_vehicle_bounding_boxes(ego_context, target_speed, num_future_frames)
+
+        world = ego_context['ego_actor'].get_world()
+        # for actor_idx, actors_forecasted_bounding_boxes in npc_vehicles_predicted_bounding_boxes.items():
+        #     for bb in actors_forecasted_bounding_boxes:
+        #         world.debug.draw_box(box=bb,
+        #                                 rotation=bb.rotation,
+        #                                 thickness=0.1,
+        #                                 color=self.config.other_vehicles_forecasted_bbs_color,
+        #                                 life_time=self.config.draw_life_time)
+
+        # for bb in ego_predicted_bounding_boxes:
+        #     world.debug.draw_box(box=bb,
+        #                             rotation=bb.rotation,
+        #                             thickness=0.1,
+        #                             color=self.config.ego_vehicle_forecasted_bbs_normal_color)
+
+        npc_vehicle_collisions = self.agent_prediction.check_ego_collision_vehicles(near_lane_change=near_lane_change,
+                                                                                    ego_predicted_bounding_boxes=ego_predicted_bounding_boxes,
+                                                                                    npc_vehicles_predicted_bounding_boxes_dict=npc_vehicles_predicted_bounding_boxes,
+                                                                                    npc_vehicles_lanes=structured_data['agent'])
+
+        if len(npc_vehicle_collisions) > 0:
+            for vehicle_id, collision_data in npc_vehicle_collisions.items():
+                ego_bounding_box = collision_data['ego_bounding_box']
+                npc_vehicle_bounding_box = collision_data['npc_vehicle_bounding_box']
+
+                world.debug.draw_box(box=ego_bounding_box,
+                                    rotation=ego_bounding_box.rotation,
+                                    thickness=0.1,
+                                    color=self.config.ego_vehicle_forecasted_bbs_hazard_color,
+                                    life_time=self.config.draw_life_time)
+                world.debug.draw_box(box=npc_vehicle_bounding_box,
+                                    rotation=npc_vehicle_bounding_box.rotation,
+                                    thickness=0.1,
+                                    color=self.config.leading_vehicle_color,
+                                    life_time=self.config.draw_life_time)
+        print(f'NPC Vehicle Collisions: {npc_vehicle_collisions}')
+
+    def run_command(self, high_level_command: HighLevelCommand, structured_data):
         # TODO: Currently returns None, fallback to default rule-based IDM behaviour
         if not high_level_command:
             return None
@@ -147,6 +221,7 @@ class TrajectoryPlanner:
         command_mapping = self.command_mapping
         try:
             print(f'Executing command: {command} with params: {params} and key actors: {key_actors} with reasoning: {reasoning}')
+            self.rollout_trajectory(command, params, key_actors, structured_data)
             return command_mapping[command](params, key_actors)
         except Exception as e:
             print(f'Exception while executing command "{command}": {e}')
@@ -235,6 +310,35 @@ class TrajectoryPlanner:
     #     start_index = self.ego_context['route_index']
     #     return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
 
+    def _get_traffic_light_speed(self, target_speed_initial):
+        ego_speed = self.ego_context['speed']
+        next_traffic_light = self.traffic_context['next_traffic_light']
+
+        target_speed = target_speed_initial
+        if next_traffic_light:
+            # Check if the traffic light is red and within a certain distance
+            distance_to_traffic_light = self.traffic_context['distance_to_next_traffic_light']
+            if distance_to_traffic_light <= self.config.light_radius and \
+               next_traffic_light.state == carla.TrafficLightState.Red:
+                leading_actor_speed = 0.0
+                leading_actor_length = 0.0
+
+                distance_to_leading_actor = distance_to_traffic_light
+                desired_following_distance = self.config.idm_red_light_minimum_distance
+                desired_time_headway = self.config.idm_red_light_desired_time_headway
+
+                target_speed = self._compute_target_speed_idm(
+                    desired_speed = target_speed_initial,
+                    leading_actor_length = leading_actor_length,
+                    ego_speed = ego_speed,
+                    leading_actor_speed = leading_actor_speed,
+                    distance_to_leading_actor = distance_to_leading_actor,
+                    s0 = desired_following_distance,
+                    T=desired_time_headway
+                )
+
+        return target_speed
+
     def _get_target_speed(self, target_speed_initial, params: LongitudinalCommandParams):
         ego_location = self.ego_context['location']
         ego_speed = self.ego_context['speed']
@@ -257,34 +361,9 @@ class TrajectoryPlanner:
                 distance_to_leading_actor = ego_location.distance(leading_vehicle.get_location())
 
                 desired_following_distance = self.config.idm_leading_vehicle_minimum_distance
+                desired_time_headway = self.config.idm_leading_vehicle_time_headway
 
                 target_speed_vehicle = self._compute_target_speed_idm(
-                    desired_speed = target_speed_initial,
-                    leading_actor_length = leading_actor_length,
-                    ego_speed = ego_speed,
-                    leading_actor_speed = leading_actor_speed,
-                    distance_to_leading_actor = distance_to_leading_actor,
-                    s0 = desired_following_distance
-                )
-                print(f'Leading Vehicle Speed: {target_speed_vehicle}\n')
-                target_speeds.append(target_speed_vehicle)
-        
-        # Check for traffic lights
-        next_traffic_light = self.traffic_context['next_traffic_light']
-        if next_traffic_light:
-            if next_traffic_light.state == carla.TrafficLightState.Red:
-                leading_actor_speed = 0.0
-                leading_actor_length = 0.0
-
-                distance_to_leading_actor = self.traffic_context['distance_to_next_traffic_light']
-
-                desired_following_distance = params.desired_following_distance \
-                    if params.desired_following_distance \
-                    else self.config.idm_red_light_minimum_distance
-
-                desired_time_headway = self.config.idm_red_light_desired_time_headway
-
-                target_speed = self._compute_target_speed_idm(
                     desired_speed = target_speed_initial,
                     leading_actor_length = leading_actor_length,
                     ego_speed = ego_speed,
@@ -293,11 +372,13 @@ class TrajectoryPlanner:
                     s0 = desired_following_distance,
                     T=desired_time_headway
                 )
-            else:
-                target_speed = target_speed_initial
+                print(f'Leading Vehicle ID: {leading_vehicle.id}, IDM Speed: {target_speed_vehicle}\n')
+                target_speeds.append(target_speed_vehicle)
 
-            print(f'Traffic Light Speed: {target_speed}\n')
-            target_speeds.append(target_speed)
+        # Check for traffic lights
+        target_speed_traffic_light = self._get_traffic_light_speed(target_speed_initial)
+        print(f'Traffic Light Speed: {target_speed_traffic_light}\n')
+        target_speeds.append(target_speed_traffic_light)
 
         return min(target_speeds)
 
@@ -328,7 +409,7 @@ class TrajectoryPlanner:
         self.target_speed = self._get_target_speed(target_speed_initial, params)
         start_index = self.ego_context['route_index']
         return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
-    
+
     # def _maintain_speed(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor]):
     #     key_actors = self._get_key_actors(key_actors_llm)
     #     target_speed_initial = self.ego_context['speed']
@@ -450,7 +531,9 @@ class TrajectoryPlanner:
     #     return self.target_speed, self._waypoint_planner.route_points[start_index:], self._waypoint_planner.route_waypoints[start_index:]
 
     def _change_lane(self, params: LongitudinalCommandParams, key_actors_llm: list[KeyActor], shift_to_left_lane = True):
-        target_speed_initial = self.ego_context['speed']
+        target_speed_initial = params.target_speed \
+            if params.target_speed \
+            else self.traffic_context['speed_limit']
         target_speed = target_speed_initial
 
         lane_change = self.ego_context['lane_change']
@@ -478,9 +561,10 @@ class TrajectoryPlanner:
         available_lane_change_distance = lane_change_end_point_loc.distance(start_wp.transform.location)
         # transition_length = self.config.transition_smoothness_distance
         transition_length = max(self.config.transition_smoothness_distance, available_lane_change_distance * self.config.points_per_meter)
+        lane_transition_factor = max(1.0, np.abs(lane_change_late_start_wp.lane_id - lane_change_end_wp.lane_id))
 
         print(f'From Index: {from_index}, Lane Change Index: {lane_change_index}, To Index: {to_index}')
-        self._waypoint_planner.change_lane(from_index, lane_change_index, to_index, lane_change_direction, transition_length)
+        self._waypoint_planner.change_lane(from_index, lane_change_index, to_index, lane_change_direction, transition_length, lane_transition_factor)
 
         ongoing_leading_vehicles = self.vehicle_context['ongoing_leading_vehicles']
         target_lane_id = lane_change_end_wp.lane_id
@@ -494,7 +578,8 @@ class TrajectoryPlanner:
                 ego_location = self.ego_context['location']
                 distance_to_leading_actor = ego_location.distance(leading_vehicle.get_location())
 
-                desired_following_distance = self.config.idm_leading_vehicle_minimum_distance
+                desired_following_distance = self.config.idm_leading_vehicle_minimum_distance / 2.0
+                desired_time_headway = self.config.idm_leading_vehicle_time_headway / 2.0
 
                 target_speed = min(target_speed, self._compute_target_speed_idm(
                     desired_speed = target_speed_initial,
@@ -502,7 +587,8 @@ class TrajectoryPlanner:
                     ego_speed = self.ego_context['speed'],
                     leading_actor_speed = leading_actor_speed,
                     distance_to_leading_actor = distance_to_leading_actor,
-                    s0 = desired_following_distance
+                    s0 = desired_following_distance,
+                    T = desired_time_headway
                 ))
 
         self.target_speed = target_speed

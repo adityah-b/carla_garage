@@ -642,14 +642,18 @@ class AgentPrediction:
 
         return npc_vehicles_future_bounding_boxes_dict
 
-    def check_ego_collision_vehicles(self, near_lane_change, ego_bounding_boxes, npc_vehicles_future_bounding_boxes_dict, npc_vehicles_lanes):
+    def check_ego_collision_vehicles(self,
+                                     near_lane_change,
+                                     ego_predicted_bounding_boxes,
+                                     npc_vehicles_predicted_bounding_boxes_dict,
+                                     npc_vehicles_lanes):
         """
         Check if the ego vehicle will collide with any NPC vehicles in the future.
 
         Args:
             near_lane_change (bool): Flag indicating if the ego vehicle is near a lane change.
-            ego_bounding_boxes (list): A list of bounding boxes representing the future states of the ego vehicle.
-            npc_vehicles_future_bounding_boxes_dict (dict): A dictionary containing the future states of the NPC agents.
+            ego_predicted_bounding_boxes (list): A list of bounding boxes representing the future states of the ego vehicle.
+            npc_vehicles_predicted_bounding_boxes_dict (dict): A dictionary containing the future states of the NPC agents.
             npc_vehicles_lanes (dict): A dictionary containing the lanes of the NPC vehicles.
         Returns:
 
@@ -659,11 +663,15 @@ class AgentPrediction:
         ego_vehicle_location = self.ego_context['location']
         ego_speed = self.ego_context['speed']
 
-        leading_vehicle_ids = npc_vehicles_lanes['ego']['leading_vehicles']
-        trailing_vehicle_ids = npc_vehicles_lanes['ego']['trailing_vehicles']
+        leading_vehicle_ids = []
+        trailing_vehicle_ids = []
+        if 'Ego Lane' in npc_vehicles_lanes['Ongoing Traffic']:
+            # Get the leading and trailing vehicles in the ego lane
+            leading_vehicle_ids = npc_vehicles_lanes['Ongoing Traffic']['Ego Lane']['leading_vehicles']
+            trailing_vehicle_ids = npc_vehicles_lanes['Ongoing Traffic']['Ego Lane']['trailing_vehicles']
 
-        for i, ego_bounding_box in enumerate(ego_bounding_boxes):
-            for vehicle_id, future_bounding_boxes in npc_vehicles_future_bounding_boxes_dict.items():
+        for i, ego_bounding_box in enumerate(ego_predicted_bounding_boxes):
+            for vehicle_id, predicted_bounding_boxes in npc_vehicles_predicted_bounding_boxes_dict.items():
                 # Skip leading and rear vehicles if not near a lane change
                 if vehicle_id in leading_vehicle_ids and not near_lane_change:
                     continue
@@ -671,19 +679,27 @@ class AgentPrediction:
                     continue
                 else:
                     # Check if the ego bounding box intersects with the predicted bounding box of the actor
-                    intersects_with_ego = self.agent_utils.check_obb_intersection(ego_bounding_box, future_bounding_boxes[i])
+                    intersects_with_ego = self.agent_utils.check_obb_intersection(ego_bounding_box, predicted_bounding_boxes[i])
 
                     if intersects_with_ego:
                         target_vehicle = self.npc_vehicle_dict[vehicle_id]
-                        collision_point = future_bounding_boxes[i].location
+                        target_vehicle_speed = target_vehicle.get_velocity().length()
+
+                        collision_point = predicted_bounding_boxes[i].location
+                        ego_collision_bounding_box = ego_bounding_box
+                        npc_vehicle_collision_bounding_box = predicted_bounding_boxes[i]
 
                         vehicle_spacing = max(2 * target_vehicle.bounding_box.extent.x, 2 * ego_bounding_box.extent.x)
-                        distance_to_collision = collision_point.distance(ego_vehicle_location) - vehicle_spacing
-                        time_to_collision = distance_to_collision / ego_speed
+                        # distance_to_collision = collision_point.distance(ego_vehicle_location) - vehicle_spacing
+                        distance_to_collision = collision_point.distance(ego_vehicle_location)
+                        time_to_collision = min(distance_to_collision / ego_speed,
+                                                distance_to_collision / target_vehicle_speed)
 
                         collision_entry = {
                             "vehicle_id": vehicle_id,
                             "collision_point": collision_point,
+                            "ego_bounding_box": ego_collision_bounding_box,
+                            "npc_vehicle_bounding_box": npc_vehicle_collision_bounding_box,
                             "distance_to_collision": distance_to_collision,
                             "time_to_collision": time_to_collision,
                         }

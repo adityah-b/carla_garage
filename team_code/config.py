@@ -354,17 +354,8 @@ in the metric system (i.e. meters, seconds) and all angles are expressed in
 radians bounded between [-pi, pi).
 
 SCENE CONTEXT INPUTS:
-1. Semantic BEV Scene Representation: A Bird's Eye View (BEV) image of the traffic scene with
-ground-truth semantic labels. Each label will be color coded according to their respective
-classes. These are as follows:
-    - Blue = Moving NPC Vehicle
-    - Orange = Static NPC Vehicle
-    - White = Ego Vehicle
-    - Dark Magenta = Lane Boundaries
-    - Gray = Sidewalks
-    - Light Magenta = Lane Lines
-    - Cyan = Pedestrian
-    - Red, Yellow, Green = Traffic Light State
+1. RGB BEV Image: A Bird's Eye View (BEV) RGB image of the traffic scene with
+ground-truth vehicle bounding boxes and IDs.
 
 2. Textual Scene Description: A textual description of the scene. This description will contain information about:
     - Ego vehicle current state
@@ -397,8 +388,11 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
       Reasoning for the command.
 
 `LongitudinalCommand` ACTIONS:
+- `accelerate`: Accelerate the ego vehicle
+- `decelerate`: Decelerate the ego vehicle
 - `maintain_speed`: Maintain the ego vehicle's current speed
 - `change_lane_left`: Change the ego vehicle's lane to the left.
+- `change_lane_right`: Change the ego vehicle's lane to the right.
 
 `LongitudinalCommandParams` PARAMETERS:
 1. `desired_following_distance`: The desired following distance to the leading vehicle, in meters.

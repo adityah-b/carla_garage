@@ -12,6 +12,8 @@ from agents.navigation.local_planner import RoadOption
 
 import os
 
+from collections import defaultdict
+
 class PrivilegedRoutePlanner(object):
   """
     This class is used the experts navigation and provides not only the route but preprocesses it and provides useful
@@ -852,6 +854,58 @@ class PrivilegedRoutePlanner(object):
 
     return other_dir_wps
 
+  def create_junction_map(self, junction_wp):
+      junction_connections = None
+
+      if junction_wp:
+          junction_obj = junction_wp.get_junction()
+          print(f'Junction ID: {junction_obj.id}')
+
+          # Get the junction waypoints
+          junction_wps = junction_obj.get_waypoints(carla.LaneType.Driving)
+
+          # Identify the unique entry and exit waypoints
+          junction_connection_map = defaultdict(set)
+          for entry_wp, exit_wp in junction_wps:
+              # TODO MAY NEED TO FIX THIS
+              entry_connection_wp = entry_wp.previous(0.25)[0]
+              exit_connection_wp = exit_wp.next(0.25)[0]
+
+              entry_connection_key = (entry_connection_wp.lane_id, entry_connection_wp.road_id)
+              exit_connection_key = (exit_connection_wp.lane_id, exit_connection_wp.road_id)
+
+              # Bidirectional key
+              connection_key = frozenset({entry_connection_key, exit_connection_key})
+
+              # Store junction lanelet connections
+              connection_data = (entry_connection_wp, entry_wp, exit_wp, exit_connection_wp)
+              junction_connection_map[connection_key].add(connection_data)
+
+          # Create a reverse index for the junction waypoints
+          junction_connections = defaultdict(set)
+          for key, connections in junction_connection_map.items():
+              for lane_id, road_id in key:
+                  junction_connections[(lane_id, road_id)].update(connections)
+
+      return junction_connections
+
+  def get_junction_connections(self, junction_map, lane_wp):
+      lanelet = None
+      lane_wp_key = (lane_wp.lane_id, lane_wp.road_id)
+      lane_connections = junction_map.get(lane_wp_key, None)
+      if lane_connections:
+          # print(f'\tLane Connections: {len(lane_connections)}')
+          for lane_connection in lane_connections:
+              entry_connection_wp, entry_wp, exit_wp, exit_connection_wp = lane_connection
+              # print(f'\t\tEntry Connection Waypoint Lane ID: {entry_connection_wp.lane_id}, Road ID: {entry_connection_wp.road_id}')
+              # print(f'\t\tEntry Waypoint Lane ID: {entry_wp.lane_id}, Road ID: {entry_wp.road_id}')
+              # print(f'\t\tExit Waypoint Lane ID: {exit_wp.lane_id}, Road ID: {exit_wp.road_id}')
+              # print(f'\t\tExit Connection Waypoint Lane ID: {exit_connection_wp.lane_id}, Road ID: {exit_connection_wp.road_id}')
+
+              lanelet = (entry_wp, exit_connection_wp)
+
+      return lanelet
+
   def get_leading_vehicles(self, carla_map, npc_vehicles, traffic_type):
     """
         Get the instances of vehicles leading ahead of the ego vehicle.
@@ -867,12 +921,65 @@ class PrivilegedRoutePlanner(object):
     if npc_vehicles and self.route_index != self.route_points.shape[0]:
         # Get the current ego waypoint
         ego_wp = self.route_waypoints[self.route_index]
+        leading_max_detection_radius = self.config.leading_vehicles_maximum_detection_radius
 
         # Get the lanes in the same direction and opposite direction as the ego vehicle
         same_lanes = self.get_same_dir_lanes(ego_wp)
         opposite_lanes = self.get_opposite_dir_lanes(ego_wp)
 
-        leading_max_detection_radius = self.config.leading_vehicles_maximum_detection_radius
+        # Check if the ego is near a junction
+        junction_wp = None
+        for i in range(min(leading_max_detection_radius, len(self.route_waypoints[self.route_index:]))):
+            if self.route_waypoints[self.route_index + i].is_junction:
+                junction_wp = self.route_waypoints[self.route_index + i]
+                break
+
+        junction_connections = self.create_junction_map(junction_wp)
+        if junction_connections:
+            color_entry_connection = carla.Color(255, 0, 0, 255)
+            color_entry = carla.Color(255, 255, 0, 255)
+            color_exit = carla.Color(0, 255, 255, 255)
+            color_exit_connection = carla.Color(0, 0, 255, 255)
+
+            same_lane_junction_wps = set()
+            opposite_lane_junction_wps = set()
+            # for same_lane_wp in same_lanes:
+            #     print(f'Same Lane Waypoint Lane ID: {same_lane_wp.lane_id}, Road ID: {same_lane_wp.road_id}')
+            #     lanelet = self.get_junction_connections(junction_connections, same_lane_wp)
+            #     if lanelet:
+            #         entry_wp, exit_connection_wp = lanelet
+            #         same_lane_junction_wps.add(entry_wp)
+            #         same_lane_junction_wps.add(exit_connection_wp)
+
+            #         # Draw the junction waypoints
+            #         self._world.debug.draw_point(same_lane_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_entry_connection, life_time=0.)
+            #         # self._world.debug.draw_point(entry_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_entry, life_time=0.)
+            #         # self._world.debug.draw_point(exit_connection_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_exit, life_time=0.)
+
+            for opposite_lane_wp in opposite_lanes:
+                # print(f'Opposite Lane Waypoint Lane ID: {opposite_lane_wp.lane_id}, Road ID: {opposite_lane_wp.road_id}')
+                lanelet = self.get_junction_connections(junction_connections, opposite_lane_wp)
+                if lanelet:
+                    entry_wp, exit_connection_wp = lanelet
+                    opposite_lane_junction_wps.add(entry_wp)
+                    opposite_lane_junction_wps.add(exit_connection_wp)
+
+                    # Draw the junction waypoints
+                    # self._world.debug.draw_point(opposite_lane_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_entry_connection, life_time=0.)
+                    # self._world.debug.draw_point(entry_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_entry, life_time=0.)
+                    # self._world.debug.draw_point(exit_connection_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_exit, life_time=0.)
+
+            # junction_wps = junction_wp.get_junction().get_waypoints(carla.LaneType.Driving)
+            # for entry_exit_pair in junction_wps:
+            #     entry_wp = entry_exit_pair[0]
+            #     exit_wp = entry_exit_pair[1]
+
+            #     # Draw the junction waypoints
+            #     self._world.debug.draw_point(entry_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_entry, life_time=0.)
+            #     self._world.debug.draw_point(exit_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_exit, life_time=0.)
+
+            same_lanes = same_lanes + list(same_lane_junction_wps)
+            opposite_lanes = opposite_lanes + list(opposite_lane_junction_wps)
 
         # Get NPC waypoints for lane filtering
         vehicle_waypoints = [carla_map.get_waypoint(vehicle.get_location()) for vehicle in npc_vehicles]
@@ -904,9 +1011,9 @@ class PrivilegedRoutePlanner(object):
             print(f"No valid NPC vehicles found for {traffic_type} leading traffic.")
             return {}
 
-        print(f"Valid NPC vehicles for {traffic_type} traffic:")
-        for vehicle, lane_id in valid_npc_vehicles:
-            print(f"\tID: {vehicle.id}")
+        # print(f"Valid NPC vehicles for {traffic_type} traffic:")
+        # for vehicle, lane_id in valid_npc_vehicles:
+        #     print(f"\tID: {vehicle.id}, Lane ID: {lane_id}, Road ID: {carla_map.get_waypoint(vehicle.get_location()).road_id}")
         min_lane_id = min(valid_npc_vehicles, key=lambda x: x[1])[1]
         max_lane_id = max(valid_npc_vehicles, key=lambda x: x[1])[1]
 
@@ -976,21 +1083,29 @@ class PrivilegedRoutePlanner(object):
             ego_actor_vec = vehicle_locations[:, :2] - self.route_points[self.route_index, :2]
             loc_dot_products = np.sum(ego_actor_vec * ego_fwd_vec, axis=1)
 
-            yaw_indices = np.where((yaw_differences > max_yaw_difference) & (heading_dot_products < 0) & (loc_dot_products >= 0))[0]
+            # for idx, vehicle_id in enumerate(vehicle_ids):
+            #    print(f'Vehicle ID: {vehicle_id}\n \tYaw Difference: {yaw_differences[idx]}, Min Distance: {min_distances[idx]}, Heading Dot Product: {heading_dot_products[idx]}, Location Dot Product: {loc_dot_products[idx]}')
+
+            # NOTE THE YAW DIFFERENCE ONLY WORKS WHEN THE ROUTE IS STRAIGHT. DURING TURNS, THE YAW DIFFERENCE IS A LOT LOWER EVEN THOUGH THE VEHICLES CROSSING THE EGO'S PATH ARE STILL ONCOMING TRAFFIC
+            # yaw_indices = np.where((yaw_differences > max_yaw_difference) & (heading_dot_products < 0) & (loc_dot_products >= 0))[0]
+            yaw_indices = np.where((heading_dot_products < 0) & (loc_dot_products >= 0))[0]
 
         yaw_mask = np.zeros_like(vehicle_ids, dtype=bool)
         yaw_mask[yaw_indices] = True
 
         # Usually the road is 3.5 m wide, but in case of ParkingCrossingPedestrian it's less
         leading_vehicle_ids = vehicle_ids[(min_distances < max_distance) & yaw_mask]
-        print(f"Leading vehicle IDs for {traffic_type} traffic: {leading_vehicle_ids}")
+        # leading_vehicle_ids = vehicle_ids[yaw_mask]
+        # print(f"Leading vehicle IDs for {traffic_type} traffic: {leading_vehicle_ids}")
         self.previous_leading_vehicle_ids[traffic_type] = leading_vehicle_ids
 
         # Group leading vehicles by their target lane ids
         leading_vehicle_groups = {}
         for target_lane_wp in target_lanes:
+            # print(f'Target Lane Waypoint Lane ID: {target_lane_wp.lane_id}, Road ID: {target_lane_wp.road_id}')
             leading_vehicle_groups[target_lane_wp.lane_id] = []
             for vehicle, lane_id in valid_npc_vehicles:
+                # print(f'\tVehicle ID: {vehicle.id}, Lane ID: {lane_id}, Road ID: {carla_map.get_waypoint(vehicle.get_location()).road_id}')
                 if vehicle.id in leading_vehicle_ids and lane_id == target_lane_wp.lane_id:
                     leading_vehicle_groups[target_lane_wp.lane_id].append(vehicle)
 
@@ -1050,9 +1165,9 @@ class PrivilegedRoutePlanner(object):
             print(f"No valid NPC vehicles found for {traffic_type} trailing traffic.")
             return {}
 
-        print(f"Valid NPC vehicles for {traffic_type} traffic:")
-        for vehicle, lane_id in valid_npc_vehicles:
-            print(f"\tID: {vehicle.id}")
+        # print(f"Valid NPC vehicles for {traffic_type} traffic:")
+        # for vehicle, lane_id in valid_npc_vehicles:
+        #     print(f"\tID: {vehicle.id}")
 
         min_lane_id = min(valid_npc_vehicles, key=lambda x: x[1])[1]
         max_lane_id = max(valid_npc_vehicles, key=lambda x: x[1])[1]
@@ -1101,7 +1216,7 @@ class PrivilegedRoutePlanner(object):
             loc_dot_products = np.sum(ego_actor_vec * ego_fwd_vec, axis=1)
 
             yaw_indices = np.where((yaw_differences < max_yaw_difference) & (loc_dot_products < 0))[0]
-        
+
         elif traffic_type == "oncoming":
             max_yaw_difference = self.config.trailing_vehicles_max_route_angle_oncoming
 
@@ -1125,7 +1240,7 @@ class PrivilegedRoutePlanner(object):
 
         # Usually the road is 3.5 m wide, but in case of ParkingCrossingPedestrian it's less
         trailing_vehicle_ids = vehicle_ids[(min_distances < max_distance) & yaw_mask]
-        print(f"Trailing vehicle IDs for {traffic_type} traffic: {trailing_vehicle_ids}")
+        # print(f"Trailing vehicle IDs for {traffic_type} traffic: {trailing_vehicle_ids}")
         self.previous_trailing_vehicle_ids[traffic_type] = trailing_vehicle_ids
 
         # Group trailing vehicles by their target lane ids
@@ -1203,9 +1318,9 @@ class PrivilegedRoutePlanner(object):
           cur_idx += 1
           lane_change_end_point = self.route_waypoints[cur_idx]
 
-      print(f'EARLY START ROAD ID: {lane_change_early_start_point.road_id}, LANE ID: {lane_change_early_start_point.lane_id}, LOC: \n\tX: {lane_change_early_start_point.transform.location.x}, Y: {lane_change_early_start_point.transform.location.y}, Z: {lane_change_early_start_point.transform.location.z}')
-      print(f'LATE START ROAD ID: {lane_change_late_start_point.road_id}, LANE ID: {lane_change_late_start_point.lane_id}, LOC: \n\tX: {lane_change_late_start_point.transform.location.x}, Y: {lane_change_late_start_point.transform.location.y}, Z: {lane_change_late_start_point.transform.location.z}')
-      print(f'END ROAD ID: {lane_change_end_point.road_id}, LANE ID: {lane_change_end_point.lane_id}, LOC: \n\tX: {lane_change_end_point.transform.location.x}, Y: {lane_change_end_point.transform.location.y}, Z: {lane_change_end_point.transform.location.z}')
+      # print(f'EARLY START ROAD ID: {lane_change_early_start_point.road_id}, LANE ID: {lane_change_early_start_point.lane_id}, LOC: \n\tX: {lane_change_early_start_point.transform.location.x}, Y: {lane_change_early_start_point.transform.location.y}, Z: {lane_change_early_start_point.transform.location.z}')
+      # print(f'LATE START ROAD ID: {lane_change_late_start_point.road_id}, LANE ID: {lane_change_late_start_point.lane_id}, LOC: \n\tX: {lane_change_late_start_point.transform.location.x}, Y: {lane_change_late_start_point.transform.location.y}, Z: {lane_change_late_start_point.transform.location.z}')
+      # print(f'END ROAD ID: {lane_change_end_point.road_id}, LANE ID: {lane_change_end_point.lane_id}, LOC: \n\tX: {lane_change_end_point.transform.location.x}, Y: {lane_change_end_point.transform.location.y}, Z: {lane_change_end_point.transform.location.z}')
     lane_change_data = {
         "has_lane_change": has_lane_change,
         "lane_change_direction": lane_change_direction,

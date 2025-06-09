@@ -277,7 +277,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     # Setup agent prediction module
     grp = GlobalRoutePlanner(self.world_map, self.config.sampling_resolution)
-    self.agent_prediction.setup(self.traffic_manager, self.world_map, grp, self._vehicle)
+    self.trajectory_planner.setup_agent_prediction(self.traffic_manager, self.world_map, grp, self._vehicle)
+    # self.agent_prediction.setup(self.traffic_manager, self.world_map, grp, self._vehicle)
 
     # Setup cameras
     self.camera_tags = ['rgb', 'rgb_bev']
@@ -474,6 +475,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     ongoing_trailing_vehicles = self._waypoint_planner.get_trailing_vehicles(self.world_map, npc_vehicles, "ongoing")
 
     oncoming_leading_vehicles = self._waypoint_planner.get_leading_vehicles(self.world_map, npc_vehicles, "oncoming")
+    print(f'Oncoming Leading Vehicles: {oncoming_leading_vehicles}')
     oncoming_trailing_vehicles = self._waypoint_planner.get_trailing_vehicles(self.world_map, npc_vehicles, "oncoming")
 
     lane_change_data = self._waypoint_planner.get_upcoming_lane_change(ego_speed)
@@ -494,27 +496,6 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         "location": self._vehicle.get_location(),
         "lane_change": lane_change_data,
     }
-
-    num_future_frames = int(self.config.bicycle_frame_rate * self.config.default_forecast_length)
-
-    npc_predicted_paths, npc_vehicles_dict = self.agent_prediction.predict_npc_vehicle_waypoints(ego_context, npc_vehicles)
-    npc_predicted_vehicle_bounding_boxes = self.agent_prediction.forecast_npc_vehicle_bounding_boxes(npc_vehicles_dict, npc_predicted_paths, num_future_frames)
-
-    # for actor_idx, actors_forecasted_bounding_boxes in npc_predicted_vehicle_bounding_boxes.items():
-    #       for bb in actors_forecasted_bounding_boxes:
-    #         self._world.debug.draw_box(box=bb,
-    #                                     rotation=bb.rotation,
-    #                                     thickness=0.1,
-    #                                     color=self.config.other_vehicles_forecasted_bbs_color,
-    #                                     life_time=self.config.draw_life_time)
-
-    # ego_bounding_boxes = self.agent_prediction.forecast_ego_vehicle_bounding_boxes(ego_context, target_speed, num_future_frames)
-    # for bb in ego_bounding_boxes:
-    #   self._world.debug.draw_box(box=bb,
-    #                              rotation=bb.rotation,
-    #                              thickness=0.1,
-    #                              color=self.config.ego_vehicle_forecasted_bbs_normal_color,
-    #                              life_time=self.config.draw_life_time)
 
     # # if self.visualize == 1:
     # for vehicle_id, predicted_path in npc_predicted_paths.items():
@@ -545,12 +526,21 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     structured_data = self.scene_descriptor.get_structured_data(traffic_context, ego_context, agent_context)
     # print(f"Structured Data: {structured_data}")
-    scenario_prompt = """
-Scenario Name: EnterActorFlowV2
-Scenario Description: The ego vehicle is expected to merge onto a highway from a ramp.\n
-"""
-    formatted_data = scenario_prompt + self.scene_descriptor.to_formatted_string(structured_data)
-    print(f"Structured Data: {formatted_data}")
+#     scenario_prompt = """
+# Scenario Name: EnterActorFlowV2
+# Scenario Description: The ego vehicle is expected to merge onto a highway from a ramp.\n
+# """
+#     scenario_prompt = """
+# Scenario Name: HighwayExit
+# Scenario Description: The ego vehicle is expected to exit from the highway.\n
+# """
+#     scenario_prompt = """
+# Scenario Name: HighwayCutIn
+# Scenario Description: A vehicle is expected to cut in front of the ego vehicle on the highway from a ramp on the right side. Decelerate accordingly to maintain a safe following distance once you observe the vehicle cutting in to your lane.\n
+
+# """
+    # formatted_data = scenario_prompt + self.scene_descriptor.to_formatted_string(structured_data)
+    formatted_data = self.scene_descriptor.to_formatted_string(structured_data)
 
     # Get camera sensor object
     image_obvs = []
@@ -592,18 +582,21 @@ Scenario Description: The ego vehicle is expected to merge onto a highway from a
     # Execute at 1Hz
     high_level_cmd = None
     if self.step % int(self.config.carla_fps) == 0:
+      print(f'\nEXECUTING LLM COMMAND\n')
       # print(f"Structured Data: {formatted_data}")
       high_level_cmd = self.scene_interpreter.run_step(formatted_data, bb_final)
 
+    print(f"Structured Data: {formatted_data}")
+
     # Translate the high-level command to low-level commands
     brake = False
+    self.trajectory_planner.update_state(agent_context, traffic_context, ego_context, self._waypoint_planner)
     if high_level_cmd:
-      self.trajectory_planner.update_state(agent_context, traffic_context, ego_context, self._waypoint_planner)
-      llm_target_speed, route_points, route_wps = self.trajectory_planner.run_command(high_level_cmd)
+      llm_target_speed, route_points, route_wps = self.trajectory_planner.run_command(high_level_cmd, structured_data)
       self.prev_cmd = high_level_cmd
 
     else:
-      llm_target_speed, route_points, route_wps = self.trajectory_planner.run_command(self.prev_cmd)
+      llm_target_speed, route_points, route_wps = self.trajectory_planner.run_command(self.prev_cmd, structured_data)
 
     # if llm_target_speed < 0.1:
     #     brake = True

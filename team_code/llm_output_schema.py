@@ -22,6 +22,7 @@ class LongitudinalCommand(enum.Enum):
     ACCELERATE = "accelerate"
     DECELERATE = "decelerate"
     CHANGE_LANE_LEFT = "change_lane_left"
+    CHANGE_LANE_RIGHT = "change_lane_right"
     # STOP = "stop"
 
 # class LongitudinalCommand(enum.Enum):
@@ -53,7 +54,16 @@ class HighLevelCommand(BaseModel):
     key_actors: list[KeyActor] = Field(..., description="Key actors involved in the command.")
     reasoning: str
 
-
+class SceneDescription(BaseModel):
+    """
+    Description of the scene, including key actors and their types.
+    """
+    road_description: str = Field(..., description="Description of the road network and its conditions.")
+    traffic_description: str = Field(..., description="Description of the traffic conditions in the scene.")
+    static_objects_and_obstacles_description: str = Field(..., description="Description of static objects and obstacles in the scene.")
+    ego_vehicle_description: str = Field(..., description="Description of the ego vehicle and its state.")
+    key_actors: list[KeyActor] = Field(..., description="List of key actors in the scene.")
+    reasoning: str = Field(..., description="Reasoning for the chosen key actors")
 
 class VehicleConditions(BaseModel):
     class VehicleTrafficType(enum.Enum):
