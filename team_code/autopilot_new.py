@@ -579,36 +579,40 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
       output_path = os.path.join(output_dir, f"rgb_bounding_boxes_{self._image_counter:04d}.png")
       cv2.imwrite(output_path, bb_final)
 
+      text_output_path = os.path.join(output_dir, f"scene_context_{self._image_counter:04d}.txt")
+      with open(text_output_path, 'w') as f:
+        f.write(formatted_data)
+
     # Execute at 1Hz
-    high_level_cmd = None
-    if self.step % int(self.config.carla_fps) == 0:
-      print(f'\nEXECUTING LLM COMMAND\n')
-      # print(f"Structured Data: {formatted_data}")
-      high_level_cmd = self.scene_interpreter.run_step(formatted_data, bb_final)
+    # high_level_cmd = None
+    # if self.step % int(self.config.carla_fps) == 0:
+    #   print(f'\nEXECUTING LLM COMMAND\n')
+    #   # print(f"Structured Data: {formatted_data}")
+    #   high_level_cmd = self.scene_interpreter.run_step(formatted_data, bb_final)
 
     print(f"Structured Data: {formatted_data}")
 
     # Translate the high-level command to low-level commands
-    brake = False
-    self.trajectory_planner.update_state(agent_context, traffic_context, ego_context, self._waypoint_planner)
-    if high_level_cmd:
-      llm_target_speed, route_points, route_wps = self.trajectory_planner.run_command(high_level_cmd, structured_data)
-      self.prev_cmd = high_level_cmd
+    # brake = False
+    # self.trajectory_planner.update_state(agent_context, traffic_context, ego_context, self._waypoint_planner)
+    # if high_level_cmd:
+    #   llm_target_speed, route_points, route_wps = self.trajectory_planner.run_command(high_level_cmd, structured_data)
+    #   self.prev_cmd = high_level_cmd
 
-    else:
-      llm_target_speed, route_points, route_wps = self.trajectory_planner.run_command(self.prev_cmd, structured_data)
+    # else:
+    #   llm_target_speed, route_points, route_wps = self.trajectory_planner.run_command(self.prev_cmd, structured_data)
 
     # if llm_target_speed < 0.1:
     #     brake = True
 
-    print(f"LLM Target Speed: {self.trajectory_planner.target_speed}")
+    # print(f"LLM Target Speed: {self.trajectory_planner.target_speed}")
     # NEW CODE
 
     # Manage route obstacle scenarios and adjust target speed
-    # target_speed_route_obstacle, keep_driving, speed_reduced_by_obj = self._manage_route_obstacle_scenarios(
-    #     target_speed, ego_speed, route_wp, vehicles, route_np)
     target_speed_route_obstacle, keep_driving, speed_reduced_by_obj = self._manage_route_obstacle_scenarios(
-        target_speed, ego_speed, route_wps, vehicles, route_points)
+        target_speed, ego_speed, route_wp, vehicles, route_np)
+    # target_speed_route_obstacle, keep_driving, speed_reduced_by_obj = self._manage_route_obstacle_scenarios(
+    #     target_speed, ego_speed, route_wps, vehicles, route_points)
 
 
     # print(f'Target Speed Route Obstacle: {target_speed_route_obstacle}')
@@ -617,12 +621,12 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     if keep_driving:
       brake, target_speed = False, target_speed_route_obstacle
     else:
-      # brake, target_speed, speed_reduced_by_obj = self.get_brake_and_target_speed(
-      #     plant, route_np, distance_to_next_traffic_light, next_traffic_light, distance_to_next_stop_sign,
-      #     next_stop_sign, vehicles, actors, target_speed, speed_reduced_by_obj)
-      _, target_speed, speed_reduced_by_obj = self.get_brake_and_target_speed(
+      brake, target_speed, speed_reduced_by_obj = self.get_brake_and_target_speed(
           plant, route_np, distance_to_next_traffic_light, next_traffic_light, distance_to_next_stop_sign,
           next_stop_sign, vehicles, actors, target_speed, speed_reduced_by_obj)
+      # _, target_speed, speed_reduced_by_obj = self.get_brake_and_target_speed(
+      #     plant, route_np, distance_to_next_traffic_light, next_traffic_light, distance_to_next_stop_sign,
+      #     next_stop_sign, vehicles, actors, target_speed, speed_reduced_by_obj)
 
     # print(f'Speed Reduced by Object: {speed_reduced_by_obj}')
     # print(f'IDM Target Speed: {target_speed}')
@@ -633,8 +637,8 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self.junction = ego_vehicle_waypoint.is_junction
 
     # Compute throttle and brake control
-    # throttle, control_brake = self._longitudinal_controller.get_throttle_and_brake(brake, target_speed, ego_speed)
-    throttle, control_brake = self._longitudinal_controller.get_throttle_and_brake(brake, self.trajectory_planner.target_speed, ego_speed)
+    throttle, control_brake = self._longitudinal_controller.get_throttle_and_brake(brake, target_speed, ego_speed)
+    # throttle, control_brake = self._longitudinal_controller.get_throttle_and_brake(brake, self.trajectory_planner.target_speed, ego_speed)
 
     # Compute steering control
     steer = self._get_steer(route_np, ego_position, tick_data["compass"], ego_speed)

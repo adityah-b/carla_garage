@@ -2,17 +2,23 @@
 
 # PDM-Lite agent
 export TEAM_AGENT=$WORK_DIR/team_code/autopilot_new.py
+# export TEAM_AGENT=$WORK_DIR/team_code/autopilot.py
 
 # PDM-Lite agent with data collection
 # export TEAM_AGENT=$WORK_DIR/team_code/data_agent.py
 
-export ROUTES=$LEADERBOARD_ROOT/data/routes_devtest.xml
+# export ROUTES=$LEADERBOARD_ROOT/data/routes_devtest.xml
 # export ROUTES=$WORK_DIR/data/50x36_Town13/SignalizedJunctionLeftTurn/9_0.xml
+# export ROUTES=$WORK_DIR/data/50x38_Town12/EnterActorFlowV2/975_0.xml
+# export ROUTES=$WORK_DIR/data/50x38_Town12/HighwayExit/964_11.xml
+export ROUTES=$WORK_DIR/data/50x38_Town12/HighwayCutIn/953_3.xml
+# export ROUTES=$WORK_DIR/data/50x38_Town12/InterurbanAdvancedActorFlow/417_0.xml
 
-export ROUTES_SUBSET=0
+# export ROUTES_SUBSET=0
 export REPETITIONS=1
 
 export DEBUG_CHALLENGE=1
+# export DEBUG_CHALLENGE=0
 export CHALLENGE_TRACK_CODENAME=MAP
 export CHECKPOINT_ENDPOINT="${LEADERBOARD_ROOT}/results.json"
 export RECORD_PATH=
@@ -38,4 +44,4 @@ python3 ${LEADERBOARD_ROOT}/leaderboard/leaderboard_evaluator_local.py \
 --record=${RECORD_PATH} \
 --resume=${RESUME} \
 --timeout=300 \
---routes-subset=${ROUTES_SUBSET} \
+# --routes-subset=${ROUTES_SUBSET} \

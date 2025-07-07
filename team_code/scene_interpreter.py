@@ -78,27 +78,27 @@ reasoning: Reasoning for the chosen key actors.
         except Exception as e:
             return {"error": str(e)}
 
-    def predict_intention(self, scene_description: SceneDescription, image: np.ndarray) -> NPCIntention:
-        """
-        Predicts the intention of the non-player characters (NPCs) in the scene.
-        :param scene_description: SceneDescription object containing key actors and their types.
-        :param image: Image of the scene as a numpy array.
-        :return: NPCIntention object containing predicted intentions of NPCs.
-        """
-        try:
-            # Convert the numpy array to a PIL image
-            pil_image = Image.fromarray(np.uint8(image), mode='RGB')
-            key_actors = 
-#             scene_prompt = f"""
-# Scene Description:
-#     Road Description: {scene_description.road_description}
-#     Traffic Description: {scene_description.traffic_description}
-#     Static Objects and Obstacles: {scene_description.static_objects_and_obstacles_description}
-#     Ego Vehicle State: {scene_description.ego_vehicle_description}
+#     def predict_intention(self, scene_description: SceneDescription, image: np.ndarray) -> NPCIntention:
+#         """
+#         Predicts the intention of the non-player characters (NPCs) in the scene.
+#         :param scene_description: SceneDescription object containing key actors and their types.
+#         :param image: Image of the scene as a numpy array.
+#         :return: NPCIntention object containing predicted intentions of NPCs.
+#         """
+#         try:
+#             # Convert the numpy array to a PIL image
+#             pil_image = Image.fromarray(np.uint8(image), mode='RGB')
+#             key_actors =
+# #             scene_prompt = f"""
+# # Scene Description:
+# #     Road Description: {scene_description.road_description}
+# #     Traffic Description: {scene_description.traffic_description}
+# #     Static Objects and Obstacles: {scene_description.static_objects_and_obstacles_description}
+# #     Ego Vehicle State: {scene_description.ego_vehicle_description}
 
-            contents = [pil_image, scene_description]
+#             contents = [pil_image, scene_description]
 
-        
+
     def _initialize_llm(self):
         """
         Sends the system prompt to the LLM to initialize it.
