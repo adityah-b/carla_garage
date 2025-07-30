@@ -13,6 +13,15 @@ from agents.navigation.local_planner import RoadOption
 import os
 
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import List, Dict, Set
+
+@dataclass(frozen=True, slots=True)
+class PlannerState:
+    route_index : int
+    route_waypoints : List[carla.Waypoint]
+    route_points : np.ndarray
+    rotation_angles : np.ndarray
 
 class PrivilegedRoutePlanner(object):
   """
@@ -76,6 +85,14 @@ class PrivilegedRoutePlanner(object):
         "ongoing": np.array([]),
         "oncoming": np.array([]),
     }
+
+  def get_planner_state(self) -> PlannerState:
+      return PlannerState(
+         route_index = self.route_index,
+         route_waypoints = self.route_waypoints,
+         route_points = self.route_points,
+         rotation_angles = self.rotation_angles
+      )
 
   def save(self):
     """
