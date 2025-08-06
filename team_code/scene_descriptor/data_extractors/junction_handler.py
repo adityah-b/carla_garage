@@ -5,7 +5,7 @@ from typing import List, Dict, Set, Optional, Tuple
 from dataclasses import dataclass
 from collections import defaultdict
 
-JunctionPair = Tuple[Optional[carla.Waypoint], carla.Waypoint]
+JunctionPair = Tuple[carla.Waypoint, carla.Waypoint]
 
 @dataclass(frozen=True, slots=True)
 class JunctionConnection:
@@ -33,17 +33,13 @@ class JunctionHandler:
     def _step_into_junction(
         wp : carla.Waypoint,
         max_travel_distance : float,
-        step_func,
-        return_pre_entry : bool = False
+        step_func
     ) -> Optional[JunctionPair]:
         """
         Step into a junction given a lane waypoint.
         """
-        if wp.is_junction:
-            return (None, wp)
-
         traveled_distance = 0.0
-        prev_wp = None
+        prev_wp = wp
 
         while wp and (not wp.is_junction) and (traveled_distance < max_travel_distance):
             next_wps = step_func(wp)
@@ -57,7 +53,7 @@ class JunctionHandler:
         if not wp.is_junction:
             return None
 
-        return (prev_wp if return_pre_entry else None, wp)
+        return (prev_wp, wp)
 
     @staticmethod
     def _step_out_of_junction(
@@ -71,7 +67,7 @@ class JunctionHandler:
         while wp and wp.is_junction:
             next_wps = step_func(wp)
             if not next_wps:
-                return wp
+                return None
             wp = next_wps[0]
 
         return wp
@@ -80,7 +76,6 @@ class JunctionHandler:
     def get_next_junction(
         wp : carla.Waypoint,
         max_travel_distance : float = 50.0,
-        return_pre_entry : bool = False
     ) -> Optional[JunctionPair]:
         """
         Get the next junction waypoint within max_travel_distance.
@@ -88,15 +83,13 @@ class JunctionHandler:
         return JunctionHandler._step_into_junction(
             wp,
             max_travel_distance,
-            step_func = lambda w: w.next(JunctionHandler.JUNCTION_HOP_DISTANCE),
-            return_pre_entry = return_pre_entry
+            step_func = lambda w: w.next(JunctionHandler.JUNCTION_HOP_DISTANCE)
         )
 
     @staticmethod
     def get_previous_junction(
         wp : carla.Waypoint,
         max_travel_distance : float = 50.0,
-        return_pre_entry : bool = False
     ) -> Optional[JunctionPair]:
         """
         Get the previous junction waypoint within max_travel_distance.
@@ -104,8 +97,7 @@ class JunctionHandler:
         return JunctionHandler._step_into_junction(
             wp,
             max_travel_distance,
-            step_func = lambda w: w.previous(JunctionHandler.JUNCTION_HOP_DISTANCE),
-            return_pre_entry = return_pre_entry
+            step_func = lambda w: w.previous(JunctionHandler.JUNCTION_HOP_DISTANCE)
         )
 
     @staticmethod

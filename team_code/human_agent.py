@@ -35,6 +35,13 @@ from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 
 from scene_descriptor.data_extractors.junction_handler import JunctionHandler
 
+# Privileged route planner
+from config import GlobalConfig
+from privileged_route_planner import PrivilegedRoutePlanner
+
+# Road handler
+from scene_descriptor.data_extractors.road_handler import RoadHandler
+
 def get_entry_point():
     return 'HumanAgent'
 
@@ -135,6 +142,21 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
         self.ego_agent = CarlaDataProvider.get_hero_actor()
         self.world = self.ego_agent.get_world()
 
+        # Setup privileged waypoint planner
+        self.config = GlobalConfig()
+        self.waypoint_planner = PrivilegedRoutePlanner(self.config)
+
+        self.waypoint_planner.setup_route(
+            self.org_dense_route_world_coord,
+            self.world,
+            self.world_map,
+            False,
+            self.ego_agent.get_location()
+        )
+
+        # Setup road handler
+        self.road_handler = RoadHandler(self.config, self.world_map)
+
     def sensors(self):
         """
         Define the sensor suite required by the agent
@@ -177,37 +199,72 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
         Execute one step of navigation.
         """
         cur_loc = self.ego_agent.get_location()
-        # junction_wp = self.world_map.get_waypoint(cur_loc)
+        ego_location = np.array([cur_loc.x, cur_loc.y, cur_loc.z])
 
-        # if junction_wp.is_junction:
+        # cur_wp = self.world_map.get_waypoint(cur_loc)
+        # _, junction_wp = JunctionHandler.get_next_junction(cur_wp)
+        # if not junction_wp:
+        #     print(f'No junction found in next 50.0m')
+
+        # if junction_wp:
+        #     distance = cur_wp.transform.location.distance(junction_wp.transform.location)
+        #     print(f'Junction found {distance} m away')
         #     lane_wp = junction_wp.previous(2.0)[0]
         #     junction_map = JunctionHandler.create_junction_map(junction_wp)
-        #     lanelet = JunctionHandler.get_junction_connections(junction_map, lane_wp)
+        #     lanelets = JunctionHandler.get_junction_connections(junction_map, lane_wp)
 
-        #     if lanelet:
-        #         self.world.debug.draw_line(lane_wp.transform.location, lanelet[0].transform.location, color=carla.Color(255, 255, 0))
-        #         self.world.debug.draw_line(lanelet[0].transform.location, lanelet[1].transform.location)
-        #         self.world.debug.draw_line(lanelet[1].transform.location, lanelet[2].transform.location, color=carla.Color(0, 255, 0))
-        #         self.world.debug.draw_line(lanelet[2].transform.location, lanelet[3].transform.location, color=carla.Color(0, 0, 255))
+        #     if lanelets:
+        #         for lanelet in lanelets:
+        #             self.world.debug.draw_line(lane_wp.transform.location, lanelet.entry_connection.transform.location, color=carla.Color(255, 255, 0))
+        #             self.world.debug.draw_line(lanelet.entry_connection.transform.location, lanelet.entry_junction.transform.location)
+        #             self.world.debug.draw_line(lanelet.entry_junction.transform.location, lanelet.exit_junction.transform.location, color=carla.Color(0, 255, 0))
+        #             self.world.debug.draw_line(lanelet.exit_junction.transform.location, lanelet.exit_connection.transform.location, color=carla.Color(0, 0, 255))
 
-        cur_wp = self.world_map.get_waypoint(cur_loc)
-        _, junction_wp = JunctionHandler.get_next_junction(cur_wp)
-        if not junction_wp:
-            print(f'No junction found in next 50.0m')
+        # Get the list of vehicles in the scene
+        actors = self.world.get_actors()
+        vehicles = list(actors.filter("*vehicle*"))
+        npc_vehicles = [vehicle for vehicle in vehicles if vehicle.id != self.ego_agent.id]
 
-        if junction_wp:
-            distance = cur_wp.transform.location.distance(junction_wp.transform.location)
-            print(f'Junction found {distance} m away')
-            lane_wp = junction_wp.previous(2.0)[0]
-            junction_map = JunctionHandler.create_junction_map(junction_wp)
-            lanelets = JunctionHandler.get_junction_connections(junction_map, lane_wp)
+        self.waypoint_planner.run_step(ego_location)
+        planner_state = self.waypoint_planner.get_planner_state()
+        leading_vehicles_grouped = self.road_handler.get_leading_vehicles(planner_state, npc_vehicles)
 
-            if lanelets:
-                for lanelet in lanelets:
-                    self.world.debug.draw_line(lane_wp.transform.location, lanelet.entry_connection.transform.location, color=carla.Color(255, 255, 0))
-                    self.world.debug.draw_line(lanelet.entry_connection.transform.location, lanelet.entry_junction.transform.location)
-                    self.world.debug.draw_line(lanelet.entry_junction.transform.location, lanelet.exit_junction.transform.location, color=carla.Color(0, 255, 0))
-                    self.world.debug.draw_line(lanelet.exit_junction.transform.location, lanelet.exit_connection.transform.location, color=carla.Color(0, 0, 255))
+        # Draw route
+        # route_points = planner_state.route_points[planner_state.route_index:]
+        # for i in range(min(route_points.shape[0] - 1, self.config.draw_future_route_till_distance)):
+        #     loc = route_points[i]
+        #     loc = carla.Location(loc[0], loc[1], loc[2] + 0.1)
+        #     self.world.debug.draw_point(location=loc,
+        #                                 size=0.05,
+        #                                 color=self.config.future_route_color,
+        #                                 life_time=self.config.draw_life_time)
+
+        print(f'Leading Vehicles')
+        for lane_name, lane_vehicles_list in leading_vehicles_grouped.items():
+            print(f'\tLane Name: {lane_name}')
+            for lv in lane_vehicles_list:
+                ll = lv.lanelet
+                ll_wps = ll.waypoints_list()
+                for wp_a, wp_b in zip(ll_wps[:-1], ll_wps[1:]):
+                    loc_a = wp_a.transform.location
+                    loc_a = carla.Location(loc_a.x, loc_a.y, loc_a.z + 0.1)
+
+                    loc_b = wp_b.transform.location
+                    loc_b = carla.Location(loc_b.x, loc_b.y, loc_b.z + 0.1)
+
+                    self.world.debug.draw_line(
+                        loc_a, loc_b, color=self.config.future_route_color, life_time=self.config.draw_life_time)
+
+                vehicles = lv.vehicles
+                for v in vehicles:
+                    loc = v.get_location()
+                    print(f'\t\tVehicle: {v.id}')
+
+                    self.world.debug.draw_string(
+                        location=loc,
+                        text=f'{v.id}',
+                        life_time=0
+                    )
 
 
         self._clock.tick_busy_loop(20)
