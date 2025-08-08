@@ -34,6 +34,7 @@ from collections import defaultdict
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 
 from scene_descriptor.data_extractors.junction_handler import JunctionHandler
+from scene_descriptor.data_extractors.lane_handler import LaneHandler, WaypointUtils
 
 # Privileged route planner
 from config import GlobalConfig
@@ -41,6 +42,11 @@ from privileged_route_planner import PrivilegedRoutePlanner
 
 # Road handler
 from scene_descriptor.data_extractors.road_handler import RoadHandler
+
+color_red     = carla.Color(r=100, g=0,   b=0)
+color_green   = carla.Color(r=0,   g=100, b=0)
+color_blue    = carla.Color(r=0,   g=0,   b=100)
+color_yellow  = carla.Color(r=100, g=100, b=0)
 
 def get_entry_point():
     return 'HumanAgent'
@@ -228,6 +234,9 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
         self.waypoint_planner.run_step(ego_location)
         planner_state = self.waypoint_planner.get_planner_state()
         leading_vehicles_grouped = self.road_handler.get_leading_vehicles(planner_state, npc_vehicles)
+        trailing_vehicles_grouped = self.road_handler.get_trailing_vehicles(planner_state, npc_vehicles)
+        oncoming_vehicles_grouped = self.road_handler.get_oncoming_vehicles(planner_state, npc_vehicles)
+        cross_vehicles_grouped = self.road_handler.get_cross_vehicles(planner_state, npc_vehicles)
 
         # Draw route
         # route_points = planner_state.route_points[planner_state.route_index:]
@@ -253,7 +262,45 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
                     loc_b = carla.Location(loc_b.x, loc_b.y, loc_b.z + 0.1)
 
                     self.world.debug.draw_line(
-                        loc_a, loc_b, color=self.config.future_route_color, life_time=self.config.draw_life_time)
+                        loc_a, loc_b, color=color_red, life_time=self.config.draw_life_time)
+
+                    # self.world.debug.draw_string(
+                    #     loc_a,
+                    #     text = f'({loc_a.x}, {loc_a.y})',
+                    #     life_time=0)
+                    # self.world.debug.draw_string(
+                    #     loc_b,
+                    #     text = f'({loc_b.x}, {loc_b.y})',
+                    #     life_time=0)
+
+                vehicles = lv.vehicles
+                for v in vehicles:
+                    loc = v.get_location()
+                    print(f'\t\tVehicle: {v.id}')
+
+                    self.world.debug.draw_string(
+                        location=loc,
+                        color=color_red,
+                        text=f'{v.id}',
+                        life_time=0
+                    )
+
+
+        print(f'Trailing Vehicles')
+        for lane_name, lane_vehicles_list in trailing_vehicles_grouped.items():
+            print(f'\tLane Name: {lane_name}')
+            for lv in lane_vehicles_list:
+                ll = lv.lanelet
+                ll_wps = ll.waypoints_list()
+                for wp_a, wp_b in zip(ll_wps[:-1], ll_wps[1:]):
+                    loc_a = wp_a.transform.location
+                    loc_a = carla.Location(loc_a.x, loc_a.y, loc_a.z + 0.1)
+
+                    loc_b = wp_b.transform.location
+                    loc_b = carla.Location(loc_b.x, loc_b.y, loc_b.z + 0.1)
+
+                    self.world.debug.draw_line(
+                        loc_a, loc_b, color=color_blue, life_time=self.config.draw_life_time)
 
                 vehicles = lv.vehicles
                 for v in vehicles:
@@ -263,9 +310,65 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
                     self.world.debug.draw_string(
                         location=loc,
                         text=f'{v.id}',
+                        color=color_blue,
                         life_time=0
                     )
 
+        print(f'Oncoming Vehicles')
+        for lane_name, lane_vehicles_list in oncoming_vehicles_grouped.items():
+            print(f'\tLane Name: {lane_name}')
+            for lv in lane_vehicles_list:
+                ll = lv.lanelet
+                ll_wps = ll.waypoints_list()
+                for wp_a, wp_b in zip(ll_wps[:-1], ll_wps[1:]):
+                    loc_a = wp_a.transform.location
+                    loc_a = carla.Location(loc_a.x, loc_a.y, loc_a.z + 0.1)
+
+                    loc_b = wp_b.transform.location
+                    loc_b = carla.Location(loc_b.x, loc_b.y, loc_b.z + 0.1)
+
+                    self.world.debug.draw_line(
+                        loc_a, loc_b, color=color_green, life_time=self.config.draw_life_time)
+
+                vehicles = lv.vehicles
+                for v in vehicles:
+                    loc = v.get_location()
+                    print(f'\t\tVehicle: {v.id}')
+
+                    self.world.debug.draw_string(
+                        location=loc,
+                        text=f'{v.id}',
+                        color=color_green,
+                        life_time=0
+                    )
+
+        print(f'Cross Vehicles')
+        for lane_name, lane_vehicles_list in cross_vehicles_grouped.items():
+            print(f'\tLane Name: {lane_name}')
+            for lv in lane_vehicles_list:
+                ll = lv.lanelet
+                ll_wps = ll.waypoints_list()
+                for wp_a, wp_b in zip(ll_wps[:-1], ll_wps[1:]):
+                    loc_a = wp_a.transform.location
+                    loc_a = carla.Location(loc_a.x, loc_a.y, loc_a.z + 0.2)
+
+                    loc_b = wp_b.transform.location
+                    loc_b = carla.Location(loc_b.x, loc_b.y, loc_b.z + 0.2)
+
+                    self.world.debug.draw_line(
+                        loc_a, loc_b, color=color_yellow, life_time=0)
+
+                vehicles = lv.vehicles
+                for v in vehicles:
+                    loc = v.get_location()
+                    print(f'\t\tVehicle: {v.id}')
+
+                    self.world.debug.draw_string(
+                        location=loc,
+                        text=f'{v.id}',
+                        color=color_yellow,
+                        life_time=0
+                    )
 
         self._clock.tick_busy_loop(20)
         self.agent_engaged = True

@@ -28,14 +28,15 @@ class RoadHandler:
     def _get_all_lanelets(
         self,
         lane_wps : List[carla.Waypoint],
-        max_len : float = 50.0
+        max_len : float = 80.0,
+        backward : bool = False
     ) -> List[Lanelet]:
         """
         Given a list of waypoints, generate list of corresponding lanelets
         """
         all_lanelets : List[Lanelet] = []
         for wp in lane_wps:
-            all_lanelets += LaneHandler.generate_lanelet(wp, self.grp, max_len)
+            all_lanelets += LaneHandler.generate_lanelet(wp, self.grp, max_len, backward)
 
         return all_lanelets
 
@@ -129,7 +130,7 @@ class RoadHandler:
         if traffic_type in ["leading", "oncoming", "crossing"]:
             max_detection_radius = self.config.leading_vehicles_maximum_detection_radius
         elif traffic_type == "trailing":
-            max_detection_radius = self.config.trailing_vehicles_maximum_detection_radius
+            max_detection_radius = self.config.tailing_vehicles_maximum_detection_radius
 
         # Slice the route
         if traffic_type in ["leading", "oncoming", "crossing"]:
@@ -182,12 +183,10 @@ class RoadHandler:
         elif traffic_type == "oncoming":
             mask &= (heading_dots < 0) & (loc_dots >= 0)
         elif traffic_type == "crossing":
-            pass
-            # cross_angle_thresh  = cfg.cross_vehicles_max_route_angle  # e.g. ~30°
+            cross_angle_thresh  = 30  # e.g. ~30°
             # lateral_thresh      = cfg.cross_vehicles_max_lateral_distance  # e.g. road width
-            # mask &= (np.abs(heading_dot) < np.cos(np.deg2rad(90 - cross_angle_thresh))) \
-            #         & (loc_dot >= 0) \
-            #         & (lateral_dist < lateral_thresh)
+            mask &= (np.abs(heading_dots) < np.cos(np.deg2rad(90 - cross_angle_thresh))) \
+                    & (loc_dots >= 0)
         else:
             raise ValueError(f"Unknown traffic_type: {traffic_type}")
 
@@ -215,13 +214,14 @@ class RoadHandler:
         same_lane_wps = LaneHandler.get_same_dir_lanes(ego_wp)
 
         # Setup the source waypoints for each lanelet
+        ego_idx = same_lane_wps.index(ego_wp)
         lane_dict = {'ego' : ego_wp}
-        if len(same_lane_wps) > 1:
-            left_wp = same_lane_wps[0]
-            lane_dict['left'] = left_wp
-        if len(same_lane_wps) > 2:
-            right_wp = same_lane_wps[-1]
-            lane_dict['right'] = right_wp
+        if ego_idx > 0:
+            left_wp = same_lane_wps[ego_idx - 1]
+            lane_dict["left"] = left_wp
+        if ego_idx < len(same_lane_wps) - 1:
+            right_wp = same_lane_wps[ego_idx + 1]
+            lane_dict["right"] = right_wp
 
         min_lane_id = left_wp.lane_id if left_wp else ego_wp.lane_id
         max_lane_id = right_wp.lane_id if right_wp else ego_wp.lane_id
@@ -242,7 +242,7 @@ class RoadHandler:
         )
 
         # Generate all lanelets for each target lane waypoint
-        all_lanelets = self._get_all_lanelets(same_lane_wps, leading_max_detection_radius)
+        all_lanelets = self._get_all_lanelets(same_lane_wps)
 
         # Group lanelets by their corresponding lanes
         grouped_lanelets = self._group_lanelets(all_lanelets, lane_dict)
@@ -262,7 +262,7 @@ class RoadHandler:
         """
         route_index = planner_state.route_index
         route_waypoints = planner_state.route_waypoints
-        trailing_max_detection_radius = self.config.trailing_vehicles_maximum_detection_radius
+        trailing_max_detection_radius = self.config.tailing_vehicles_maximum_detection_radius
 
         # Get the current ego waypoint
         ego_wp = route_waypoints[route_index]
@@ -273,13 +273,14 @@ class RoadHandler:
         same_lane_wps = LaneHandler.get_same_dir_lanes(ego_wp)
 
         # Setup the source waypoints for each lanelet
+        ego_idx = same_lane_wps.index(ego_wp)
         lane_dict = {'ego' : ego_wp}
-        if len(same_lane_wps) > 1:
-            left_wp = same_lane_wps[0]
-            lane_dict['left'] = left_wp
-        if len(same_lane_wps) > 2:
-            right_wp = same_lane_wps[-1]
-            lane_dict['right'] = right_wp
+        if ego_idx > 0:
+            left_wp = same_lane_wps[ego_idx - 1]
+            lane_dict["left"] = left_wp
+        if ego_idx < len(same_lane_wps) - 1:
+            right_wp = same_lane_wps[ego_idx + 1]
+            lane_dict["right"] = right_wp
 
         min_lane_id = left_wp.lane_id if left_wp else ego_wp.lane_id
         max_lane_id = right_wp.lane_id if right_wp else ego_wp.lane_id
@@ -300,7 +301,7 @@ class RoadHandler:
         )
 
         # Generate all lanelets for each target lane waypoint
-        all_lanelets = self._get_all_lanelets(same_lane_wps, trailing_max_detection_radius)
+        all_lanelets = self._get_all_lanelets(same_lane_wps, backward=True)
 
         # Group lanelets by their corresponding lanes
         grouped_lanelets = self._group_lanelets(all_lanelets, lane_dict)
@@ -318,6 +319,7 @@ class RoadHandler:
         """
         Get the instances of vehicles in oncoming traffic with respect to the ego vehicle
         """
+        grouped_vehicles = {}
         route_index = planner_state.route_index
         route_waypoints = planner_state.route_waypoints
         leading_max_detection_radius = self.config.leading_vehicles_maximum_detection_radius
@@ -334,51 +336,80 @@ class RoadHandler:
             for i, wp in enumerate(opp_lane_wps):
                 lane_dict[f'oncoming-{i}'] = wp
 
-        min_lane_id = opp_lane_wps[-1].lane_id
-        max_lane_id = opp_lane_wps[0].lane_id
+            min_lane_id = opp_lane_wps[-1].lane_id
+            max_lane_id = opp_lane_wps[0].lane_id
 
-        # Define the maximum distance and yaw difference thresholds
-        # Get the maximum lane offset from the ego vehicle's lane id
-        max_lane_offset = max(abs(min_lane_id - ego_wp.lane_id), abs(max_lane_id - ego_wp.lane_id))
-        max_distance = self.config.leading_vehicles_max_route_distance * (1 + max_lane_offset)
-        max_yaw_difference = self.config.leading_vehicles_max_route_angle_oncoming
+            # Define the maximum distance and yaw difference thresholds
+            # Get the maximum lane offset from the ego vehicle's lane id
+            max_lane_offset = max(abs(min_lane_id - ego_wp.lane_id), abs(max_lane_id - ego_wp.lane_id))
+            max_distance = self.config.trailing_vehicles_max_route_distance_lane_change * 4
+            max_yaw_difference = self.config.leading_vehicles_max_route_angle_oncoming
 
-        # Filter all oncoming vehicles
-        oncoming_vehicles = self._filter_vehicles_by_route(
-            planner_state,
-            npc_vehicles,
-            max_distance,
-            max_yaw_difference,
-            traffic_type="oncoming"
-        )
+            # Filter all oncoming vehicles
+            oncoming_vehicles = self._filter_vehicles_by_route(
+                planner_state,
+                npc_vehicles,
+                max_distance,
+                max_yaw_difference,
+                traffic_type="oncoming"
+            )
 
-        # Generate all lanelets for each target lane waypoint
-        all_lanelets = self._get_all_lanelets(opp_lane_wps, leading_max_detection_radius)
+            # Generate all lanelets for each target lane waypoint
+            all_lanelets = self._get_all_lanelets(opp_lane_wps, backward=True)
 
-        # Group lanelets by their corresponding lanes
-        grouped_lanelets = self._group_lanelets(all_lanelets, lane_dict)
+            # Group lanelets by their corresponding lanes
+            grouped_lanelets = self._group_lanelets(all_lanelets, lane_dict)
 
-        # Group vehicles by lane name
-        grouped_vehicles = self._assign_vehicles_to_lanelets(oncoming_vehicles, grouped_lanelets)
+            # Group vehicles by lane name
+            grouped_vehicles = self._assign_vehicles_to_lanelets(oncoming_vehicles, grouped_lanelets)
 
         return grouped_vehicles
 
+    def get_cross_vehicles(
+        self,
+        planner_state : PlannerState,
+        npc_vehicles : List[carla.Vehicle],
+    ) -> Dict[str, List[LaneVehicles]]:
+        """
+        Get the instances of vehicles in cross traffic with respect to the ego vehicle
+        """
+        grouped_vehicles = {}
+        route_index = planner_state.route_index
+        route_waypoints = planner_state.route_waypoints
+        leading_max_detection_radius = self.config.leading_vehicles_maximum_detection_radius
 
-# # Get NPC waypoints for lane filtering
-#         actor_waypoints = [self.carla_map.get_waypoint(actor.get_location()) for actor in actor_list]
+        # Get the current ego waypoint
+        ego_wp = route_waypoints[route_index]
 
-#         # Get flattened set of all lanelet keys
-#         all_lanelets_keys = {
-#             key
-#             for ll in all_lanelets
-#             for key in ll.lanelet_sections()
-#         }
+        # Get the lanes in the perpendicular direction as the ego vehicle
+        cross_lane_wps = LaneHandler.get_cross_dir_lanes(ego_wp)
 
-#         # Filter NPC actors based on lanelet membership
-#         valid_npc_actors = [
-#             (actor, actor_wp)
-#             for actor, actor_wp in zip(actor_list, actor_waypoints)
-#             if (actor_wp.road_id, actor_wp.section_id, actor_wp.lane_id) in all_lanelets_keys
-#         ]
+        lane_dict = {}
+        if cross_lane_wps:
+            # Setup the source waypoints for each lanelet
+            for wp in cross_lane_wps:
+                lane_dict[f'crossing-{wp.lane_id}'] = wp
 
-#         return valid_npc_actors
+            # Define the maximum distance and yaw difference thresholds
+            max_distance = self.config.trailing_vehicles_max_route_distance_lane_change * 4
+            max_yaw_difference = self.config.leading_vehicles_max_route_angle_oncoming
+
+            # Filter all cross vehicles
+            cross_vehicles = self._filter_vehicles_by_route(
+                planner_state,
+                npc_vehicles,
+                max_distance,
+                max_yaw_difference,
+                traffic_type="crossing"
+            )
+
+            # Generate all lanelets for each target lane waypoint
+            all_lanelets = self._get_all_lanelets(cross_lane_wps, backward=True)
+
+            # Group lanelets by their corresponding lanes
+            grouped_lanelets = self._group_lanelets(all_lanelets, lane_dict)
+
+            # Group vehicles by lane name
+            grouped_vehicles = self._assign_vehicles_to_lanelets(cross_vehicles, grouped_lanelets)
+
+        return grouped_vehicles

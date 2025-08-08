@@ -8,22 +8,28 @@ from collections import OrderedDict
 from .junction_handler import JunctionHandler
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
-@dataclass(frozen=True, slots=True)
 class Lanelet:
-    points : OrderedDict[tuple[int, int, int], carla.Waypoint]
+    def __init__(
+        self,
+        sparse_points : OrderedDict[tuple[int, int, int], carla.Waypoint],
+        dense_points = List[carla.Waypoint]
+    ):
+        self.sparse_points = sparse_points
+        self.dense_points = dense_points
 
     def waypoints_list(self):
-        return list(self.points.values())
+        # return list(self.points.values())
+        return self.dense_points
 
     def lanelet_sections(self):
-        return set(self.points.keys())
+        return set(self.sparse_points.keys())
 
     def __len__(self):
-        return len(self.points)
+        return len(self.sparse_points)
 
     def __contains__(self, wp: carla.Waypoint) -> bool:
         key = (wp.road_id, wp.section_id, wp.lane_id)
-        return key in self.points
+        return key in self.sparse_points
 
 class WaypointUtils:
     WAYPOINT_SAMPLING_RESOLUTION : float = 2.0
@@ -71,7 +77,7 @@ class WaypointUtils:
         source_wp : carla.Waypoint,
         target_wp : carla.Waypoint,
         grp : GlobalRoutePlanner,
-        assume_no_junction : bool = False
+        backward : bool = False
     ) -> List[carla.Waypoint]:
         """
         Interpolate waypoints between source and target waypoints
@@ -87,10 +93,16 @@ class WaypointUtils:
         interp_wps = [source_wp]
         cur_wp = source_wp
 
+        if backward:
+            step_func = (lambda wp : wp.previous(WaypointUtils.WAYPOINT_SAMPLING_RESOLUTION))
+        else:
+            step_func = (lambda wp : wp.next(WaypointUtils.WAYPOINT_SAMPLING_RESOLUTION))
+
         while WaypointUtils.get_distance(cur_wp, target_wp) > WaypointUtils.WAYPOINT_SAMPLING_RESOLUTION and \
                 WaypointUtils.get_distance(cur_wp, source_wp) < WaypointUtils.get_distance(target_wp, source_wp):
-            wp_choice = cur_wp.next(WaypointUtils.WAYPOINT_SAMPLING_RESOLUTION)
-            if not assume_no_junction and len(wp_choice) > 1:
+            # wp_choice = cur_wp.next(WaypointUtils.WAYPOINT_SAMPLING_RESOLUTION)
+            wp_choice = step_func(cur_wp)
+            if len(wp_choice) > 1:
                 max_dot = -1 * np.inf
                 target_wp_vec = target_wp.transform.get_forward_vector()
                 for wp in wp_choice:
@@ -102,8 +114,10 @@ class WaypointUtils:
                         cur_wp = wp
 
             elif not wp_choice:
-                _, exit_wp = WaypointUtils._find_waypoint_entry_exit(grp, cur_wp)
-                cur_wp = exit_wp
+                # _, exit_wp = WaypointUtils._find_waypoint_entry_exit(grp, cur_wp)
+                # cur_wp = exit_wp
+                entry_wp, exit_wp = WaypointUtils._find_waypoint_entry_exit(grp, cur_wp)
+                cur_wp = entry_wp if backward else exit_wp
 
             else:
                 cur_wp = wp_choice[0]
@@ -119,6 +133,7 @@ class WaypointUtils:
         source_wp : carla.Waypoint,
         grp : GlobalRoutePlanner,
         distance : float,
+        backward : bool = False
     ) -> carla.Waypoint:
         """
         Get a waypoint at a certain distance from the input waypoint.
@@ -134,12 +149,19 @@ class WaypointUtils:
         # print(f'Getting waypoints at distance {distance} from {waypoint.transform.location}')
         traveled_distance = 0.0
         cur_wp = source_wp
+        if backward:
+            step_func = (lambda wp : wp.previous(WaypointUtils.WAYPOINT_SAMPLING_RESOLUTION))
+        else:
+            step_func = (lambda wp : wp.next(WaypointUtils.WAYPOINT_SAMPLING_RESOLUTION))
 
         while traveled_distance < distance:
-            wp_choice = cur_wp.next(WaypointUtils.WAYPOINT_SAMPLING_RESOLUTION)
+            # wp_choice = cur_wp.next(WaypointUtils.WAYPOINT_SAMPLING_RESOLUTION)
+            wp_choice = step_func(cur_wp)
             if not wp_choice:
-                _, exit_wp = WaypointUtils._find_waypoint_entry_exit(grp, cur_wp)
-                cur_wp = exit_wp
+                # _, exit_wp = WaypointUtils._find_waypoint_entry_exit(grp, cur_wp)
+                # cur_wp = exit_wp
+                entry_wp, exit_wp = WaypointUtils._find_waypoint_entry_exit(grp, cur_wp)
+                cur_wp = entry_wp if backward else exit_wp
             else:
                 cur_wp = wp_choice[0]
 
@@ -154,56 +176,138 @@ class LaneHandler:
 
     @staticmethod
     def _to_lanelet(
-        waypoints : List[carla.Waypoint]
+        dense_waypoints : List[carla.Waypoint]
     ) -> Lanelet:
         """
         Generate lanelet given waypoint list
         """
-        lanelet_points = OrderedDict()
-        for wp in waypoints:
+        sparse_lanelet_points = OrderedDict()
+        for wp in dense_waypoints:
             key = (wp.road_id, wp.section_id, wp.lane_id)
-            lanelet_points.setdefault(key, wp)
+            sparse_lanelet_points.setdefault(key, wp)
 
-        return Lanelet(lanelet_points)
+        return Lanelet(sparse_points=sparse_lanelet_points, dense_points=dense_waypoints)
 
     @staticmethod
     def generate_lanelet(
         start_wp : carla.Waypoint,
         grp : GlobalRoutePlanner,
-        max_length : float = 50.0
+        max_length : float = 80.0,
+        backward : bool = False
     ) -> List[Lanelet]:
         """
-        Generate lanelets that extend max_length metres from start_wp or through the next junction
+        Generate lanelets that extend up to max_length metres from start_wp,
+        incorporating full junction crossings when present.
         """
+        wp_step = (lambda wp, dist : wp.previous(dist)) if backward else (lambda wp, dist : wp.next(dist))
+        find_junc = (JunctionHandler.get_previous_junction) if backward else (JunctionHandler.get_next_junction)
+
         lanelets = []
-        # Look ahead for any junctions
-        junction_pair = JunctionHandler.get_next_junction(start_wp, max_length)
+        # Look nearby for any junctions
+        junction_pair = find_junc(start_wp, max_length)
         if junction_pair:
             junction_entry_wp, junction_wp = junction_pair
             junction_map = JunctionHandler.create_junction_map(junction_wp)
             junction_connections = JunctionHandler.get_junction_connections(junction_map, junction_entry_wp)
 
+            # for each possible path through the junction...
             for j_conn in junction_connections:
                 anchors = [
-                    start_wp,
                     j_conn.entry_connection,
                     j_conn.entry_junction,
                     j_conn.exit_junction,
                     j_conn.exit_connection
                 ]
+                if backward:
+                    anchors.reverse()
 
+                if not start_wp.is_junction:
+                    anchors.insert(0, start_wp)
+
+                # extend beyond junction up to max_length
+                cur_dist = WaypointUtils.get_distance(start_wp, anchors[-1])
+                dist_left = max_length - cur_dist
+                if dist_left > 0:
+                    last_wp = anchors[-1]
+                    # choices = wp_step(last_wp, dist_left)
+                    # end_wp = choices[0] if choices else WaypointUtils.get_waypoint_at_distance(
+                    #     last_wp, grp, dist_left, backward
+                    # )
+                    # anchors.append(end_wp)
+                    end_wp = WaypointUtils.get_waypoint_at_distance(
+                        last_wp, grp, dist_left, backward
+                    )
+                    anchors.append(end_wp)
+
+                # one dense interpolation pass
                 dense_lanelet = []
                 for a, b in zip(anchors[:-1], anchors[1:]):
-                    dense_lanelet.extend(WaypointUtils.interpolate_between_waypoints(a, b, grp))
+                    dense_lanelet.extend(WaypointUtils.interpolate_between_waypoints(a, b, grp, backward))
 
                 lanelets.append(LaneHandler._to_lanelet(dense_lanelet))
         else:
-            end_wp_choices = start_wp.next(max_length)
-            end_wp = end_wp_choices[0] if end_wp_choices else WaypointUtils.get_waypoint_at_distance(start_wp, grp, max_length)
-            dense_lanelet = WaypointUtils.interpolate_between_waypoints(start_wp, end_wp, grp)
+            # no junction: anchor = [start → end]
+            end_wp_choices = wp_step(start_wp, max_length)
+            end_wp = end_wp_choices[0] if end_wp_choices else WaypointUtils.get_waypoint_at_distance(start_wp, grp, max_length, backward)
+            dense_lanelet = WaypointUtils.interpolate_between_waypoints(start_wp, end_wp, grp, backward)
             lanelets.append(LaneHandler._to_lanelet(dense_lanelet))
 
         return lanelets
+
+    # @staticmethod
+    # def generate_lanelet(
+    #     start_wp : carla.Waypoint,
+    #     grp : GlobalRoutePlanner,
+    #     max_length : float = 50.0
+    # ) -> List[Lanelet]:
+    #     """
+    #     Generate lanelets that extend up to max_length metres from start_wp,
+    #     incorporating full junction crossings when present.
+    #     """
+    #     lanelets = []
+    #     # Look ahead for any junctions
+    #     junction_pair = JunctionHandler.get_next_junction(start_wp, max_length)
+    #     if junction_pair:
+    #         junction_entry_wp, junction_wp = junction_pair
+    #         junction_map = JunctionHandler.create_junction_map(junction_wp)
+    #         junction_connections = JunctionHandler.get_junction_connections(junction_map, junction_entry_wp)
+
+    #         # for each possible path through the junction...
+    #         for j_conn in junction_connections:
+    #             anchors = [
+    #                 j_conn.entry_connection,
+    #                 j_conn.entry_junction,
+    #                 j_conn.exit_junction,
+    #                 j_conn.exit_connection
+    #             ]
+    #             if not start_wp.is_junction:
+    #                 anchors.insert(0, start_wp)
+
+    #             # extend beyond junction up to max_length
+    #             last_loc = anchors[-1].transform.location
+    #             dist_left = max_length - start_wp.transform.location.distance(last_loc)
+    #             if dist_left > 0:
+    #                 # pick endpoint either via .next() or planner lookup
+    #                 choices = anchors[-1].next(dist_left)
+    #                 end_wp = choices[0] if choices else WaypointUtils.get_waypoint_at_distance(
+    #                     anchors[-1], grp, dist_left
+    #                 )
+    #                 anchors.append(end_wp)
+
+    #             # one dense interpolation pass
+    #             dense_lanelet = []
+    #             for a, b in zip(anchors[:-1], anchors[1:]):
+    #                 dense_lanelet.extend(WaypointUtils.interpolate_between_waypoints(a, b, grp))
+
+    #             lanelets.append(LaneHandler._to_lanelet(dense_lanelet))
+    #     else:
+    #         # no junction: anchor = [start → end]
+    #         end_wp_choices = start_wp.next(max_length)
+    #         end_wp = end_wp_choices[0] if end_wp_choices else WaypointUtils.get_waypoint_at_distance(start_wp, grp, max_length)
+    #         dense_lanelet = WaypointUtils.interpolate_between_waypoints(start_wp, end_wp, grp)
+    #         lanelets.append(LaneHandler._to_lanelet(dense_lanelet))
+
+    #     return lanelets
 
     @staticmethod
     def get_same_dir_lanes(
@@ -246,11 +350,15 @@ class LaneHandler:
         Returns:
             list: List of waypoints with opposite direction of the road.
         """
+        start_wp = waypoint
+        if waypoint.is_junction:
+            start_wp = JunctionHandler.get_junction_entry_connection(waypoint)
+
         other_dir_wps = []
         other_dir_wp = None
 
         # Get the first lane of the opposite direction
-        left_wp = waypoint
+        left_wp = start_wp
         while True:
             possible_left_wp = left_wp.get_left_lane()
             if possible_left_wp is None:
@@ -275,9 +383,36 @@ class LaneHandler:
 
         return other_dir_wps
 
-    # TODO: Implement cross direction checking
     @staticmethod
     def get_cross_dir_lanes(
         waypoint : carla.Waypoint
     ) -> List[carla.Waypoint]:
-        pass
+        """
+        Gets all the lanes that are perpendicular to the direction of the road of a wp
+        """
+        start_wp = waypoint
+        if waypoint.is_junction:
+            start_wp = JunctionHandler.get_junction_entry_connection(waypoint)
+        start_wp_vec = start_wp.transform.get_forward_vector()
+        cross_wps = []
+
+        # Cross directional lanes are only present at junctions
+        junction_pair = JunctionHandler.get_next_junction(start_wp)
+        if junction_pair:
+            # print(f'cross_dir found junction wp')
+            junction_entry_wp, junction_wp = junction_pair
+            junction_map = JunctionHandler.create_junction_map(junction_wp)
+            junction_connections = JunctionHandler.get_junction_connections(junction_map, junction_entry_wp)
+
+            potential_cross_wps = {j_conn.exit_connection for j_conn in junction_connections}
+            print(f'potential wps: {len(potential_cross_wps)}')
+
+            dot_threshold = 0.2
+            for wp in potential_cross_wps:
+                wp_vec = wp.transform.get_forward_vector()
+                wp_dot = wp_vec.dot(start_wp_vec)
+                # print(f'wp dot: {wp_dot}')
+                if np.abs(wp_dot) < dot_threshold:
+                    cross_wps.append(wp)
+
+        return cross_wps
