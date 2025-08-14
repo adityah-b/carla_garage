@@ -4,7 +4,8 @@ import carla
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
-from road_handler import RoadHandler, LaneVehicles, Lanelet
+from .base_actor_extractor import BaseActorExtractor
+from .road_handler import RoadHandler, LaneVehicles, Lanelet
 from privileged_route_planner import PlannerState
 
 @dataclass(frozen=True, slots=True)
@@ -12,7 +13,8 @@ class VehicleData:
     """
     Structured vehicle data.
     """
-    vehicle_id: int
+    vehicle : carla.Vehicle
+    id: int
     speed: float
     relative_orientation: float
     relative_position: List[float]
@@ -23,7 +25,7 @@ class LaneVehicleData:
     lanelet : Lanelet
     vehicle_data : List[VehicleData]
 
-class VehicleDataExtractor:
+class VehicleDataExtractor(BaseActorExtractor):
     """
     Extracts and processes vehicle data from CARLA simulation.
 
@@ -36,25 +38,54 @@ class VehicleDataExtractor:
     def __init__(self, config, carla_map : carla.Map):
         self.road_handler = RoadHandler(config, carla_map)
 
-    def get_all_vehicle_traffic(
+    def extract_vehicle_data(
         self,
         ego_wp : carla.Waypoint,
         planner_state : PlannerState,
         vehicles : List[carla.Vehicle],
-    ) -> Dict[str, Dict[str, Any]]:
+    ) -> Dict[str, Dict[str, List[LaneVehicleData]]]:
         leading_vehicles_group = self.road_handler.get_leading_vehicles(planner_state, vehicles)
-        # trailing_vehicles_group = self.road_handler.get_trailing_vehicles(planner_state, vehicles)
-        # oncoming_vehicles_group = self.road_handler.get_oncoming_vehicles(planner_state, vehicles)
+        trailing_vehicles_group = self.road_handler.get_trailing_vehicles(planner_state, vehicles)
+        oncoming_vehicles_group = self.road_handler.get_oncoming_vehicles(planner_state, vehicles)
+        cross_vehicles_group = self.road_handler.get_cross_vehicles(planner_state, vehicles)
 
-        for lane_name, lane_vehicles in leading_vehicles_group.items():
-            # TODO: Might need to fix return type and return LaneVehicles instead of List[LaneVehicles]
-            leading_vehicles = lane_vehicles[0].vehicles
+        all_vehicles = {
+            "leading" : self._group_vehicles(ego_wp, leading_vehicles_group),
+            "trailing" : self._group_vehicles(ego_wp, trailing_vehicles_group),
+            "oncoming" : self._group_vehicles(ego_wp, oncoming_vehicles_group),
+            "cross" : self._group_vehicles(ego_wp, cross_vehicles_group),
+        }
 
-            leading_data = self._extract_vehicle_data(ego_wp, leading_vehicles)
+        return all_vehicles
 
     # -------------------------------------------------------------------- #
     #  Utility
     # -------------------------------------------------------------------- #
+
+    def _group_vehicles(
+        self,
+        ego_wp : carla.Waypoint,
+        vehicles_dict : Dict[str, List[LaneVehicles]]
+    ) -> Dict[str, List[LaneVehicleData]]:
+        """
+        Extract vehicle data and group them based on their lane info
+        """
+        grouped_data = {}
+        for lane_name, lane_vehicles_list in vehicles_dict.items():
+            veh_data_list : List[LaneVehicleData] = []
+            for lv in lane_vehicles_list:
+                ll = lv.lanelet
+                vehicles = lv.vehicles
+
+                veh_data = self._extract_vehicle_data(ego_wp, vehicles)
+
+                lv_data = LaneVehicleData(lanelet=ll, vehicle_data=veh_data)
+
+                veh_data_list.append(lv_data)
+
+            grouped_data[lane_name] = veh_data_list
+
+        return grouped_data
 
     def _extract_vehicle_data(
         self,
@@ -81,18 +112,6 @@ class VehicleDataExtractor:
     # -------------------------------------------------------------------- #
     #  Private
     # -------------------------------------------------------------------- #
-
-    def _get_ego_transform_matrix(self, ego_wp: carla.Waypoint) -> np.ndarray:
-        """
-        Extract ego vehicle transformation matrix.
-        """
-        return np.array(ego_wp.transform.get_matrix())
-
-    def _get_ego_yaw(self, ego_wp: carla.Waypoint) -> float:
-        """
-        Extract ego vehicle yaw angle in radians.
-        """
-        return np.deg2rad(ego_wp.transform.rotation.yaw)
 
     def _extract_vectorized_data(
         self,
@@ -130,7 +149,8 @@ class VehicleDataExtractor:
         vehicle_data = []
         for i in range(len(vehicles)):
             data = VehicleData(
-                vehicle_id=int(vehicle_ids[i]),
+                vehicle=vehicles[i],
+                id=int(vehicle_ids[i]),
                 speed=round(float(speeds[i]), 2),
                 relative_orientation=round(float(relative_yaws[i]), 2),
                 relative_position=relative_positions[i][:2].round(2).tolist(),
@@ -139,35 +159,3 @@ class VehicleDataExtractor:
             vehicle_data.append(data)
 
         return vehicle_data
-
-    def _calculate_relative_positions(
-        self,
-        vehicle_matrices: np.ndarray,
-        ego_matrix: np.ndarray
-    ) -> np.ndarray:
-        """
-        Calculate relative positions of vehicles with respect to ego vehicle.
-
-        Args:
-            vehicle_matrices: Nx4x4 array of vehicle transformation matrices
-            ego_matrix: 4x4 ego vehicle transformation matrix
-
-        Returns:
-            Nx3 array of relative positions
-        """
-        # Get positions from transformation matrices
-        vehicle_positions = vehicle_matrices[:, :3, 3]
-        ego_position = ego_matrix[:3, 3]
-
-        # Calculate relative positions in world coordinates
-        relative_world = vehicle_positions - ego_position[np.newaxis, :]
-
-        # Transform to ego vehicle coordinate system
-        ego_rotation = ego_matrix[:3, :3]
-        relative_ego = (ego_rotation.T @ relative_world.T).T
-
-        return relative_ego
-
-    def _normalize_angles(self, angles: np.ndarray) -> np.ndarray:
-        """Normalize angles to [-π, π] range."""
-        return (angles + np.pi) % (2 * np.pi) - np.pi

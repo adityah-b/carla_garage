@@ -43,6 +43,22 @@ from privileged_route_planner import PrivilegedRoutePlanner
 # Road handler
 from scene_descriptor.data_extractors.road_handler import RoadHandler
 
+# Vehicle data extractor
+from scene_descriptor.data_extractors.vehicle_data_extractor import VehicleDataExtractor
+
+# Vehicle formatter
+from scene_descriptor.formatters.vehicle_formatter import VehicleFormatter
+
+# Vehicle predictor
+from actor_prediction.vehicle_prediction import VehiclePrediction
+
+# Scene descriptor
+from scene_descriptor.scene_descriptor import SceneDescriptor
+import cv2
+
+# Scene analyzer
+from scene_analyzer.scene_analyzer import SceneAnalyzer
+
 color_red     = carla.Color(r=100, g=0,   b=0)
 color_green   = carla.Color(r=0,   g=100, b=0)
 color_blue    = carla.Color(r=0,   g=0,   b=100)
@@ -163,6 +179,19 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
         # Setup road handler
         self.road_handler = RoadHandler(self.config, self.world_map)
 
+        # Setup vehicle data extractor
+        self.vehicle_data_extractor = VehicleDataExtractor(self.config, self.world_map)
+
+        # Setup vehicle predictor
+        self.vehicle_predictor = VehiclePrediction(self.config, self.world_map)
+
+        # Setup scene descriptor
+        self.scene_descriptor = SceneDescriptor(self.config, self.world_map)
+
+        # Setup scene analyzer
+        self.scene_analyzer = SceneAnalyzer()
+        self.step = 0
+
     def sensors(self):
         """
         Define the sensor suite required by the agent
@@ -184,6 +213,31 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
         sensors = [
             {'type': 'sensor.camera.rgb', 'x': 0.7, 'y': 0.0, 'z': 1.60, 'roll': 0.0, 'pitch': 0.0, 'yaw': 0.0,
              'width': self.camera_width, 'height': self.camera_height, 'fov': 100, 'id': 'Center'},
+            {
+                'type': 'sensor.camera.rgb',
+                'x': self.config.camera_pos[0],
+                'y': self.config.camera_pos[1],
+                'z': self.config.camera_pos[2],
+                'roll': self.config.camera_rot_0[0],
+                'pitch': self.config.camera_rot_0[1],
+                'yaw': self.config.camera_rot_0[2],
+                'width': self.config.camera_width,
+                'height': self.config.camera_height,
+                'fov': self.config.camera_fov,
+                'id': 'rgb'
+            }, {
+                'type': 'sensor.camera.rgb',
+                'x': self.config.camera_pos[0],
+                'y': self.config.camera_pos[1],
+                'z': 20.0,
+                'roll': self.config.camera_rot_0[0],
+                'pitch': -90,
+                'yaw': 0,
+                'width': self.config.camera_width,
+                'height': self.config.camera_height * 2,
+                'fov': self.config.camera_fov,
+                'id': 'rgb_bev'
+            }
         ]
 
         if self._left_mirror:
@@ -204,10 +258,18 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
         """
         Execute one step of navigation.
         """
+        self.step +=1
+
+        if not self.agent_engaged:
+            # Setup cameras
+            self.camera_tags = ['rgb', 'rgb_bev']
+            cameras = [(tag, self.sensor_interface._sensors_objects[tag]) for tag in self.camera_tags]
+            self.scene_descriptor.setup_cameras(cameras)
+
         cur_loc = self.ego_agent.get_location()
         ego_location = np.array([cur_loc.x, cur_loc.y, cur_loc.z])
+        cur_wp = self.world_map.get_waypoint(cur_loc)
 
-        # cur_wp = self.world_map.get_waypoint(cur_loc)
         # _, junction_wp = JunctionHandler.get_next_junction(cur_wp)
         # if not junction_wp:
         #     print(f'No junction found in next 50.0m')
@@ -233,10 +295,53 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
 
         self.waypoint_planner.run_step(ego_location)
         planner_state = self.waypoint_planner.get_planner_state()
+
+        # Get camera sensor object
+        # image_obvs = []
+        # for tag in self.camera_tags:
+        #     image_obvs.append((tag, input_data[tag][1][:, :, :3]))
+        # self.scene_descriptor.set_camera_observations(image_obvs)
+
+        # bb_images = self.scene_descriptor.draw_actor_bounding_boxes(self.ego_agent, npc_vehicles)
+
+        # bb_rgb = bb_images['rgb']
+        # bb_rgb_bev = bb_images['rgb_bev']
+
+        # # bb_rgb = cv2.cvtColor(bb_rgb, cv2.COLOR_BGR2RGB)
+        # # bb_rgb_bev = cv2.cvtColor(bb_rgb_bev, cv2.COLOR_BGR2RGB)
+        # bb_final = np.concatenate((bb_rgb, bb_rgb_bev), axis=0)
+
+        # cv2.namedWindow("BirdView RGB", cv2.WINDOW_NORMAL)
+        # cv2.imshow("BirdView RGB", bb_final)
+        # cv2.waitKey(1)
+
+        scene_context = self.scene_descriptor.process_complete_scene(self.ego_agent, actors, planner_state)
+        scene_text = scene_context.formatted_text
+        print(f'\n\nStructured Data\n\n')
+        print(f'{scene_text}')
+
+
+        # if scene_context.scene_data.traffic_data.next_stop_sign is not None:
+        #     if self.step % int(2 * self.config.carla_fps) == 0:
+        #         print(f'\n\nStructured Data\n\n')
+        #         print(f'{scene_text}')
+
+        #         scene_description = self.scene_analyzer.interpret_scene(scene_context=scene_text, image=bb_final)
+        #         print(f'\n\nScene Description\n\n')
+        #         print(f'{scene_description}')
+
+        #         # key_actor_intention = self.scene_analyzer.predict_intentions(scene_description=scene_description, image=bb_final)
+        #         # print(f'\n\nKey Actor Intentions\n\n')
+        #         # print(f'{key_actor_intention}')
+
+        #         ego_plan = self.scene_analyzer.plan_ego_actions(key_actor_intentions=scene_description, image=bb_final)
+        #         print(f'\n\nEgo Plan\n\n')
+        #         print(f'{ego_plan}')
+
         leading_vehicles_grouped = self.road_handler.get_leading_vehicles(planner_state, npc_vehicles)
-        trailing_vehicles_grouped = self.road_handler.get_trailing_vehicles(planner_state, npc_vehicles)
-        oncoming_vehicles_grouped = self.road_handler.get_oncoming_vehicles(planner_state, npc_vehicles)
-        cross_vehicles_grouped = self.road_handler.get_cross_vehicles(planner_state, npc_vehicles)
+        # trailing_vehicles_grouped = self.road_handler.get_trailing_vehicles(planner_state, npc_vehicles)
+        # oncoming_vehicles_grouped = self.road_handler.get_oncoming_vehicles(planner_state, npc_vehicles)
+        # cross_vehicles_grouped = self.road_handler.get_cross_vehicles(planner_state, npc_vehicles)
 
         # Draw route
         # route_points = planner_state.route_points[planner_state.route_index:]
@@ -248,9 +353,9 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
         #                                 color=self.config.future_route_color,
         #                                 life_time=self.config.draw_life_time)
 
-        print(f'Leading Vehicles')
+        # print(f'Leading Vehicles')
         for lane_name, lane_vehicles_list in leading_vehicles_grouped.items():
-            print(f'\tLane Name: {lane_name}')
+            # print(f'\tLane Name: {lane_name}')
             for lv in lane_vehicles_list:
                 ll = lv.lanelet
                 ll_wps = ll.waypoints_list()
@@ -276,7 +381,7 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
                 vehicles = lv.vehicles
                 for v in vehicles:
                     loc = v.get_location()
-                    print(f'\t\tVehicle: {v.id}')
+                    # print(f'\t\tVehicle: {v.id}')
 
                     self.world.debug.draw_string(
                         location=loc,
@@ -286,89 +391,104 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
                     )
 
 
-        print(f'Trailing Vehicles')
-        for lane_name, lane_vehicles_list in trailing_vehicles_grouped.items():
-            print(f'\tLane Name: {lane_name}')
-            for lv in lane_vehicles_list:
-                ll = lv.lanelet
-                ll_wps = ll.waypoints_list()
-                for wp_a, wp_b in zip(ll_wps[:-1], ll_wps[1:]):
-                    loc_a = wp_a.transform.location
-                    loc_a = carla.Location(loc_a.x, loc_a.y, loc_a.z + 0.1)
+        # # print(f'Trailing Vehicles')
+        # for lane_name, lane_vehicles_list in trailing_vehicles_grouped.items():
+        #     # print(f'\tLane Name: {lane_name}')
+        #     for lv in lane_vehicles_list:
+        #         ll = lv.lanelet
+        #         ll_wps = ll.waypoints_list()
+        #         for wp_a, wp_b in zip(ll_wps[:-1], ll_wps[1:]):
+        #             loc_a = wp_a.transform.location
+        #             loc_a = carla.Location(loc_a.x, loc_a.y, loc_a.z + 0.1)
 
-                    loc_b = wp_b.transform.location
-                    loc_b = carla.Location(loc_b.x, loc_b.y, loc_b.z + 0.1)
+        #             loc_b = wp_b.transform.location
+        #             loc_b = carla.Location(loc_b.x, loc_b.y, loc_b.z + 0.1)
 
-                    self.world.debug.draw_line(
-                        loc_a, loc_b, color=color_blue, life_time=self.config.draw_life_time)
+        #             self.world.debug.draw_line(
+        #                 loc_a, loc_b, color=color_blue, life_time=self.config.draw_life_time)
 
-                vehicles = lv.vehicles
-                for v in vehicles:
-                    loc = v.get_location()
-                    print(f'\t\tVehicle: {v.id}')
+        #         vehicles = lv.vehicles
+        #         for v in vehicles:
+        #             loc = v.get_location()
+        #             # print(f'\t\tVehicle: {v.id}')
 
-                    self.world.debug.draw_string(
-                        location=loc,
-                        text=f'{v.id}',
-                        color=color_blue,
-                        life_time=0
-                    )
+        #             self.world.debug.draw_string(
+        #                 location=loc,
+        #                 text=f'{v.id}',
+        #                 color=color_blue,
+        #                 life_time=0
+        #             )
 
-        print(f'Oncoming Vehicles')
-        for lane_name, lane_vehicles_list in oncoming_vehicles_grouped.items():
-            print(f'\tLane Name: {lane_name}')
-            for lv in lane_vehicles_list:
-                ll = lv.lanelet
-                ll_wps = ll.waypoints_list()
-                for wp_a, wp_b in zip(ll_wps[:-1], ll_wps[1:]):
-                    loc_a = wp_a.transform.location
-                    loc_a = carla.Location(loc_a.x, loc_a.y, loc_a.z + 0.1)
+        # # print(f'Oncoming Vehicles')
+        # for lane_name, lane_vehicles_list in oncoming_vehicles_grouped.items():
+        #     # print(f'\tLane Name: {lane_name}')
+        #     for lv in lane_vehicles_list:
+        #         ll = lv.lanelet
+        #         ll_wps = ll.waypoints_list()
+        #         for wp_a, wp_b in zip(ll_wps[:-1], ll_wps[1:]):
+        #             loc_a = wp_a.transform.location
+        #             loc_a = carla.Location(loc_a.x, loc_a.y, loc_a.z + 0.1)
 
-                    loc_b = wp_b.transform.location
-                    loc_b = carla.Location(loc_b.x, loc_b.y, loc_b.z + 0.1)
+        #             loc_b = wp_b.transform.location
+        #             loc_b = carla.Location(loc_b.x, loc_b.y, loc_b.z + 0.1)
 
-                    self.world.debug.draw_line(
-                        loc_a, loc_b, color=color_green, life_time=self.config.draw_life_time)
+        #             self.world.debug.draw_line(
+        #                 loc_a, loc_b, color=color_green, life_time=self.config.draw_life_time)
 
-                vehicles = lv.vehicles
-                for v in vehicles:
-                    loc = v.get_location()
-                    print(f'\t\tVehicle: {v.id}')
+        #         vehicles = lv.vehicles
+        #         for v in vehicles:
+        #             loc = v.get_location()
+        #             # print(f'\t\tVehicle: {v.id}')
 
-                    self.world.debug.draw_string(
-                        location=loc,
-                        text=f'{v.id}',
-                        color=color_green,
-                        life_time=0
-                    )
+        #             self.world.debug.draw_string(
+        #                 location=loc,
+        #                 text=f'{v.id}',
+        #                 color=color_green,
+        #                 life_time=0
+        #             )
 
-        print(f'Cross Vehicles')
-        for lane_name, lane_vehicles_list in cross_vehicles_grouped.items():
-            print(f'\tLane Name: {lane_name}')
-            for lv in lane_vehicles_list:
-                ll = lv.lanelet
-                ll_wps = ll.waypoints_list()
-                for wp_a, wp_b in zip(ll_wps[:-1], ll_wps[1:]):
-                    loc_a = wp_a.transform.location
-                    loc_a = carla.Location(loc_a.x, loc_a.y, loc_a.z + 0.2)
+        # # print(f'Cross Vehicles')
+        # for lane_name, lane_vehicles_list in cross_vehicles_grouped.items():
+        #     # print(f'\tLane Name: {lane_name}')
+        #     for lv in lane_vehicles_list:
+        #         ll = lv.lanelet
+        #         ll_wps = ll.waypoints_list()
+        #         for wp_a, wp_b in zip(ll_wps[:-1], ll_wps[1:]):
+        #             loc_a = wp_a.transform.location
+        #             loc_a = carla.Location(loc_a.x, loc_a.y, loc_a.z + 0.2)
 
-                    loc_b = wp_b.transform.location
-                    loc_b = carla.Location(loc_b.x, loc_b.y, loc_b.z + 0.2)
+        #             loc_b = wp_b.transform.location
+        #             loc_b = carla.Location(loc_b.x, loc_b.y, loc_b.z + 0.2)
 
-                    self.world.debug.draw_line(
-                        loc_a, loc_b, color=color_yellow, life_time=0)
+        #             self.world.debug.draw_line(
+        #                 loc_a, loc_b, color=color_yellow, life_time=0)
 
-                vehicles = lv.vehicles
-                for v in vehicles:
-                    loc = v.get_location()
-                    print(f'\t\tVehicle: {v.id}')
+        #         vehicles = lv.vehicles
+        #         for v in vehicles:
+        #             loc = v.get_location()
+        #             # print(f'\t\tVehicle: {v.id}')
 
-                    self.world.debug.draw_string(
-                        location=loc,
-                        text=f'{v.id}',
-                        color=color_yellow,
-                        life_time=0
-                    )
+        #             self.world.debug.draw_string(
+        #                 location=loc,
+        #                 text=f'{v.id}',
+        #                 color=color_yellow,
+        #                 life_time=0
+        #             )
+
+        # all_vehicle_traffic = self.vehicle_data_extractor.extract_vehicle_data(cur_wp, planner_state, npc_vehicles)
+        # veh_data_str = VehicleFormatter.format_vehicles(all_vehicle_traffic)
+
+        # print(f'\n\nFormatted Vehicles\n\n')
+        # print(f'{veh_data_str}')
+
+        # forecasted_bbs = self.vehicle_predictor.predict_vehicle_motion(all_vehicle_traffic)
+        # for v_data, bbs in forecasted_bbs.items():
+        #     for bb in bbs:
+        #         self.world.debug.draw_box(box=bb,
+        #                             rotation=bb.rotation,
+        #                             thickness=0.1,
+        #                             color=self.config.other_vehicles_forecasted_bbs_color,
+        #                             life_time=self.config.draw_life_time)
 
         self._clock.tick_busy_loop(20)
         self.agent_engaged = True

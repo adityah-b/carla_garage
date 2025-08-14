@@ -21,7 +21,13 @@ class PlannerState:
     route_index : int
     route_waypoints : List[carla.Waypoint]
     route_points : np.ndarray
+    route_commands : np.ndarray
     rotation_angles : np.ndarray
+    next_traffic_lights : List[carla.TrafficLight]
+    dist_to_next_traffic_lights : np.ndarray
+    next_stop_signs : List[carla.TrafficSign]
+    dist_to_next_stop_signs : np.ndarray
+    speed_limits : np.ndarray
 
 class PrivilegedRoutePlanner(object):
   """
@@ -91,7 +97,13 @@ class PrivilegedRoutePlanner(object):
          route_index = self.route_index,
          route_waypoints = self.route_waypoints,
          route_points = self.route_points,
-         rotation_angles = self.rotation_angles
+         route_commands = self.commands,
+         rotation_angles = self.rotation_angles,
+         next_traffic_lights = self.next_traffic_lights,
+         dist_to_next_traffic_lights = self.distances_to_next_traffic_lights,
+         next_stop_signs = self.next_stop_signs,
+         dist_to_next_stop_signs = self.distances_to_next_stop_signs,
+         speed_limits = self.speed_limits
       )
 
   def save(self):

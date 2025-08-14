@@ -4,7 +4,8 @@ import carla
 
 from dataclasses import dataclass
 from typing import Dict, List, Any
-from camera_interface import CameraInterface
+
+from .camera_interface import CameraInterface
 
 @dataclass(frozen=True, slots=True)
 class ImageRendererConfig:
@@ -40,8 +41,8 @@ class ImageRenderer:
     def render_vehicle_bounding_boxes(
         self,
         cameras : Dict[str, CameraInterface],
-        ego_context : Dict[str, Any],
-        agent_context : Dict[str, Any],
+        ego_vehicle : carla.Vehicle,
+        npc_vehicles : List[carla.Vehicle],
     ) -> Dict[str, np.ndarray]:
         """
         Render bounding boxes for all vehicles on all camera images.
@@ -54,13 +55,12 @@ class ImageRenderer:
         Returns:
             Dictionary of rendered images by camera tag
         """
-        ego_actor = ego_context['ego_actor']
-        ego_transform = ego_actor.get_transform()
+        ego_transform = ego_vehicle.get_transform()
         ego_location = ego_transform.location
         ego_forward_vec = ego_transform.get_forward_vector()
 
         # Get all vehicles including ego
-        all_vehicles = agent_context['npc_vehicles'] + [ego_actor]
+        all_vehicles = npc_vehicles + [ego_vehicle]
 
         rendered_images = {}
 

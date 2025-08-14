@@ -91,9 +91,7 @@ class CameraInterface:
         """
         Get current world to camera transformation matrix
         """
-        if self._world_to_camera_matrix is None:
-            self._world_to_camera_matrix = np.array(self.transform.get_inverse_matrix(), dtype=np.float64)
-        return self._world_to_camera_matrix
+        return np.array(self.transform.get_inverse_matrix(), dtype=np.float64)
 
     # -------------------------------------------------------------------- #
     #  Utility

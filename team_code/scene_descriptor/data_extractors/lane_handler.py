@@ -12,7 +12,7 @@ class Lanelet:
     def __init__(
         self,
         sparse_points : OrderedDict[tuple[int, int, int], carla.Waypoint],
-        dense_points = List[carla.Waypoint]
+        dense_points : List[carla.Waypoint]
     ):
         self.sparse_points = sparse_points
         self.dense_points = dense_points
@@ -23,6 +23,25 @@ class Lanelet:
 
     def lanelet_sections(self):
         return set(self.sparse_points.keys())
+
+    def find(self, wp: carla.Waypoint) -> int:
+        if not self.dense_points:
+            raise ValueError("Lanelet has no dense points")
+
+        loc = wp.transform.location
+        best_i = 0
+        best_d2 = float("inf")
+
+        # Use squared distance (no sqrt) for speed
+        for i, w in enumerate(self.dense_points):
+            l = w.transform.location
+            dx, dy, dz = l.x - loc.x, l.y - loc.y, l.z - loc.z
+            d2 = dx*dx + dy*dy + dz*dz
+            if d2 < best_d2:
+                best_d2 = d2
+                best_i = i
+
+        return best_i
 
     def __len__(self):
         return len(self.sparse_points)
@@ -244,12 +263,17 @@ class LaneHandler:
                 for a, b in zip(anchors[:-1], anchors[1:]):
                     dense_lanelet.extend(WaypointUtils.interpolate_between_waypoints(a, b, grp, backward))
 
+                if backward:
+                    dense_lanelet.reverse()
+
                 lanelets.append(LaneHandler._to_lanelet(dense_lanelet))
         else:
             # no junction: anchor = [start → end]
             end_wp_choices = wp_step(start_wp, max_length)
             end_wp = end_wp_choices[0] if end_wp_choices else WaypointUtils.get_waypoint_at_distance(start_wp, grp, max_length, backward)
             dense_lanelet = WaypointUtils.interpolate_between_waypoints(start_wp, end_wp, grp, backward)
+            if backward:
+                dense_lanelet.reverse()
             lanelets.append(LaneHandler._to_lanelet(dense_lanelet))
 
         return lanelets
@@ -405,7 +429,6 @@ class LaneHandler:
             junction_connections = JunctionHandler.get_junction_connections(junction_map, junction_entry_wp)
 
             potential_cross_wps = {j_conn.exit_connection for j_conn in junction_connections}
-            print(f'potential wps: {len(potential_cross_wps)}')
 
             dot_threshold = 0.2
             for wp in potential_cross_wps:

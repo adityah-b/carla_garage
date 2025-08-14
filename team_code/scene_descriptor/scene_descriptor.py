@@ -1,50 +1,47 @@
-from typing import Dict, List, Tuple, Any, Optional
+import carla
 import numpy as np
 
-from camera_interface import CameraInterface
-from image_renderer import ImageRenderer
-from data_extractors import TrafficDataExtractor, EgoVehicleDataExtractor, VehicleDataExtractor, VehicleGrouper
-from formatters import SceneFormatter, CompactSceneFormatter
+from dataclasses import dataclass
+from typing import Dict, List, Tuple, Any, Optional
+
+from .camera_interface import CameraInterface
+from .image_renderer import ImageRenderer
+
+from privileged_route_planner import PlannerState
+
+# Data extractors
+from .data_extractors.scene_extractor import SceneData, SceneExtractor
+
+# Formatters
+from .formatters.scene_formatter import SceneFormatter
+
+@dataclass(frozen=True, slots=True)
+class SceneContext:
+    scene_data : SceneData
+    formatted_text : Optional[str]
 
 class SceneDescriptor:
-    """
-    Main interface for converting privileged CARLA simulator data into structured text.
-
-    This refactored version follows single responsibility principle and separates concerns:
-    - Camera management
-    - Data extraction
-    - Rendering
-    - Formatting
-
-    Responsibilities:
-    - Coordinate between specialized components
-    - Manage camera lifecycle
-    - Provide unified API for scene data processing
-    """
-
-    def __init__(self, config):
-        """
-        Initialize SceneDescriptor with configuration.
-
-        Args:
-            config: Configuration object containing thresholds and parameters
-        """
+    def __init__(self, config, carla_map: carla.Map):
         self.config = config
+        self.carla_map = carla_map
 
         # Component initialization
         self._cameras: Dict[str, CameraInterface] = {}
         self._camera_tags: List[str] = []
 
         # Initialize specialized processors
-        self._vehicle_extractor = VehicleDataExtractor()
-        self._vehicle_grouper = VehicleGrouper()
-        self._bbox_renderer = ImageRenderer(config)
-        self._traffic_extractor = TrafficDataExtractor(config)
-        self._ego_extractor = EgoVehicleDataExtractor()
-        self._formatter = SceneFormatter(config)
-        self._compact_formatter = CompactSceneFormatter(config)
+        self._bbox_renderer = ImageRenderer()
 
-    def setup_cameras(self, cameras: List[Tuple[str, Any]]) -> None:
+        # Extractors
+        self._data_extractor = SceneExtractor(self.config, self.carla_map)
+
+        # Formatters
+        self._formatter = SceneFormatter()
+
+    def setup_cameras(
+        self,
+        cameras: List[Tuple[str, Any]]
+    ) -> None:
         """
         Initialize camera interfaces from CARLA camera actors.
 
@@ -58,7 +55,10 @@ class SceneDescriptor:
             self._cameras[tag] = CameraInterface(camera_obj)
             self._camera_tags.append(tag)
 
-    def set_camera_observations(self, images: List[Tuple[str, np.ndarray]]) -> None:
+    def set_camera_observations(
+        self,
+        images: List[Tuple[str, np.ndarray]]
+    ) -> None:
         """
         Update camera observations with new image data.
 
@@ -73,8 +73,8 @@ class SceneDescriptor:
 
     def draw_actor_bounding_boxes(
         self,
-        ego_context: Dict[str, Any],
-        agent_context: Dict[str, Any]
+        ego_vehicle : carla.Vehicle,
+        npc_vehicles : List[carla.Vehicle]
     ) -> Dict[str, np.ndarray]:
         """
         Render vehicle bounding boxes on camera images.
@@ -87,15 +87,15 @@ class SceneDescriptor:
             Dictionary of camera tags mapped to rendered images
         """
         return self._bbox_renderer.render_vehicle_bounding_boxes(
-            self._cameras, ego_context, agent_context
+            self._cameras, ego_vehicle, npc_vehicles
         )
 
     def get_structured_scene_data(
         self,
-        traffic_context: Dict[str, Any],
-        ego_context: Dict[str, Any],
-        agent_context: Dict[str, Any]
-    ) -> Dict[str, Any]:
+        ego_vehicle : carla.Vehicle,
+        actors : carla.ActorList,
+        planner_state : PlannerState,
+    ) -> SceneData:
         """
         Convert privileged simulator data into structured format.
 
@@ -107,25 +107,15 @@ class SceneDescriptor:
         Returns:
             Dictionary containing structured scene data
         """
-        # Extract structured data using specialized extractors
-        traffic_data = self._traffic_extractor.extract_traffic_data(traffic_context)
-        ego_data = self._ego_extractor.extract_ego_data(ego_context)
-
-        # Group vehicle data by lanes and directions
-        grouped_vehicles = self._vehicle_grouper.group_vehicles_by_lane(
-            agent_context, ego_context, self._vehicle_extractor
+        return self._data_extractor.extract_scene(
+            ego_vehicle=ego_vehicle,
+            actors=actors,
+            planner_state=planner_state
         )
-
-        return {
-            "traffic": traffic_data.__dict__ if traffic_data else None,
-            "ego": ego_data.__dict__ if ego_data else None,
-            "agent": grouped_vehicles
-        }
 
     def format_scene_as_text(
         self,
-        structured_data: Dict[str, Any],
-        compact: bool = False
+        scene_data: SceneData,
     ) -> str:
         """
         Convert structured scene data to formatted text representation.
@@ -137,17 +127,20 @@ class SceneDescriptor:
         Returns:
             Formatted string representation of scene data
         """
-        formatter = self._compact_formatter if compact else self._formatter
-        return formatter.format_scene_data(structured_data)
+        return self._formatter.format_scene(
+            traffic=scene_data.traffic_data,
+            ego=scene_data.ego_data,
+            vehicles=scene_data.vehicle_data,
+            peds=scene_data.ped_data,
+        )
 
     def process_complete_scene(
         self,
-        traffic_context: Dict[str, Any],
-        ego_context: Dict[str, Any],
-        agent_context: Dict[str, Any],
+        ego_vehicle : carla.Vehicle,
+        actors : carla.ActorList,
+        planner_state : PlannerState,
         format_as_text: bool = True,
-        compact_format: bool = False
-    ) -> Dict[str, Any]:
+    ) -> SceneContext:
         """
         Complete scene processing pipeline.
 
@@ -162,46 +155,19 @@ class SceneDescriptor:
             Dictionary containing structured data and optional formatted text
         """
         # Get structured data
-        structured_data = self.get_structured_scene_data(
-            traffic_context, ego_context, agent_context
+        scene_data = self.get_structured_scene_data(
+            ego_vehicle, actors, planner_state
         )
-
-        result = {"structured_data": structured_data}
 
         # Add formatted text if requested
+        formatted_text = None
         if format_as_text:
-            result["formatted_text"] = self.format_scene_as_text(
-                structured_data, compact=compact_format
-            )
+            formatted_text = self.format_scene_as_text(scene_data)
 
-        return result
-
-    # Convenience methods for backward compatibility and specific use cases
-
-    def get_traffic_data(self, traffic_context: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract traffic data (backward compatibility method)."""
-        traffic_data = self._traffic_extractor.extract_traffic_data(traffic_context)
-        return traffic_data.__dict__ if traffic_data else {}
-
-    def get_ego_data(self, ego_context: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract ego vehicle data (backward compatibility method)."""
-        ego_data = self._ego_extractor.extract_ego_data(ego_context)
-        return ego_data.__dict__ if ego_data else {}
-
-    def get_agent_data(
-        self,
-        agent_context: Dict[str, Any],
-        ego_context: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        """Extract and group agent vehicle data (backward compatibility method)."""
-        return self._vehicle_grouper.group_vehicles_by_lane(
-            agent_context, ego_context, self._vehicle_extractor
+        return SceneContext(
+            scene_data=scene_data,
+            formatted_text=formatted_text
         )
-
-    # Legacy method name support
-    def to_formatted_string(self, structured_data: Dict[str, Any]) -> str:
-        """Legacy method name for formatting (backward compatibility)."""
-        return self.format_scene_as_text(structured_data, compact=False)
 
     # Properties for accessing internal components (useful for testing/debugging)
 
