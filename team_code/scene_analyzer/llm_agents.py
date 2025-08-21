@@ -43,8 +43,8 @@ class VLMAgent:
         # ModelCatalogue.validate(model_name)
 
         self.model_name = model_name
-        # self.client = OpenRouterClient(self.model_name)
-        self.client = OpenAIClient(self.model_name)
+        self.client = OpenRouterClient(self.model_name)
+        # self.client = OpenAIClient(self.model_name)
 
         self.temperature = kwargs.get("temperature", 0.0)
         self.max_output_tokens = kwargs.get("max_output_tokens", 500)

@@ -134,3 +134,9 @@ class LateralPIDController(LateralController):
         Loads the previously saved state of the controller by restoring the saved error history.
         """
     self.error_history = self.saved_error_history.copy()
+
+  def reset_state(self):
+    """
+        Resets the current state of the controller
+        """
+    self.error_history = []

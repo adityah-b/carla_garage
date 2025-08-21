@@ -1,0 +1,105 @@
+import carla
+import numpy as np
+
+from typing import List, Tuple
+
+from config import GlobalConfig
+from kinematic_bicycle_model import KinematicBicycleModel
+from lateral_controller import LateralPIDController
+from longitudinal_controller import LongitudinalLinearRegressionController
+
+class VehicleForecaster:
+    def __init__(self, config : GlobalConfig):
+        self.config = config
+        self.vehicle_model = KinematicBicycleModel(self.config)
+
+        self.lateral_controller = LateralPIDController(self.config)
+        self.long_controller = LongitudinalLinearRegressionController(self.config)
+
+    def _get_nearest_vehicle_route_point(
+        self,
+        vehicle_route_points : np.ndarray,
+        vehicle_location : np.ndarray,
+        route_index : int
+    ) -> Tuple[np.ndarray, int]:
+        """
+        Get the nearest route point to the vehicle.
+
+        Args:
+            vehicle_route_points (numpy.ndarray): An array of waypoints representing the planned route.
+            vehicle_location (numpy.ndarray): The current location of the vehicle.
+
+        Returns:
+            numpy.ndarray: The remaining route points from the nearest route point to the vehicle.
+        """
+        to_index = self.config.ego_vehicles_route_point_search_distance
+        search_range = min(route_index + to_index, vehicle_route_points.shape[0])
+
+        # Find the index of the nearest route point to the agent's position
+        route_index_offset = np.argmin(np.linalg.norm(
+            vehicle_location[None, :2] - vehicle_route_points[route_index:search_range, :2], axis=1)
+        )
+
+        return vehicle_route_points[route_index + route_index_offset:], route_index_offset
+
+    def forecast_vehicle_bbs(
+        self,
+        vehicle : carla.Vehicle,
+        vehicle_route_points : np.ndarray,
+        veh_speed : float,
+        veh_target_speed : float,
+        num_future_frames : int
+    ) -> List[carla.BoundingBox]:
+        self.lateral_controller.reset_state()
+
+        vehicle_location = np.array(
+            [vehicle.get_location().x, vehicle.get_location().y, vehicle.get_location().z]
+        )
+        vehicle_heading_angle = np.array([np.deg2rad(vehicle.get_transform().rotation.yaw)])
+        vehicle_speed = np.array([vehicle.get_velocity().length()])
+
+        vehicle_target_speed = vehicle_speed
+
+        # Calculate the throttle command based on the target speed and current speed
+        throttle = self.long_controller.get_throttle_extrapolation(vehicle_target_speed, vehicle_speed)
+        steering = self.lateral_controller.step(vehicle_route_points, vehicle_speed, vehicle_location, vehicle_heading_angle.item())
+        action = np.array([steering, throttle, 0.0]).flatten()
+
+        # Iterate over the future frames and forecast the agent's state
+        future_bounding_boxes = []
+        route_index = 0
+        for i in range(num_future_frames):
+            # Forecast the next state using the kinematic bicycle model
+            vehicle_location, vehicle_heading_angle, vehicle_speed = self.vehicle_model.forecast_ego_vehicle(vehicle_location, vehicle_heading_angle, vehicle_speed, action)
+
+            # Update the route and extrapolate steering and throttle commands
+            vehicle_forecast_route, route_index_offset = self._get_nearest_vehicle_route_point(vehicle_route_points, vehicle_location, route_index)
+            route_index += route_index_offset
+
+            steering = self.lateral_controller.step(vehicle_forecast_route, vehicle_speed, vehicle_location, vehicle_heading_angle.item())
+            throttle = self.long_controller.get_throttle_extrapolation(vehicle_target_speed, vehicle_speed)
+            action = np.array([steering, throttle, 0.0]).flatten()
+
+            # Calculate the heading angle in degrees
+            vehicle_heading_angle_degrees = np.rad2deg(vehicle_heading_angle).item()
+
+            # Decrease the NPC vehicles bounding box if it is slow and resolve permanent bounding box
+            # intersectinos at collisions.
+            # In case of driving increase them for safety.
+            extent = vehicle.bounding_box.extent
+            # Otherwise we would increase the extent of the bounding box of the vehicle
+            extent = carla.Vector3D(x=extent.x, y=extent.y, z=extent.z)
+            extent.x *= self.config.slow_speed_extent_factor_ego \
+                if vehicle_speed < self.config.extent_ego_bbs_speed_threshold \
+                else self.config.high_speed_extent_factor_ego_x
+            extent.y *= self.config.slow_speed_extent_factor_ego \
+                if vehicle_speed < self.config.extent_ego_bbs_speed_threshold \
+                else self.config.high_speed_extent_factor_ego_y
+
+            vehicle_carla_location = carla.Location(x=vehicle_location[0].item(), y=vehicle_location[1].item(), z=vehicle_location[2].item())
+            vehicle_bounding_box = carla.BoundingBox(vehicle_carla_location, extent)
+            vehicle_bounding_box.rotation = carla.Rotation(pitch=0, yaw=vehicle_heading_angle_degrees, roll=0)
+
+            future_bounding_boxes.append(vehicle_bounding_box)
+
+        return future_bounding_boxes

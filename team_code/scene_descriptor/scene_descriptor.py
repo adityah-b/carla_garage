@@ -128,10 +128,7 @@ class SceneDescriptor:
             Formatted string representation of scene data
         """
         return self._formatter.format_scene(
-            traffic=scene_data.traffic_data,
-            ego=scene_data.ego_data,
-            vehicles=scene_data.vehicle_data,
-            peds=scene_data.ped_data,
+            scene_data=scene_data
         )
 
     def process_complete_scene(

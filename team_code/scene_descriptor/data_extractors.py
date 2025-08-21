@@ -178,7 +178,7 @@ class VehicleDataExtractor:
         vehicle_data = []
         for i in range(len(vehicles)):
             data = VehicleData(
-                vehicle_id=int(vehicle_ids[i]),
+                id=int(vehicle_ids[i]),
                 speed=round(float(speeds[i]), 2),
                 relative_orientation=round(float(relative_yaws[i]), 2),
                 relative_position=relative_positions[i][:2].round(2).tolist(),

@@ -1,27 +1,27 @@
-from typing import Dict, List, Tuple, Any, Optional
+from scene_descriptor.data_extractors.scene_extractor import SceneData
 
-from .ego_formatter import EgoVehicleFormatter, EgoVehicleData
-from .vehicle_formatter import VehicleFormatter, LaneVehicleData
-from .traffic_formatter import TrafficFormatter, TrafficData
-from .ped_formatter import PedestrianFormatter, PedestrianData
+from .ego_formatter import EgoVehicleFormatter
+from .vehicle_formatter import VehicleFormatter
+from .traffic_formatter import TrafficFormatter
+from .ped_formatter import PedestrianFormatter
+from .route_formatter import RouteFormatter
 
 class SceneFormatter:
     def format_scene(
         self,
-        traffic : Optional[TrafficData],
-        ego : Optional[EgoVehicleData],
-        vehicles : Optional[Dict[str, Dict[str, List[LaneVehicleData]]]],
-        peds : Optional[PedestrianData],
+        scene_data : SceneData,
         precision : int = 2
     ) -> str:
-        formatted_text : List[str] = []
-        if traffic:
-            formatted_text.append(TrafficFormatter.format_traffic(traffic_data=traffic, precision=precision))
-        if ego:
-            formatted_text.append(EgoVehicleFormatter.format_ego(ego_vehicle_data=ego, precision=precision))
-        if vehicles:
-            formatted_text.append(VehicleFormatter.format_vehicles(grouped_vehicles=vehicles, precision=precision))
-        if peds:
-            formatted_text.append(PedestrianFormatter.format_pedestrians(peds=peds, precision=precision))
+        formatted_text = []
+        if scene_data.traffic_data:
+            formatted_text.append(TrafficFormatter.format_traffic(traffic_data=scene_data.traffic_data, precision=precision))
+        if scene_data.ego_data:
+            formatted_text.append(EgoVehicleFormatter.format_ego(ego_vehicle_data=scene_data.ego_data, precision=precision))
+        if scene_data.vehicle_data:
+            formatted_text.append(VehicleFormatter.format_vehicles(grouped_vehicles=scene_data.vehicle_data, precision=precision))
+        if scene_data.ped_data:
+            formatted_text.append(PedestrianFormatter.format_pedestrians(peds=scene_data.ped_data, precision=precision))
+        if scene_data.route_data:
+            formatted_text.append(RouteFormatter.format_route(route_data=scene_data.route_data, precision=precision))
 
         return "\n".join(formatted_text)

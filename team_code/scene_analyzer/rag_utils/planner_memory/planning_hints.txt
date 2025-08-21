@@ -1,0 +1,53 @@
+# Memory 0:
+Scenario:
+Overtake a slower leader.
+Planner Action:
+accelerate(f_dist=3.0, t_head=1.4, spd=speed_limit-0.5)
+change_lane_left(gap_time=1.4, gap_dist=14.0)
+maintain_speed(f_dist=3.5, t_head=1.6)
+change_lane_right(gap_time=1.4, gap_dist=14.0)
+
+# Memory 1:
+Scenario:
+On-ramp merge into faster flow.
+Planner Action:
+accelerate(f_dist=4.0, t_head=1.8, spd=flow_speed)
+change_lane_left(gap_time=1.8, gap_dist=20.0)
+maintain_speed(f_dist=4.5, t_head=1.9)
+
+# Memory 2:
+Scenario:
+Approach lane drop; pre-emptive reposition with gentle decel.
+Planner Action:
+decelerate(f_dist=4.5, t_head=1.9, spd=speed_limit-2.0)
+change_lane_right(gap_time=1.8, gap_dist=20.0)
+maintain_speed(f_dist=3.5, t_head=1.7)
+
+# Memory 3:
+Scenario:
+Obstacle in lane (parked van) requiring pass.
+Planner Action:
+decelerate(f_dist=5.0, t_head=2.0, spd=5.0)
+change_lane_left(gap_time=1.6, gap_dist=16.0)
+accelerate(f_dist=3.5, t_head=1.6, spd=speed_limit-0.5)
+
+# Memory 4:
+Scenario:
+Open road, no leader.
+Planner Action:
+accelerate(f_dist=3.5, t_head=1.3, spd=speed_limit-0.3)
+maintain_speed(f_dist=3.5, t_head=1.3)
+
+# Memory 5:
+Scenario:
+Catching a slower leader and settling behind safely.
+Planner Action:
+accelerate(f_dist=4.0, t_head=1.6, spd=leader_speed)
+maintain_speed(f_dist=4.0, t_head=1.6)
+
+# Memory 6:
+Scenario:
+Approach red light with ample distance.
+Planner Action:
+decelerate(f_dist=5.0, t_head=2.0, spd=0.0)
+stop()

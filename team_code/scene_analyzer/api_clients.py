@@ -59,7 +59,7 @@ class OpenAIClient(APIClient):
             model="gpt-4o-mini-2024-07-18",
             input=formatted_messages,
             temperature=0.0,
-            max_output_tokens=750,
+            max_output_tokens=500,
         )
 
         return response.output_text
@@ -109,7 +109,7 @@ class OpenRouterClient(APIClient):
             extra_body={},
             messages=formatted_messages,
             temperature=0.0,
-            max_completion_tokens=250,
+            max_completion_tokens=500,
         )
 
         return response.choices[0].message.content

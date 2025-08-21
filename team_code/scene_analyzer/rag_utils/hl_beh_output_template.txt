@@ -1,0 +1,14 @@
+scenario:
+<one paragraph natural language summary describing the driving scenario and the necessary high-level driving behaviours to navigate the scenario>
+
+key_actors:
+1) actor = {
+        'id' : <key_actor_id>,
+        'type' : <vehicle | ped | cyclist | traffic_light | stop_sign>,
+        'traffic' : <lead | trail | oncoming | cross | None>,
+   }
+2) ...
+
+reasoning:
+1. <Why each action and key actor choice is valid; cite memory IDs if used, e.g., "Uses Memory 2, 5">
+2. ...

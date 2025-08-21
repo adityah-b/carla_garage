@@ -10,6 +10,7 @@ from .traffic_data_extractor import TrafficData, TrafficDataExtractor
 from .ego_data_extractor import EgoVehicleData, EgoVehicleDataExtractor
 from .vehicle_data_extractor import LaneVehicleData, VehicleDataExtractor
 from .ped_data_extractor import PedestrianData, PedestrianDataExtractor
+from .route_extractor import RouteData, RouteDataExtractor
 
 @dataclass(frozen=True, slots=True)
 class SceneData:
@@ -17,6 +18,7 @@ class SceneData:
     ego_data : Optional[EgoVehicleData]
     vehicle_data : Optional[Dict[str, Dict[str, List[LaneVehicleData]]]]
     ped_data : Optional[List[PedestrianData]]
+    route_data : Optional[RouteData]
 
 
 class SceneExtractor:
@@ -28,6 +30,7 @@ class SceneExtractor:
         self._ego_extractor = EgoVehicleDataExtractor(self.config)
         self._vehicle_extractor = VehicleDataExtractor(self.config, self.carla_map)
         self._ped_extractor = PedestrianDataExtractor(self.config, self.carla_map)
+        self._route_extractor = RouteDataExtractor(self.config)
 
     def extract_scene(
         self,
@@ -54,9 +57,12 @@ class SceneExtractor:
         ]
         ped_data = self._ped_extractor.extract_ped_data(ego_wp=ego_wp, peds=pedestrians)
 
+        route_data = self._route_extractor.extract_route_data(ego_vehicle, ego_wp, planner_state)
+
         return SceneData(
             traffic_data=traffic_data if traffic_data else None,
             ego_data=ego_data if ego_data else None,
             vehicle_data=vehicle_data if vehicle_data else None,
             ped_data=ped_data if ped_data else None,
+            route_data=route_data if route_data else None,
         )
