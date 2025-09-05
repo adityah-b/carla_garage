@@ -1,14 +1,14 @@
 import carla
 import numpy as np
 
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 from config import GlobalConfig
 from kinematic_bicycle_model import KinematicBicycleModel
 from lateral_controller import LateralPIDController
 from longitudinal_controller import LongitudinalLinearRegressionController
 
-class VehicleForecaster:
+class MotionForecaster:
     def __init__(self, config : GlobalConfig):
         self.config = config
         self.vehicle_model = KinematicBicycleModel(self.config)
@@ -46,9 +46,8 @@ class VehicleForecaster:
         self,
         vehicle : carla.Vehicle,
         vehicle_route_points : np.ndarray,
-        veh_speed : float,
-        veh_target_speed : float,
-        num_future_frames : int
+        num_future_frames : int,
+        target_speed : float = None,
     ) -> List[carla.BoundingBox]:
         self.lateral_controller.reset_state()
 
@@ -58,7 +57,7 @@ class VehicleForecaster:
         vehicle_heading_angle = np.array([np.deg2rad(vehicle.get_transform().rotation.yaw)])
         vehicle_speed = np.array([vehicle.get_velocity().length()])
 
-        vehicle_target_speed = vehicle_speed
+        vehicle_target_speed = np.array([target_speed]) if target_speed else vehicle_speed
 
         # Calculate the throttle command based on the target speed and current speed
         throttle = self.long_controller.get_throttle_extrapolation(vehicle_target_speed, vehicle_speed)
@@ -103,3 +102,47 @@ class VehicleForecaster:
             future_bounding_boxes.append(vehicle_bounding_box)
 
         return future_bounding_boxes
+
+    def forecast_ped_bbs(
+        self,
+        peds : List[carla.Walker],
+        num_future_frames : int
+    ) -> Dict[int, List[carla.BoundingBox]]:
+        forecasted_ped_bbs = {}
+
+        pedestrian_locations = np.array(
+            [[ped.get_location().x, ped.get_location().y, ped.get_location().z] for ped in peds])
+        pedestrian_speeds = np.array([ped.get_velocity().length() for ped in peds])
+        pedestrian_speeds = np.maximum(pedestrian_speeds, self.config.min_walker_speed)
+        pedestrian_directions = np.array(
+            [[ped.get_control().direction.x,
+            ped.get_control().direction.y,
+            ped.get_control().direction.z] for ped in peds])
+
+        # Calculate future pedestrian locations based on their current locations, speeds, and directions
+        future_pedestrian_locations = pedestrian_locations[:, None, :] + np.arange(1, num_future_frames + 1)[
+            None, :, None] * pedestrian_directions[:, None, :] * pedestrian_speeds[:, None,
+                                                                                None] / self.config.bicycle_frame_rate
+
+        # Iterate over pedestrians and calculate their future bounding boxes
+        for i, ped in enumerate(peds):
+            bb, transform = ped.bounding_box, ped.get_transform()
+            rotation = carla.Rotation(pitch=bb.rotation.pitch + transform.rotation.pitch,
+                                        yaw=bb.rotation.yaw + transform.rotation.yaw,
+                                        roll=bb.rotation.roll + transform.rotation.roll)
+            extent = bb.extent
+            extent.x = max(self.config.pedestrian_minimum_extent, extent.x)  # Ensure a minimum width
+            extent.y = max(self.config.pedestrian_minimum_extent, extent.y)  # Ensure a minimum length
+
+            pedestrian_future_bboxes = []
+            for j in range(num_future_frames):
+                location = carla.Location(future_pedestrian_locations[i, j, 0], future_pedestrian_locations[i, j, 1],
+                                        future_pedestrian_locations[i, j, 2])
+
+                bounding_box = carla.BoundingBox(location, extent)
+                bounding_box.rotation = rotation
+                pedestrian_future_bboxes.append(bounding_box)
+
+            forecasted_ped_bbs[ped.id] = pedestrian_future_bboxes
+
+        return forecasted_ped_bbs

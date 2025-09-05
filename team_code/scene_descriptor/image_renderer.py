@@ -3,17 +3,26 @@ import numpy as np
 import carla
 
 from dataclasses import dataclass
-from typing import Dict, List, Any
+from typing import Dict, Tuple
 
 from .camera_interface import CameraInterface
 
 @dataclass(frozen=True, slots=True)
 class ImageRendererConfig:
     # Rendering configuration
-    BBOX_COLOR = (255, 0, 0)  # Blue in BGR
+    VEHICLE_BBOX_COLOR = (255, 0, 0) # Blue in BGR
+    EGO_BBOX_COLOR = (0, 255, 0) # Green
+    CYCLIST_BBOX_COLOR = (255, 255, 0) # Cyan
+    PED_BBOX_COLOR = (0, 255, 255) # Yellow
+
     BBOX_THICKNESS = 1
     LABEL_COLOR = (255, 255, 255)  # White text
-    LABEL_BG_COLOR = (255, 0, 0)  # Blue background
+
+    VEHICLE_LABEL_BG_COLOR = (255, 0, 0)  # Blue background
+    EGO_LABEL_BG_COLOR = (0, 255, 0) # Green
+    CYCLIST_LABEL_BG_COLOR = (255, 255, 0) # Cyan
+    PED_LABEL_BG_COLOR = (0, 255, 255) # Yellow
+
     LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
     LABEL_FONT_SCALE = 0.5
     LABEL_FONT_THICKNESS = 1
@@ -38,14 +47,14 @@ class ImageRenderer:
     #  Utility
     # -------------------------------------------------------------------- #
 
-    def render_vehicle_bounding_boxes(
+    def render_actor_bounding_boxes(
         self,
         cameras : Dict[str, CameraInterface],
         ego_vehicle : carla.Vehicle,
-        npc_vehicles : List[carla.Vehicle],
+        actors : carla.ActorList,
     ) -> Dict[str, np.ndarray]:
         """
-        Render bounding boxes for all vehicles on all camera images.
+        Render bounding boxes for all actors on all camera images.
 
         Args:
             cameras: Dictionary of camera interfaces by tag
@@ -59,8 +68,10 @@ class ImageRenderer:
         ego_location = ego_transform.location
         ego_forward_vec = ego_transform.get_forward_vector()
 
-        # Get all vehicles including ego
-        all_vehicles = npc_vehicles + [ego_vehicle]
+        # Get all vehicles (cyclists included) including ego
+        all_vehicles = list(actors.filter("*vehicle*"))
+        # Get all peds
+        all_peds = list(actors.filter("*walker*"))
 
         rendered_images = {}
 
@@ -72,10 +83,45 @@ class ImageRenderer:
             rendered_image = camera.image.copy()
 
             for vehicle in all_vehicles:
-                if self._should_render_vehicle(
+                if self._should_render_actor(
                     vehicle, ego_location, ego_forward_vec, tag
                 ):
-                    self._render_single_vehicle(rendered_image, camera, vehicle)
+                    is_cyclist = ("base_type" in vehicle.attributes and vehicle.attributes["base_type"] == "bicycle")
+                    if is_cyclist:
+                        self._render_single_actor(
+                            rendered_image,
+                            camera,
+                            vehicle,
+                            bb_color=self.config.CYCLIST_BBOX_COLOR,
+                            label_bg_color=self.config.CYCLIST_LABEL_BG_COLOR,
+                            label_text=str(vehicle.id)
+                        )
+                    else:
+                        is_ego = vehicle.id == ego_vehicle.id
+                        bb_color = self.config.EGO_BBOX_COLOR if is_ego else self.config.VEHICLE_BBOX_COLOR
+                        label_bg_color = self.config.EGO_LABEL_BG_COLOR if is_ego else self.config.VEHICLE_LABEL_BG_COLOR
+                        label_text = "EGO" if is_ego else str(vehicle.id)
+                        self._render_single_actor(
+                            rendered_image,
+                            camera,
+                            vehicle,
+                            bb_color,
+                            label_bg_color,
+                            label_text
+                        )
+
+            for ped in all_peds:
+                if self._should_render_actor(
+                    ped, ego_location, ego_forward_vec, tag
+                ):
+                    self._render_single_actor(
+                        rendered_image,
+                        camera,
+                        ped,
+                        bb_color=self.config.PED_BBOX_COLOR,
+                        label_bg_color=self.config.PED_LABEL_BG_COLOR,
+                        label_text=str(ped.id)
+                    )
 
             rendered_images[tag] = rendered_image
 
@@ -85,64 +131,69 @@ class ImageRenderer:
     #  Private
     # -------------------------------------------------------------------- #
 
-    def _should_render_vehicle(
+    def _should_render_actor(
         self,
-        vehicle : carla.Vehicle,
+        actor : carla.Actor,
         ego_location : carla.Location,
         ego_forward_vec : carla.Vector3D,
         camera_tag: str,
     ) -> bool:
         """
-        Determine if vehicle should be rendered based on distance and camera type.
+        Determine if actor should be rendered based on distance and camera type.
 
         Args:
-            vehicle: CARLA vehicle actor
+            actor: CARLA actor
             ego_location: Ego vehicle location
             ego_forward_vec: Ego vehicle forward vector
             camera_tag: Camera identifier tag
 
         Returns:
-            True if vehicle should be rendered
+            True if actor should be rendered
         """
         # Always render for bird's eye view cameras
         if "bev" in camera_tag.lower():
             return True
 
-        vehicle_location = vehicle.get_transform().location
-        ego_to_vehicle_vec = vehicle_location - ego_location
-        distance = vehicle_location.distance(ego_location)
+        actor_location = actor.get_location()
+        ego_to_actor_vec = actor_location - ego_location
+        distance = actor_location.distance(ego_location)
 
-        # Only render vehicles in front and within distance threshold
-        is_in_front = ego_to_vehicle_vec.dot(ego_forward_vec) > 0
+        # Only render actors in front and within distance threshold
+        is_in_front = ego_to_actor_vec.dot(ego_forward_vec) > 0
         is_within_range = distance < self.config.MAX_FRONT_CAM_DRAW_DISTANCE
 
         return is_in_front and is_within_range
 
-    def _render_single_vehicle(
+    def _render_single_actor(
         self,
         image: np.ndarray,
         camera: CameraInterface,
-        vehicle : carla.Vehicle,
+        actor : carla.Actor,
+        bb_color : Tuple,
+        label_bg_color : Tuple,
+        label_text : str,
     ) -> None:
         """
-        Render bounding box and label for a single vehicle.
+        Render bounding box and label for a single actor.
 
         Args:
             image: Image array to render on
             camera: Camera interface object
-            vehicle: CARLA vehicle actor
+            actor: CARLA actor
         """
+
         # Render bounding box
-        self._draw_bounding_box(image, camera, vehicle)
+        self._draw_bounding_box(image, camera, actor, bb_color)
 
         # Render label
-        self._draw_vehicle_label(image, camera, vehicle)
+        self._draw_actor_label(image, camera, actor, label_bg_color, label_text)
 
     def _draw_bounding_box(
         self,
         image: np.ndarray,
         camera: CameraInterface,
         actor : carla.Actor,
+        bb_color : Tuple,
     ) -> None:
         """
         Draw 3D bounding box projected to 2D image.
@@ -182,7 +233,7 @@ class ImageRenderer:
                     image,
                     (int(p1_2d[0]), int(p1_2d[1])),
                     (int(p2_2d[0]), int(p2_2d[1])),
-                    self.config.BBOX_COLOR,
+                    bb_color,
                     self.config.BBOX_THICKNESS
                 )
 
@@ -215,27 +266,20 @@ class ImageRenderer:
         except Exception:
             return None
 
-    def _draw_vehicle_label(
+    def _draw_actor_label(
         self,
         image: np.ndarray,
         camera: CameraInterface,
-        vehicle : carla.Vehicle,
+        actor: carla.Actor,
+        label_bg_color: Tuple,
+        label_text : str,
     ) -> None:
-        """
-        Draw vehicle ID label at vehicle center.
-
-        Args:
-            image: Image array to draw on
-            camera: Camera interface object
-            vehicle: CARLA vehicle actor
-        """
-        vehicle_location = vehicle.get_transform().location
-
+        actor_loc = actor.get_location()
         try:
-            vehicle_2d = camera.project_3d_to_2d(vehicle_location)
+            actor_2d = camera.project_3d_to_2d(actor_loc)
 
-            if camera.is_point_in_canvas(vehicle_2d):
-                center_x, center_y = int(vehicle_2d[0]), int(vehicle_2d[1])
+            if camera.is_point_in_canvas(actor_2d):
+                center_x, center_y = int(actor_2d[0]), int(actor_2d[1])
 
                 # Draw label background
                 box_width, box_height = self.config.LABEL_BOX_SIZE
@@ -252,12 +296,12 @@ class ImageRenderer:
                     image,
                     top_left,
                     bottom_right,
-                    self.config.LABEL_BG_COLOR,
+                    label_bg_color,
                     thickness=-1
                 )
 
                 # Draw text
-                text = str(vehicle.id)
+                text = label_text
                 text_size = cv2.getTextSize(
                     text,
                     self.config.LABEL_FONT,
@@ -282,4 +326,3 @@ class ImageRenderer:
         except Exception as e:
             # Silently skip labels that can't be rendered
             pass
-

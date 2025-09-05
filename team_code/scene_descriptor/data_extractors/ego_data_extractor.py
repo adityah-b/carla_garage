@@ -10,6 +10,7 @@ from privileged_route_planner import PlannerState
 @dataclass(frozen=True, slots=True)
 class EgoVehicleData:
     """Ego vehicle information."""
+    ego_vehicle : carla.Vehicle
     speed: float
     orientation: float
     position: List[float]
@@ -54,6 +55,7 @@ class EgoVehicleDataExtractor:
         ego_speed = round(ego_vehicle.get_velocity().length(), 2)
 
         return EgoVehicleData(
+            ego_vehicle=ego_vehicle,
             speed=ego_speed,
             orientation=ego_orientation,
             position=ego_position,

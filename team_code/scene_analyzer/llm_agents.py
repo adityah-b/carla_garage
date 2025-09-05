@@ -5,6 +5,7 @@ import pathlib
 from dataclasses import dataclass, asdict
 from enum import Enum, auto
 from typing import Any, Iterable, List, Mapping, Protocol, Sequence
+from pydantic import BaseModel
 
 from .message_api import *
 from .api_clients import OpenAIClient, OpenRouterClient
@@ -43,8 +44,8 @@ class VLMAgent:
         # ModelCatalogue.validate(model_name)
 
         self.model_name = model_name
-        self.client = OpenRouterClient(self.model_name)
-        # self.client = OpenAIClient(self.model_name)
+        # self.client = OpenRouterClient(self.model_name)
+        self.client = OpenAIClient(self.model_name)
 
         self.temperature = kwargs.get("temperature", 0.0)
         self.max_output_tokens = kwargs.get("max_output_tokens", 500)
@@ -66,8 +67,8 @@ class VLMAgent:
         builder.add_text_content(text)
         return builder.build_message()
 
-    def send_message(self, messages: List[Message]) -> str:
+    def send_message(self, messages: List[Message], text_format : BaseModel = None) -> str:
         if not messages:
             raise ValueError("Messages cannot be empty.")
 
-        return self.client.send_message(messages, temperature=self.temperature, max_output_tokens=self.max_output_tokens)
+        return self.client.send_message(messages, text_format=text_format, temperature=self.temperature, max_output_tokens=self.max_output_tokens)

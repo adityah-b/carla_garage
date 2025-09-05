@@ -7,12 +7,15 @@ from .llm_agents import VLMAgent
 from .sys_prompts import SysPrompts
 from .rag_utils.planner_memory.planner_memory import PlannerMemory
 
-from .parsers.scene_parser import SceneParser, HighLevelBehaviour, EgoPlan
+# from .parsers.scene_parser import SceneParser, EgoPlan
+from .parsers.hl_beh_pydantic_models import HighLevelBehaviour
+from .parsers.ego_plan_pydantic_models import EgoPlan
 
 class SceneAnalyzer(VLMAgent):
     def __init__(
         self,
-        model_name: str = "qwen/qwen2.5-vl-72b-instruct:free",
+        # model_name: str = "qwen/qwen2.5-vl-72b-instruct:free",
+        model_name: str = "qwen/qwen2.5-vl-72b-instruct",
         **kwargs
     ):
         super().__init__(model_name, kwargs=kwargs)
@@ -21,7 +24,7 @@ class SceneAnalyzer(VLMAgent):
         self.planning_memory = PlannerMemory()
 
         # Parser
-        self.scene_parser = SceneParser()
+        # self.scene_parser = SceneParser()
 
     def get_high_level_behaviour(
         self,
@@ -35,11 +38,10 @@ class SceneAnalyzer(VLMAgent):
         user_message = self.create_user_message(text=text, image=image)
         messages = [system_message, user_message]
 
-        response = self.send_message(messages)
-        print(f'\n\nHIGH LEVEL BEHAVIOUR RAW RESPONSE\n\n')
-        print(f'{response}')
-
-        hl_beh : HighLevelBehaviour = self.scene_parser.parse_hl_beh(response)
+        response = self.send_message(messages, text_format=HighLevelBehaviour)
+        # print(f'\n\nHIGH LEVEL BEHAVIOUR RAW RESPONSE\n\n')
+        # print(f'{response.output_text}')
+        hl_beh : HighLevelBehaviour = response.output_parsed
 
         return hl_beh
 
@@ -50,17 +52,23 @@ class SceneAnalyzer(VLMAgent):
     ) -> EgoPlan:
         system_instruction = self.sys_prompts.get_plan_gen_prompt()
 
+        # print(f'\n\nSystem Planning Prompt\n\n')
+        # print(f'{system_instruction}')
+
         system_message = self.create_system_message(text=system_instruction)
         plan_prompt = self._build_planning_prompt(text)
+
+        print(f'\n\nPlanning Prompt\n\n')
+        print(f'{plan_prompt}')
         user_message = self.create_user_message(text=plan_prompt, image=None)
 
         messages = [system_message, user_message]
 
-        response = self.send_message(messages)
-        print(f'\n\nEGO PLAN RAW RESPONSE\n\n')
-        print(f'{response}')
+        response = self.send_message(messages, text_format=EgoPlan)
+        # print(f'\n\nEGO PLAN RAW RESPONSE\n\n')
+        # print(f'{response}')
 
-        ego_plan = self.scene_parser.parse_ego_plan(response)
+        ego_plan : EgoPlan = response.output_parsed
 
         return ego_plan
 
@@ -68,7 +76,7 @@ class SceneAnalyzer(VLMAgent):
         self,
         text : str
     ) -> str:
-        few_shot_results = self.planning_memory.retrieve_memories(text)
+        few_shot_results = self.planning_memory.retrieve_memories(text, k=2)
         plan_prompt = f"""
 ## Planning Memories
 - !!! Not all memories are relevant to the task. Select the most relevant ones. !!!

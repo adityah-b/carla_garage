@@ -1,7 +1,7 @@
 import carla
 import numpy as np
 
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
 
 from config import GlobalConfig
@@ -14,7 +14,7 @@ class PedestrianData:
     id : int
     speed : float
     relative_orientation : float
-    relative_position : List[float]
+    relative_position : Tuple[float, float]
     relative_distance : float
     is_on_road : bool
 
@@ -66,12 +66,13 @@ class PedestrianDataExtractor(BaseActorExtractor):
             ped_wp = self.carla_map.get_waypoint(peds[i].get_location(), project_to_road=False, lane_type=carla.LaneType.Driving)
             is_on_road = True if ped_wp else False
 
+            rel_pos = relative_positions[i][:2].round(2)
             data = PedestrianData(
                 pedestrian=peds[i],
                 id=int(ped_ids[i]),
                 speed=round(float(speeds[i]), 2),
                 relative_orientation=round(float(relative_yaws[i]), 2),
-                relative_position=relative_positions[i][:2].round(2).tolist(),
+                relative_position=tuple(rel_pos),
                 relative_distance=round(float(relative_distances[i]), 2),
                 is_on_road=is_on_road
             )

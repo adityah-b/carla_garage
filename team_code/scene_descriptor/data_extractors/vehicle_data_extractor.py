@@ -1,7 +1,7 @@
 import numpy as np
 import carla
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass
 
 from .base_actor_extractor import BaseActorExtractor
@@ -17,7 +17,7 @@ class VehicleData:
     id: int
     speed: float
     relative_orientation: float
-    relative_position: List[float]
+    relative_position: Tuple[float]
     relative_distance: float
 
 @dataclass(frozen=True, slots=True)
@@ -148,12 +148,13 @@ class VehicleDataExtractor(BaseActorExtractor):
         # Create VehicleData objects
         vehicle_data = []
         for i in range(len(vehicles)):
+            rel_pos = relative_positions[i][:2].round(2)
             data = VehicleData(
                 vehicle=vehicles[i],
                 id=int(vehicle_ids[i]),
                 speed=round(float(speeds[i]), 2),
                 relative_orientation=round(float(relative_yaws[i]), 2),
-                relative_position=relative_positions[i][:2].round(2).tolist(),
+                relative_position=tuple(rel_pos),
                 relative_distance=round(float(relative_distances[i]), 2)
             )
             vehicle_data.append(data)

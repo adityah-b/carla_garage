@@ -69,9 +69,19 @@ class RouteDataExtractor:
         ego_wp : carla.Waypoint,
         planner_state : PlannerState
     ) -> RouteData:
+        # TODO: TEMP CHANGE FOR TESTING
+        intersection_data=self._extract_intersection_data(ego_wp, planner_state)
+        lane_change_data=self._extract_lane_change_data(ego_vehicle, planner_state)
+
+        if intersection_data and lane_change_data:
+            if intersection_data.distance_to_intersection < lane_change_data.distance_to_lane_change:
+                lane_change_data = None
+            else:
+                intersection_data = None
+
         return RouteData(
-            intersection_data=self._extract_intersection_data(ego_wp, planner_state),
-            lane_change_data=self._extract_lane_change_data(ego_vehicle, planner_state)
+            intersection_data=intersection_data,
+            lane_change_data=lane_change_data
         )
 
     def _extract_intersection_data(

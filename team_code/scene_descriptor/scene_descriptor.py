@@ -74,7 +74,7 @@ class SceneDescriptor:
     def draw_actor_bounding_boxes(
         self,
         ego_vehicle : carla.Vehicle,
-        npc_vehicles : List[carla.Vehicle]
+        actors : carla.ActorList
     ) -> Dict[str, np.ndarray]:
         """
         Render vehicle bounding boxes on camera images.
@@ -86,8 +86,8 @@ class SceneDescriptor:
         Returns:
             Dictionary of camera tags mapped to rendered images
         """
-        return self._bbox_renderer.render_vehicle_bounding_boxes(
-            self._cameras, ego_vehicle, npc_vehicles
+        return self._bbox_renderer.render_actor_bounding_boxes(
+            self._cameras, ego_vehicle, actors
         )
 
     def get_structured_scene_data(

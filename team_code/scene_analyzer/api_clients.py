@@ -48,21 +48,32 @@ class OpenAIClient(APIClient):
         else:
             raise APIClientError(f"Unsupported content type: {content.type}")
 
-    def send_message(self, messages: List[Message], **kwargs) -> str:
+    def send_message(self, messages: List[Message], **kwargs):
         if not messages:
             raise APIClientError("Messages cannot be empty.")
 
         formatted_messages = self._format_messages(messages)
-        response = self.client.responses.create(
-            # model="gpt-4.1-mini-2025-04-14",
-            # model="gpt-4.1-nano-2025-04-14",
-            model="gpt-4o-mini-2024-07-18",
-            input=formatted_messages,
-            temperature=0.0,
-            max_output_tokens=500,
-        )
+        text_format = kwargs.get("text_format", None)
+        if text_format:
+            response = self.client.responses.parse(
+                model="gpt-4.1-mini-2025-04-14",
+                input=formatted_messages,
+                temperature=0.0,
+                max_output_tokens=512,
+                text_format=text_format
+            )
+        else:
+            response = self.client.responses.create(
+                model="gpt-4.1-mini-2025-04-14",
+                input=formatted_messages,
+                temperature=0.0,
+                max_output_tokens=512,
+            )
 
-        return response.output_text
+        print(f'\n\nUSAGE\n\n')
+        print(f'{response.usage}')
+
+        return response
 
 class OpenRouterClient(APIClient):
     BASE_URL = "https://openrouter.ai/api/v1"
@@ -108,8 +119,16 @@ class OpenRouterClient(APIClient):
             model=self.model_name,
             extra_body={},
             messages=formatted_messages,
-            temperature=0.0,
-            max_completion_tokens=500,
+            temperature=0.2,
+            max_completion_tokens=1024,
         )
 
+        # print(f'\n\nRAW OUTPUT\n\n')
+        # print(f'{repr(response.choices[0].message.content)}')
+        # print(f'\n\nUSAGE\n\n')
+        # print(f'{response.usage}')
+        # print(f'\n\nSTOP REASON\n\n')
+        # print(f'{response.choices[0].finish_reason}')
+        # print(f'\n\nJSON DUMP\n\n')
+        # print(f'{response.model_dump_json(indent=2)}')
         return response.choices[0].message.content

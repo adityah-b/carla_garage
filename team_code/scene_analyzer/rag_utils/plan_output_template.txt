@@ -1,26 +1,18 @@
 plan:
-<comma-separated sequence using ONLY: accelerate, decelerate, maintain_speed, change_lane_left, change_lane_right, stop>
-
-low_level_actions:
+<sequence list using ONLY: follow_route, stop_for, yield_for, change_lane_left, change_lane_right>
 1) <action_name>:
    longitudinal_params = {
-     'spd': <number>,
-     't_head': <number>,
-     'f_dist': <number>
+     'spd': <number>, 't_head': <number>, 'f_dist': <number>
    }
 2) <action_name>:
-   longitudinal_params = {
-     'spd': <...>, 't_head': <...>, 'f_dist': <...>
-   }
-3) <action_name>:
    lateral_params = {
      'gap_time': <number>, 'gap_dist': <number>
    }
-4) <action_name>:
-   longitudinal_params = {
-     'spd': <...>, 't_head': <...>, 'f_dist': <...>
+3) <action_name>:
+   conditional_params = {
+     'target' : <string>, 'id' : <number>
    }
-
+4) ...
 reasoning:
 1. <Why each step and parameter choice is valid; cite memory IDs if used, e.g., "Uses Memory 2, 5">
 2. ...
