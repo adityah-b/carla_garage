@@ -447,8 +447,9 @@ class PrivilegedRoutePlanner(object):
       self.route_index = 0
       self.last_route_index = 0
 
-      cmds.insert(0, RoadOption.CHANGELANELEFT)
-      route_waypoints.insert(0, carla_map.get_waypoint(vehicle_loc))
+      # cmds.insert(0, RoadOption.CHANGELANELEFT)
+      # route_waypoints.insert(0, carla_map.get_waypoint(vehicle_loc))
+      cmds[0] = RoadOption.CHANGELANELEFT
     else:
       # Add extra waypoints at the beginning of the route
       for _ in range(self.extra_route_length):

@@ -59,7 +59,7 @@ class OpenAIClient(APIClient):
                 model="gpt-4.1-mini-2025-04-14",
                 input=formatted_messages,
                 temperature=0.0,
-                max_output_tokens=512,
+                max_output_tokens=1024,
                 text_format=text_format
             )
         else:

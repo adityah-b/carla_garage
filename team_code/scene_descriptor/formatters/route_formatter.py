@@ -73,10 +73,16 @@ class RouteFormatter(BaseFormatter):
         else:
             i_type = "JUNCTION"
 
-        if not i_data.inside_intersection:
-            return f"{indent}{turn} after arriving at {i_type} intersection in next {f(i_data.distance_to_intersection, precision)} metres"
+        if i_data.inside_intersection:
+            return f"{indent}Ego inside {i_type} intersection. Executing {turn} maneuver"
 
-        if not i_data.is_executing_maneuver:
+        if i_data.distance_to_intersection < 10.0:
+            # return f"{indent}{turn} after arriving at {i_type} intersection in next {f(i_data.distance_to_intersection, precision)} metres"
             return f"{indent}{turn} at {i_type} intersection"
 
-        return f"{indent}Executing {turn} maneuver at {i_type} intersection"
+        return f"{indent}Approaching {i_type} intersection"
+
+        # if not i_data.is_executing_maneuver:
+        #     return f"{indent}{turn} at {i_type} intersection"
+
+        # return f"{indent}Executing {turn} maneuver at {i_type} intersection"

@@ -89,9 +89,10 @@ class RouteDataExtractor:
         ego_wp : carla.Waypoint,
         planner_state : PlannerState
     ) -> Optional[IntersectionData]:
+        route_index = planner_state.route_index
         ego_tf = ego_wp.transform
         ego_loc = ego_tf.location
-        ego_cmd = planner_state.route_commands[planner_state.route_index]
+        ego_cmd = planner_state.route_commands[route_index]
 
         intersection_data_raw = self._get_upcoming_intersection(planner_state)
         if not intersection_data_raw:
@@ -103,8 +104,10 @@ class RouteDataExtractor:
         start_wp = planner_state.route_waypoints[start_idx]
         end_wp = planner_state.route_waypoints[end_idx]
 
-        passed_start_wp = self._has_passed_waypoint(ego_tf, start_wp)
-        passed_end_wp = self._has_passed_waypoint(ego_tf, end_wp)
+        # passed_start_wp = self._has_passed_waypoint(ego_tf, start_wp)
+        # passed_end_wp = self._has_passed_waypoint(ego_tf, end_wp)
+        passed_start_wp = route_index >= start_idx
+        passed_end_wp = route_index > end_idx
 
         inside_intersection = (passed_start_wp) and not passed_end_wp
 
@@ -176,8 +179,6 @@ class RouteDataExtractor:
         route_index = planner_state.route_index
         route_wps = planner_state.route_waypoints
         route_cmds = planner_state.route_commands
-        next_tl = planner_state.next_traffic_lights[route_index]
-        next_ss = planner_state.next_stop_signs[route_index]
 
         max_route_length = len(route_wps)
         look_ahead_points = int(self.LOOKAHEAD_DISTANCE * self.config.points_per_meter)
@@ -197,9 +198,16 @@ class RouteDataExtractor:
         if intersection_idx is None:
             return None
 
+        start_idx = intersection_idx
+        while (start_idx > 0) and route_wps[start_idx].is_junction and route_cmds[start_idx] == intersection_cmd:
+            start_idx -= 1
+
         end_idx = intersection_idx
         while (end_idx < max_route_length) and route_wps[end_idx].is_junction and route_cmds[end_idx] == intersection_cmd:
             end_idx +=1
+
+        next_tl = planner_state.next_traffic_lights[start_idx]
+        next_ss = planner_state.next_stop_signs[start_idx]
 
         if next_tl and not next_ss:
             signalized = IntersectionType.SIGNALIZED
@@ -208,7 +216,7 @@ class RouteDataExtractor:
         else:
             signalized = IntersectionType.OTHER
 
-        return (intersection_cmd, intersection_idx, end_idx, signalized)
+        return (intersection_cmd, start_idx, end_idx, signalized)
 
     def _get_upcoming_lane_change(
         self,
@@ -260,8 +268,8 @@ class RouteDataExtractor:
             early_idx -= 1
             traveled_distance = late_wp.transform.location.distance(route_wps[early_idx].transform.location)
 
-        print(f'R IDX: {route_index}, E IDX: {early_idx}, LC IDX: {lane_change_idx}')
-        print(f'Traveled distance: {traveled_distance}')
+        # print(f'R IDX: {route_index}, E IDX: {early_idx}, LC IDX: {lane_change_idx}')
+        # print(f'Traveled distance: {traveled_distance}')
 
         # Find the end point of the lane change, where the lane change is completed
         end_idx = lane_change_idx

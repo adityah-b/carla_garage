@@ -142,6 +142,8 @@ class CallBack(object):
             self._parse_image_cb(data, self._tag)
         elif isinstance(data, carla.libcarla.LidarMeasurement):
             self._parse_lidar_cb(data, self._tag)
+        elif isinstance(data, carla.libcarla.SemanticLidarMeasurement):
+            self._parse_semantic_lidar_cb(data, self._tag)
         elif isinstance(data, carla.libcarla.RadarMeasurement):
             self._parse_radar_cb(data, self._tag)
         elif isinstance(data, carla.libcarla.GnssMeasurement):
@@ -165,6 +167,29 @@ class CallBack(object):
         points = copy.deepcopy(points)
         points = np.reshape(points, (int(points.shape[0] / 4), 4))
         self._data_provider.update_sensor(tag, points, lidar_data.frame)
+
+    def _parse_semantic_lidar_cb(self, semantic_lidar_data, tag):
+        DTYPE_SEM_LIDAR = np.dtype([
+            ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+            ('cos', 'f4'),
+            ('object_idx', 'u4'),
+            ('object_tag', 'u4'),
+        ])
+        points = np.frombuffer(semantic_lidar_data.raw_data, dtype=DTYPE_SEM_LIDAR)
+        points = copy.deepcopy(points)
+
+        xyz = np.stack([points['x'], points['y'], points['z']], axis=-1) # (N, 3)
+        cos_i = points['cos'].reshape((points['cos'].shape[0], 1))
+        obj_idx = points['object_idx'].reshape((points['object_idx'].shape[0], 1))
+        obj_tag = points['object_tag']
+
+        out = {
+            'xyz': xyz,
+            'cos_i': cos_i,
+            'object_idx': obj_idx,
+            'object_tag': obj_tag,
+        }
+        self._data_provider.update_sensor(tag, out, semantic_lidar_data.frame)
 
     def _parse_radar_cb(self, radar_data, tag):
         # [depth, azimuth, altitute, velocity]
@@ -210,7 +235,7 @@ class SensorInterface(object):
 
         self._sensors_objects[tag] = sensor
 
-        if sensor_type == 'sensor.opendrive_map': 
+        if sensor_type == 'sensor.opendrive_map':
             self._opendrive_tag = tag
 
     def update_sensor(self, tag, data, frame):

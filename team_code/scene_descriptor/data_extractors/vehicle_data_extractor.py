@@ -44,10 +44,10 @@ class VehicleDataExtractor(BaseActorExtractor):
         planner_state : PlannerState,
         vehicles : List[carla.Vehicle],
     ) -> Dict[str, Dict[str, List[LaneVehicleData]]]:
-        leading_vehicles_group = self.road_handler.get_leading_vehicles(planner_state, vehicles)
-        trailing_vehicles_group = self.road_handler.get_trailing_vehicles(planner_state, vehicles)
-        oncoming_vehicles_group = self.road_handler.get_oncoming_vehicles(planner_state, vehicles)
-        cross_vehicles_group = self.road_handler.get_cross_vehicles(planner_state, vehicles)
+        leading_vehicles_group = self.road_handler.get_leading_vehicles(ego_wp, planner_state, vehicles)
+        trailing_vehicles_group = self.road_handler.get_trailing_vehicles(ego_wp, planner_state, vehicles)
+        oncoming_vehicles_group = self.road_handler.get_oncoming_vehicles(ego_wp, planner_state, vehicles)
+        cross_vehicles_group = self.road_handler.get_cross_vehicles(ego_wp, planner_state, vehicles)
 
         all_vehicles = {
             "leading" : self._group_vehicles(ego_wp, leading_vehicles_group),
@@ -159,4 +159,5 @@ class VehicleDataExtractor(BaseActorExtractor):
             )
             vehicle_data.append(data)
 
+        vehicle_data.sort(key=lambda v: (v.relative_distance))
         return vehicle_data

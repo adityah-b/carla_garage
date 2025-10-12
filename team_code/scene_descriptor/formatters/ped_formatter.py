@@ -31,7 +31,8 @@ class PedestrianFormatter(BaseFormatter):
             f"Speed: {f(ped_data.speed, precision)}, "
             f"Relative Position: {f(ped_data.relative_position, precision)}, "
             f"Relative Orientation: {f(ped_data.relative_orientation, precision)}, "
-            f"Relative Distance: {f(ped_data.relative_distance, precision)}, "
-            f"Pedestrian Location: {on_road}"
+            # f"Relative Distance: {f(ped_data.relative_distance, precision)}, "
+            # f"Pedestrian Location: {on_road}"
+            f"Relative Distance: {f(ped_data.relative_distance, precision)}"
         )
 

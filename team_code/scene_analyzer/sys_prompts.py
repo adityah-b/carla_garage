@@ -257,7 +257,7 @@ Generate a brief summary of the high-level driving behaviours the ego vehicle mu
 - When visual or behavioral cues suggest even a small likelihood of an intrusive or disruptive maneuver (e.g., lane change, sudden stop, intersection turn),
     base your decisions assuming that maneuver is executed to ensure safe planning
 - Never include any text outside the required fields. No extra commentary.
-- Include the IDs of all relevant actors in the scene summary
+- Include the IDs and expected behaviours of all relevant actors in the scene summary
 
 ## RAG USAGE
 - If you use retrieved memory, reference it concisely in reasoning via memory IDs only (e.g., "Uses Memory 2").

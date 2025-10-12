@@ -33,19 +33,21 @@ QUALIFIER_SENSORS_LIMITS = {
     'sensor.other.imu': 1,
     'sensor.opendrive_map': 1,
     'sensor.speedometer': 1,
-    'sensor.camera.depth': 4, # for data generation
+    'sensor.camera.depth': 8, # for data generation
     'sensor.camera.semantic_segmentation': 4 # for data generation
 }
 SENSORS_LIMITS = {
     'sensor.camera.rgb': 8,
     'sensor.lidar.ray_cast': 2,
+    'sensor.lidar.ray_cast_semantic': 2,
     'sensor.other.radar': 4,
     'sensor.other.gnss': 1,
     'sensor.other.imu': 1,
     'sensor.opendrive_map': 1,
     'sensor.speedometer': 1,
-    'sensor.camera.depth': 4, # for data generation
-    'sensor.camera.semantic_segmentation': 4 # for data generation
+    'sensor.camera.depth': 8, # for data generation
+    'sensor.camera.semantic_segmentation': 4, # for data generation
+    'sensor.camera.instance_segmentation': 8 # for data generation
 }
 
 ALLOWED_SENSORS = SENSORS_LIMITS.keys()
@@ -189,6 +191,25 @@ class AgentWrapper(object):
             attributes['dropoff_general_rate'] = str(0.45)
             attributes['dropoff_intensity_limit'] = str(0.8)
             attributes['dropoff_zero_intensity'] = str(0.4)
+
+            sensor_location = carla.Location(x=sensor_spec['x'], y=sensor_spec['y'],
+                                             z=sensor_spec['z'])
+            sensor_rotation = carla.Rotation(pitch=sensor_spec['pitch'],
+                                             roll=sensor_spec['roll'],
+                                             yaw=sensor_spec['yaw'])
+
+        elif type_ == 'sensor.lidar.ray_cast_semantic':
+            attributes['range'] = str(120)
+            if DATAGEN==1:
+                attributes['rotation_frequency'] = str(sensor_spec['rotation_frequency'])
+                attributes['points_per_second'] = str(sensor_spec['points_per_second'])
+            else:
+                attributes['rotation_frequency'] = str(20)
+                # attributes['points_per_second'] = str(600000)
+                attributes['points_per_second'] = str(200000)
+            attributes['channels'] = str(64)
+            attributes['upper_fov'] = str(10)
+            attributes['lower_fov'] = str(-30)
 
             sensor_location = carla.Location(x=sensor_spec['x'], y=sensor_spec['y'],
                                              z=sensor_spec['z'])

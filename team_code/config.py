@@ -448,6 +448,9 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
     self.camera_height = 512  # Camera height in pixel during data collection and eval (affects sensor agent)
     self.camera_fov = 110
 
+    self.occupancy_camera_z = 2.5
+    self.occupancy_camera_height = 128  # Camera height in pixel during data collection and eval (affects sensor agent)
+
     # Crop the image during training to the values below. also affects the transformer tokens self.img_vert_anchors
     self.crop_image = True
     self.cropped_height = 384  # crops off the bottom part

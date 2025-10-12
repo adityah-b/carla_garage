@@ -5,15 +5,18 @@ Drives by accessing the simulator directly.
 
 import os
 import ujson
-import datetime
 import pathlib
 import gzip
-from collections import deque
-from agents.navigation.local_planner import RoadOption
+import cv2
 import math
 import numpy as np
 import carla
+import transfuser_utils as t_u
+
+from collections import deque
+from agents.navigation.local_planner import RoadOption
 from scipy.integrate import RK45
+from datetime import datetime
 
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
 from leaderboard.autoagents import autonomous_agent, autonomous_agent_local
@@ -21,32 +24,24 @@ from nav_planner import RoutePlanner
 from lateral_controller import LateralPIDController
 from privileged_route_planner import PrivilegedRoutePlanner
 from config import GlobalConfig
-import transfuser_utils as t_u
 from scenario_logger import ScenarioLogger
 from longitudinal_controller import LongitudinalLinearRegressionController
 from kinematic_bicycle_model import KinematicBicycleModel
 
-import json
 
-from birds_eye_view.chauffeurnet import ObsManager
-from birds_eye_view.run_stop_sign import RunStopSign
-
-from srunner.scenariomanager.actorcontrols.visualizer import Visualizer
-import cv2
-
-from agent_utils import AgentPrediction
-
-# New code
+# ------------- NEW CODE ------------- #
+# Scene descriptor
 from scene_descriptor.scene_descriptor import SceneDescriptor
+
+# Scene analyzer
 from scene_analyzer.scene_analyzer import SceneAnalyzer
+
+# Trajectory planner
 from trajectory_planner.trajectory_planner import TrajectoryPlanner
+# ------------- NEW CODE ------------- #
 
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
-import os
-from datetime import datetime
-
-from pprint import pprint
 # from scene_analyzer.parsers.ego_plan_parser import *
 from scene_analyzer.parsers.ego_plan_pydantic_models import EgoPlan
 
@@ -148,12 +143,18 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     # Get the world map and the ego vehicle
     self.world_map = CarlaDataProvider.get_map()
 
-    # New Code
+    # ------------- NEW CODE ------------- #
     self.traffic_manager = traffic_manager
+
+    # Scene descriptor
     self.scene_descriptor = SceneDescriptor(self.config, self.world_map)
+
+    # Scene analyzer
     self.scene_analyzer = SceneAnalyzer()
+
+    # Trajectory planner
     self.trajectory_planner = TrajectoryPlanner(self.config, self.world_map, CarlaDataProvider.get_hero_actor())
-    # New Code
+    # ------------- NEW CODE ------------- #
 
     # Set up the save path if specified
     if os.environ.get("SAVE_PATH", None) is not None:
@@ -194,13 +195,16 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
       scenario_number = pathlib.Path(self.config_path).stem
 
       # Construct the log file path
-      log_path = f"{pathlib.Path(os.environ['SAVE_PATH'])}/{scenario_name}/{scenario_number}.log"
+      log_file_name = f"{scenario_name}_{scenario_number}"
+      log_path = f"{self.save_path / log_file_name}.log"
+      # log_path = f"{pathlib.Path(os.environ['SAVE_PATH'])}/{scenario_name}/{scenario_number}.log"
 
       print(f"Saving to {log_path}")
       pathlib.Path(os.path.dirname(log_path)).mkdir(parents=True, exist_ok=True)
 
       # Start the recorder with the specified log path
-      self.client.start_recorder(log_path, True)
+      # self.client.start_recorder(log_path, True)
+      self.client.start_recorder(log_path, False)
     else:
       # Stop the recorder
       self.client.stop_recorder()
@@ -215,26 +219,6 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         """
     print("Sparse Waypoints:", len(self._global_plan))
     print("Dense Waypoints:", len(self.org_dense_route_world_coord))
-
-    print(f"Waypoint Commands")
-    for point in self._global_plan_world_coord:
-      wp = hd_map.get_waypoint(point[0].location)
-      cmd = point[1]
-      if cmd == RoadOption.VOID:
-        cmd_str = "VOID"
-      elif cmd == RoadOption.LEFT:
-        cmd_str = "LEFT"
-      elif cmd == RoadOption.RIGHT:
-        cmd_str = "RIGHT"
-      elif cmd == RoadOption.STRAIGHT:
-        cmd_str = "STRAIGHT"
-      elif cmd == RoadOption.LANEFOLLOW:
-        cmd_str = "LANEFOLLOW"
-      elif cmd == RoadOption.CHANGELANELEFT:
-        cmd_str = "CHANGELANELEFT"
-      elif cmd == RoadOption.CHANGELANERIGHT:
-        cmd_str = "CHANGELANERIGHT"
-      print(f"\tCMD: {cmd_str}, ROAD_ID: {wp.road_id}, LANE_ID: {wp.lane_id}, LOCATION: \n \t\tX: {wp.transform.location.x}, Y: {wp.transform.location.y}, Z: {wp.transform.location.z}")
 
     # Get the hero vehicle and the CARLA world
     self._vehicle = CarlaDataProvider.get_hero_actor()
@@ -254,11 +238,11 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self._waypoint_planner.setup_route(self.org_dense_route_world_coord, self._world, self.world_map,
                                        starts_with_parking_exit, self._vehicle.get_location())
 
-    # New Code
+    # ------------- NEW CODE ------------- #
     self.trajectory_planner.setup_route(
       self.org_dense_route_world_coord, self._world, self.world_map, starts_with_parking_exit, self._vehicle.get_location()
     )
-    # New Code
+    # ------------- NEW CODE ------------- #
 
     self._waypoint_planner.save()
 
@@ -287,10 +271,16 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         if extent.x < 0.001 or extent.y < 0.001 or extent.z < 0.001:
           actor.destroy()
 
+    # ------------- NEW CODE ------------- #
     # Setup cameras
     self.camera_tags = ['rgb', 'rgb_bev']
     cameras = [(tag, self.sensor_interface._sensors_objects[tag]) for tag in self.camera_tags]
     self.scene_descriptor.setup_cameras(cameras)
+
+    if self.save_path is not None:
+      self.toggle_recording()
+
+    # ------------- NEW CODE ------------- #
 
     self.initialized = True
 
@@ -536,6 +526,9 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
       brake = False
       target_speed, route_np, route_wp = self.trajectory_planner.follow_route(target_speed_initial)
 
+    # brake = False
+    # target_speed, route_np, route_wp = self.trajectory_planner.follow_route(target_speed_initial)
+
     # ------------- NEW CODE ------------- #
 
     # Determine if the ego vehicle is at a junction
@@ -543,6 +536,7 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     self.junction = ego_vehicle_waypoint.is_junction
 
     # Compute throttle and brake control
+    print(f'Autopilot Target Speed: {target_speed}')
     throttle, control_brake = self._longitudinal_controller.get_throttle_and_brake(brake, target_speed, ego_speed)
 
     # Compute steering control
@@ -1152,8 +1146,10 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         Args:
             results (optional): Any additional results to be processed or saved.
         """
-
-    # self.visualizer.reset()
+    # ------------- NEW CODE ------------- #
+    if self.save_path is not None:
+      self.toggle_recording()
+    # ------------- NEW CODE ------------- #
 
     if self.save_path is not None:
       self.lon_logger.dump_to_json()

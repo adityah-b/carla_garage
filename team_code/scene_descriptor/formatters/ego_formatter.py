@@ -13,9 +13,10 @@ class EgoVehicleFormatter(BaseFormatter):
         lines : List[str] = ["Ego Data:"]
 
         text_data = (
-            f"\tSpeed: {f(ego_vehicle_data.speed, precision=precision)}, "
-            f"Orientation: {f(ego_vehicle_data.orientation, precision=precision)}, "
-            f"Position: {f(ego_vehicle_data.position, precision=precision)}"
+            f"\tSpeed: {f(ego_vehicle_data.speed, precision=precision)}"
+            # f"\tSpeed: {f(ego_vehicle_data.speed, precision=precision)}, "
+            # f"Orientation: {f(ego_vehicle_data.orientation, precision=precision)}, "
+            # f"Position: {f(ego_vehicle_data.position, precision=precision)}"
         )
 
         lines.append(text_data)

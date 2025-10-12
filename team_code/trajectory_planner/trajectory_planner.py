@@ -15,7 +15,7 @@ from privileged_route_planner import PrivilegedRoutePlanner, PlannerState
 
 from team_code.scene_analyzer.parsers.hl_beh_pydantic_models import KeyActor
 from team_code.scene_analyzer.parsers.ego_plan_pydantic_models import (
-    EgoPlan, Action, LongitudinalParams, LateralParams, ConditionalParams
+    EgoPlan, LowLevelAction, Action, LongitudinalParams, LateralParams, ConditionalParams
 )
 
 from .idm import IDM
@@ -162,6 +162,70 @@ class TrajectoryPlanner:
     def execute_plan(self) -> Tuple:
         plan = self.cur_plan.plan
 
+        # Forecast ego vehicle
+        self.forecasted_ego_bbs = self.motion_forecaster.predict_ego_motion(
+            ego_vehicle=self.ego_vehicle,
+            ego_route_pts=self.waypoint_planner.route_points[self.waypoint_planner.route_index:],
+            target_speed=self.scene_data.ego_data.speed
+        )
+
+        # Forecast all vehicles
+        vehicles_dict = self.scene_data.vehicle_data
+        self.forecasted_veh_bbs = self.motion_forecaster.predict_vehicle_motion(vehicles_dict) if vehicles_dict else {}
+
+        # Forecast all pedestrians
+        peds = self.scene_data.ped_data
+        self.forecasted_ped_bbs = self.motion_forecaster.predict_ped_motion(peds) if peds else {}
+
+        relevant_veh_ids : List[carla.Actor] = []
+        relevant_veh_ids.extend(list(self.all_actors["oncoming"].keys()))
+        relevant_veh_ids.extend(list(self.all_actors["cross"].keys()))
+
+        has_collision : bool = False
+        next_tl = self.scene_data.traffic_data.next_traffic_light
+        next_ss = self.scene_data.traffic_data.next_stop_sign
+        ego_loc = self.waypoint_planner.route_waypoints[self.waypoint_planner.route_index].transform.location
+        # Check vehicle collisions
+        world = self.ego_vehicle.get_world()
+        for veh_id in relevant_veh_ids:
+            veh_bbs = self.forecasted_veh_bbs[veh_id]
+            collides, bb_ego, bb_veh = self.motion_forecaster.check_collision_point(self.forecasted_ego_bbs, veh_bbs)
+            if collides:
+                world.debug.draw_box(
+                    box=bb_ego,
+                    rotation=bb_ego.rotation,
+                    thickness=0.1,
+                    color=self.config.ego_vehicle_forecasted_bbs_hazard_color,
+                    life_time=self.config.draw_life_time * 2
+                )
+                world.debug.draw_box(
+                    box=bb_veh,
+                    rotation=bb_veh.rotation,
+                    thickness=0.1,
+                    color=self.config.trailing_vehicle_color,
+                    life_time=self.config.draw_life_time * 2
+                )
+                if next_tl:
+                    dist_to_collision = ego_loc.distance(bb_ego.location)
+                    if dist_to_collision > next_tl.distance_to_light and next_tl.distance_to_light > 3.0:
+                        continue
+                if next_ss:
+                    dist_to_collision = ego_loc.distance(bb_ego.location)
+                    if dist_to_collision > next_ss.distance_to_stop_sign and next_ss.distance_to_stop_sign > 3.0:
+                        continue
+
+            has_collision = has_collision or collides
+            if has_collision:
+                break
+
+        if not has_collision:
+            # Check pedestrian collisions
+            for _, ped_bbs in self.forecasted_ped_bbs.items():
+                collides, _, _ = self.motion_forecaster.check_collision_point(self.forecasted_ego_bbs, ped_bbs)
+                has_collision = has_collision or collides
+                if has_collision:
+                    break
+
         # # If we finished last tick, ask for replan
         # if self.cur_plan_idx is None or self.cur_plan_idx >= len(plan):
         #     print(f'Finished Plan')
@@ -177,6 +241,15 @@ class TrajectoryPlanner:
         #     i = self.cur_plan_idx
         #     action = actions[i]
         #     param  = params[i] if i < len(params) else None
+
+        if cur_action.action != Action.YIELD_FOR:
+            if has_collision:
+                print(f'PLAN HAS COLLISION DURING EXECUTION, REPLANNING')
+                self._reset_plan(replan=True)
+
+                target_speed, route_pts, route_wps = self.follow_route(0.0)
+                brake = target_speed < 0.1
+                return (target_speed, brake, route_pts, route_wps)
 
         fn = self._dispatch_map.get(cur_action.action)
         # if fn is None:
@@ -197,6 +270,20 @@ class TrajectoryPlanner:
             self.cur_plan_idx += 1
 
         if self.cur_plan_idx >= len(plan):
+            # if not has_collision and plan[-1].action == Action.FOLLOW_ROUTE:
+            #     ll_action = plan[-1]
+            #     ego_plan = EgoPlan(
+            #         plan=LowLevelAction(
+            #             action=ll_action.action,
+            #             longitudinal_params=LongitudinalParams(spd=self.scene_data.traffic_data.speed_limit),
+            #             lateral_params=None,
+            #             conditional_params=None
+            #         ),
+            #         reasoning=[""]
+            #     )
+            #     self.set_plan(ego_plan)
+            # else:
+            #     self._reset_plan(replan=True)
             self._reset_plan(replan=True)
 
         return (target_speed, brake, route_pts, route_wps)
@@ -355,6 +442,7 @@ class TrajectoryPlanner:
             move_to_next_state = False
 
         target_speed = self.__get_target_speed(target_speed_initial, params)
+        print(f'_follow_route Target Speed: {target_speed}')
         brake = target_speed < 1e-2
 
         route_index = self.waypoint_planner.route_index
@@ -586,11 +674,42 @@ class TrajectoryPlanner:
 
         ped_bbs = forecasted_ped_bbs[ped_data.id]
         has_collision, bb_a, bb_b = self.motion_forecaster.check_collision_point(forecasted_ego_bbs, ped_bbs)
-        if ped_data.is_on_road and not has_collision:
-            self.ped_cleared = True
+        print(f'Ped has collision: {has_collision}')
+
+        world = self.ego_vehicle.get_world()
+        # for bb_ped, bb_ego in zip(ped_bbs, forecasted_ego_bbs):
+        #     world.debug.draw_box(
+        #         box=bb_ped,
+        #         rotation=bb_ped.rotation,
+        #         thickness=0.1,
+        #         color=self.config.other_vehicles_forecasted_bbs_color,
+        #         life_time=self.config.draw_life_time
+        #     )
+        #     world.debug.draw_box(
+        #         box=bb_ego,
+        #         rotation=bb_ego.rotation,
+        #         thickness=0.1,
+        #         color=self.config.ego_vehicle_forecasted_bbs_normal_color,
+        #         life_time=self.config.draw_life_time
+        #     )
 
         if has_collision:
-            self.ped_cleared = False
+            world.debug.draw_box(
+                box=bb_a,
+                rotation=bb_a.rotation,
+                thickness=0.1,
+                color=self.config.ego_vehicle_forecasted_bbs_hazard_color,
+                life_time=self.config.draw_life_time
+            )
+            world.debug.draw_box(
+                box=bb_b,
+                rotation=bb_b.rotation,
+                thickness=0.1,
+                color=self.config.trailing_vehicle_color,
+                life_time=self.config.draw_life_time
+            )
+
+        self.ped_cleared = (not has_collision) and (ped_data.relative_distance > 5.0)
 
         return target_speed, self.ped_cleared
 
@@ -628,25 +747,60 @@ class TrajectoryPlanner:
             return target_speed_initial, True
 
         if veh_traffic_type in ["oncoming", "cross"]:
-            target_speed = 0.0
-        else:
-            target_speed = veh_data.speed * 0.8
-
-        if veh_traffic_type in ["oncoming", "cross"]:
             # Check for collisions
             forecasted_ego_bbs = self.motion_forecaster.predict_ego_motion(
                 ego_vehicle=self.ego_vehicle,
                 ego_route_pts=self.waypoint_planner.route_points[self.waypoint_planner.route_index:],
-                target_speed=target_speed_initial
+                target_speed=veh_data.speed * 1.2
             )
             forecasted_veh_bbs = self.motion_forecaster.predict_vehicle_motion(self.scene_data.vehicle_data)
             veh_bbs = forecasted_veh_bbs[veh_data.id]
 
-            has_collision, bb_a, bb_b = self.motion_forecaster.check_collision_point(forecasted_ego_bbs, veh_bbs)
-            if not has_collision and veh_data.relative_distance > 5.0:
-                self.veh_cleared = True
-            else:
-                self.veh_cleared = False
+            has_collision, bb_ego, bb_veh = self.motion_forecaster.check_collision_point(forecasted_ego_bbs, veh_bbs)
+
+            if has_collision:
+                print(f'EGO COLLIDES WITH VEHICLE: {veh_data.id}')
+                world = self.ego_vehicle.get_world()
+                world.debug.draw_box(
+                    box=bb_ego,
+                    rotation=bb_ego.rotation,
+                    thickness=0.1,
+                    color=self.config.ego_vehicle_forecasted_bbs_hazard_color,
+                    life_time=self.config.draw_life_time * 2
+                )
+                world.debug.draw_box(
+                    box=bb_veh,
+                    rotation=bb_veh.rotation,
+                    thickness=0.1,
+                    color=self.config.trailing_vehicle_color,
+                    life_time=self.config.draw_life_time * 2
+                )
+
+            elif not has_collision and veh_data.relative_distance > 5.0:
+                print(f'NO COLLISION WITH VEHICLE: {veh_data.id}')
+
+            self.veh_cleared = (not has_collision) and veh_data.relative_distance > 5.0
+            target_speed = ego_speed if self.veh_cleared else 0.0
+
+        else:
+            # target_speed = veh_data.speed * 0.8
+            target_speed = target_speed_initial
+
+        # if veh_traffic_type in ["oncoming", "cross"]:
+        #     # Check for collisions
+        #     forecasted_ego_bbs = self.motion_forecaster.predict_ego_motion(
+        #         ego_vehicle=self.ego_vehicle,
+        #         ego_route_pts=self.waypoint_planner.route_points[self.waypoint_planner.route_index:],
+        #         target_speed=target_speed_initial
+        #     )
+        #     forecasted_veh_bbs = self.motion_forecaster.predict_vehicle_motion(self.scene_data.vehicle_data)
+        #     veh_bbs = forecasted_veh_bbs[veh_data.id]
+
+        #     has_collision, bb_a, bb_b = self.motion_forecaster.check_collision_point(forecasted_ego_bbs, veh_bbs)
+        #     if not has_collision and veh_data.relative_distance > 5.0:
+        #         self.veh_cleared = True
+        #     else:
+        #         self.veh_cleared = False
 
         return target_speed, self.veh_cleared
 

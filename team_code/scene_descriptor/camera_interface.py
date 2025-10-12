@@ -59,14 +59,14 @@ class CameraInterface:
         self.config = CameraIntrinsics.build_camera_intrinsics(camera_actor_obj)
 
         self._image: Optional[np.ndarray] = None
-        self._world_to_camera_matrix: Optional[np.ndarray] = None
+        self._world_wrt_camera_matrix: Optional[np.ndarray] = None
 
     # -------------------------------------------------------------------- #
     #  Setters and Getters
     # -------------------------------------------------------------------- #
 
     def reset_state(self) -> None:
-        self._world_to_camera_matrix = None
+        self._world_wrt_camera_matrix = None
         self._image = None
 
     def set_image(self, image : np.ndarray) -> None:
@@ -87,11 +87,18 @@ class CameraInterface:
         return self.obj.get_transform()
 
     @property
-    def world_to_camera_matrix(self) -> np.ndarray:
+    def world_wrt_camera_matrix(self) -> np.ndarray:
         """
         Get current world to camera transformation matrix
         """
         return np.array(self.transform.get_inverse_matrix(), dtype=np.float64)
+
+    @property
+    def camera_wrt_world_matrix(self) -> np.ndarray:
+        """
+        Get current camera to world transformation matrix
+        """
+        return np.array(self.transform.get_matrix(), dtype=np.float64)
 
     # -------------------------------------------------------------------- #
     #  Utility
@@ -123,7 +130,7 @@ class CameraInterface:
         point_3d = np.array([location.x, location.y, location.z, 1], dtype=np.float64)
 
         # Transform to camera coordinates
-        point_camera = self.world_to_camera_matrix @ point_3d
+        point_camera = self.world_wrt_camera_matrix @ point_3d
 
         # Convert from UE4 coordinate system to standard
         # (x, y, z) -> (y, -z, x)
@@ -143,3 +150,46 @@ class CameraInterface:
             point_2d = point_2d_homogeneous[:2]
 
         return point_2d
+
+    def project_world_to_pixels_arr(
+        self,
+        pts_world_3d : np.ndarray
+    ) -> np.ndarray:
+        ############################################
+        # World -> Pixel coordinate transformation
+        ############################################
+
+        # Convert world points to homogenous form [Nx4]
+        ones = np.ones((pts_world_3d.shape[0], 1)) # [Nx1]
+        pts_world_4d = np.hstack([pts_world_3d, ones]) # [Nx4]
+
+        # Get transformation matrix from world frame to camera frame [4x4]
+        T_world_wrt_camera_ue4 = self.world_wrt_camera_matrix
+
+        # Get matrix to convert from UE4 to standard coordinate system (x, y, z) -> (y, -z, x) [4x4]
+        A = np.array([
+            [0, 1, 0, 0],
+            [0, 0, -1, 0],
+            [1, 0, 0, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float64)
+
+        # Apply change of basis mapping [4x4]
+        T_world_wrt_camera = A @ T_world_wrt_camera_ue4
+
+        # Transform to camera coordinates [Nx4]
+        pts_camera_4d = pts_world_4d @ T_world_wrt_camera.T # [Nx4] @ [4x4]^T -> [Nx4]
+
+        # Get 3D camera points [Nx3]
+        pts_camera_3d = pts_camera_4d[:, :3]
+
+        # Transform to pixel coordinates [Nx3]
+        pts_pixels_3d = pts_camera_3d @ self.config.K.T # [Nx3] @ [3x3]^T -> [Nx3]
+
+        # Normalize pixels [Nx2]
+        Z = pts_pixels_3d[:, 2:3]
+        valid = Z > 1e-6
+        pts_pixels_2d = np.empty((pts_pixels_3d.shape[0], 2), dtype=pts_pixels_3d.dtype)
+        pts_pixels_2d[valid[:,0]] = pts_pixels_3d[valid[:,0], :2] / Z[valid[:,0]]
+
+        return pts_pixels_2d

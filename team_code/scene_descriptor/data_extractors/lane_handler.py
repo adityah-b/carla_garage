@@ -133,10 +133,7 @@ class WaypointUtils:
                         cur_wp = wp
 
             elif not wp_choice:
-                # _, exit_wp = WaypointUtils._find_waypoint_entry_exit(grp, cur_wp)
-                # cur_wp = exit_wp
-                entry_wp, exit_wp = WaypointUtils._find_waypoint_entry_exit(grp, cur_wp)
-                cur_wp = entry_wp if backward else exit_wp
+                break
 
             else:
                 cur_wp = wp_choice[0]
@@ -177,13 +174,8 @@ class WaypointUtils:
             # wp_choice = cur_wp.next(WaypointUtils.WAYPOINT_SAMPLING_RESOLUTION)
             wp_choice = step_func(cur_wp)
             if not wp_choice:
-                # _, exit_wp = WaypointUtils._find_waypoint_entry_exit(grp, cur_wp)
-                # cur_wp = exit_wp
-                entry_wp, exit_wp = WaypointUtils._find_waypoint_entry_exit(grp, cur_wp)
-                cur_wp = entry_wp if backward else exit_wp
-            else:
-                cur_wp = wp_choice[0]
-
+                break
+            cur_wp = wp_choice[0]
             traveled_distance = WaypointUtils.get_distance(cur_wp, source_wp)
 
         return cur_wp
@@ -383,8 +375,10 @@ class LaneHandler:
 
         # Get the first lane of the opposite direction
         left_wp = start_wp
+        lane_hops = 0
         while True:
             possible_left_wp = left_wp.get_left_lane()
+            lane_hops += 1
             if possible_left_wp is None:
                 break
             if possible_left_wp.lane_id * left_wp.lane_id < 0:
@@ -393,6 +387,10 @@ class LaneHandler:
             left_wp = possible_left_wp
 
         if not other_dir_wp:
+            return other_dir_wps
+
+        # If first oncoming lane more than 1 lane away, ignore
+        if lane_hops > 1:
             return other_dir_wps
 
         # Check roads on the right
@@ -426,9 +424,16 @@ class LaneHandler:
             # print(f'cross_dir found junction wp')
             junction_entry_wp, junction_wp = junction_pair
             junction_map = JunctionHandler.create_junction_map(junction_wp)
-            junction_connections = JunctionHandler.get_junction_connections(junction_map, junction_entry_wp)
 
-            potential_cross_wps = {j_conn.exit_connection for j_conn in junction_connections}
+            # Get all junction connections
+            potential_cross_wps = set()
+            for junction_connections in junction_map.values():
+                for j_conn in junction_connections:
+                    potential_cross_wps.add(j_conn.exit_connection)
+
+            # junction_connections = JunctionHandler.get_junction_connections(junction_map, junction_entry_wp)
+
+            # potential_cross_wps = {j_conn.exit_connection for j_conn in junction_connections}
 
             dot_threshold = 0.2
             for wp in potential_cross_wps:

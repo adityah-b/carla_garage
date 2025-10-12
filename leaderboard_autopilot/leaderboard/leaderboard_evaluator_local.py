@@ -41,12 +41,14 @@ import pathlib
 sensors_to_icons = {
     'sensor.camera.rgb':        'carla_camera',
     'sensor.lidar.ray_cast':    'carla_lidar',
+    'sensor.lidar.ray_cast_semantic':    'carla_lidar', # for datagen
     'sensor.other.radar':       'carla_radar',
     'sensor.other.gnss':        'carla_gnss',
     'sensor.other.imu':         'carla_imu',
     'sensor.opendrive_map':     'carla_opendrive_map',
     'sensor.speedometer':       'carla_speedometer',
     'sensor.camera.semantic_segmentation': 'carla_camera', # for datagen
+    'sensor.camera.instance_segmentation': 'carla_camera', # for datagen
     'sensor.camera.depth':      'carla_camera', # for datagen
 }
 
@@ -373,13 +375,9 @@ class LeaderboardEvaluator(object):
         # Run the scenario
         try:
             # Load scenario and run it
-            print(f'ARGS.RECORD: {args.record}')
-            if args.record:
-                if int(os.environ.get('RECORD_EXPERT_AGENT', 0))==1:
-                    print(f'RECORDING EXPERT AGENT')
-                    self.client.start_recorder("{}/{}_rep{}.log".format(args.record, config.name, config.repetition_index))
-                else:
-                    self.client.start_recorder("{}.log".format(args.record), False) # changed to False, otherwise the log file become too large
+            # print(f'ARGS.RECORD: {args.record}')
+            # if args.record:
+            #     self.client.start_recorder("{}/{}_rep{}.log".format(args.record, config.name, config.repetition_index), False) # changed to False, otherwise the log file become too large
             self.manager.load_scenario(self.route_scenario, self.agent_instance, config.index, config.repetition_index)
             self.manager.run_scenario()
 
@@ -422,11 +420,11 @@ class LeaderboardEvaluator(object):
         """
         route_indexer = RouteIndexer(args.routes, args.repetitions, args.routes_subset)
 
-        resume = False
-        # if args.resume:
-        #     resume = route_indexer.validate_and_resume(args.checkpoint)
-        # else:
-        #     resume = False
+        # resume = False
+        if args.resume:
+            resume = route_indexer.validate_and_resume(args.checkpoint)
+        else:
+            resume = False
 
         if resume:
             self.statistics_manager.add_file_records(args.checkpoint)

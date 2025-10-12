@@ -38,7 +38,7 @@ class SceneExtractor:
         actors : carla.ActorList,
         planner_state : PlannerState
     ) -> SceneData:
-        ego_wp = self.carla_map.get_waypoint(ego_vehicle.get_location())
+        ego_wp = self.carla_map.get_waypoint(ego_vehicle.get_location(), lane_type=carla.LaneType.Any)
         ego_loc = ego_vehicle.get_location()
 
         # Extract structured data using specialized extractors
