@@ -453,8 +453,25 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
 
         semantic_lidar_data = input_data['lidar_semantic']
 
+        lookahead_distance = 20 * self.config.points_per_meter
+        num_route_points = planner_state.route_points.shape[0]
+        if num_route_points > 0:
+            route_end_index = min(
+                num_route_points,
+                planner_state.route_index + lookahead_distance
+            )
+            if route_end_index <= planner_state.route_index:
+                route_end_index = min(num_route_points, planner_state.route_index + 1)
+            route_points_subset = planner_state.route_points[
+                planner_state.route_index:route_end_index
+            ]
+        else:
+            route_end_index = planner_state.route_index
+            route_points_subset = np.empty((0, 3), dtype=np.float32)
+
         maps : Maps = self.grid_mapper.update_maps(
-            semantic_lidar_data[1]
+            semantic_lidar_data[1],
+            route_points_world=route_points_subset
         )
 
         occupancy_map = maps.occupancy_map
@@ -463,11 +480,19 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
         heat_map = cv2.applyColorMap(cost_map, cv2.COLORMAP_TURBO)
 
         # Generate A* path
-        lookahead_distance = 20 * self.config.points_per_meter
-        to_index = min(planner_state.route_points.shape[0] - 1, planner_state.route_index + lookahead_distance)
+        if num_route_points > 0:
+            to_index = max(
+                planner_state.route_index,
+                route_end_index - 1
+            )
+        else:
+            to_index = planner_state.route_index
 
         start_point_world = ego_location
-        goal_point_world = planner_state.route_points[to_index]
+        if num_route_points > 0:
+            goal_point_world = planner_state.route_points[to_index]
+        else:
+            goal_point_world = start_point_world
 
         # print(f'start point: {start_point_world}')
         # print(f'start point shape: {start_point_world.shape}')

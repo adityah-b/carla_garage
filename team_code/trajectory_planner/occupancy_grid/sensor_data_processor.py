@@ -261,24 +261,6 @@ class WorldMappingProcessor:
         map_file = map_dir / (map_name + '.h5')
         print(f"\nLoading map from {map_file}")
 
-        # with h5py.File(map_file, 'r', libver='latest', swmr=True) as hf:
-        #     self.pixels_per_meter = float(hf.attrs['pixels_per_meter'])
-        #     self.world_origin = np.array(hf.attrs['world_offset_in_meters'], dtype=np.float32)
-
-        #     road_mask_pixels = np.array(hf['road'], dtype=np.uint8)
-        #     print(f'road_mask_pixels shape: {road_mask_pixels.shape}')
-
-        #     # Convert to world coordinates
-        #     y_pixels, x_pixels = np.where(road_mask_pixels != 0)
-        #     road_pts_world_x = x_pixels / self.pixels_per_meter + self.world_origin[0]
-        #     road_pts_world_y = y_pixels / self.pixels_per_meter + self.world_origin[1]
-
-        #     self.road_pts_world_2d = np.stack([road_pts_world_x, road_pts_world_y], dtype=np.float32, axis=-1)
-
-        # print(f'self.pixels_per_meter: {self.pixels_per_meter}')
-        # print(f'self.world_origin: {self.world_origin}')
-        # print(f'self.road_pts_world_2d shape: {self.road_pts_world_2d.shape}')
-
         with h5py.File(map_file, 'r', libver='latest', swmr=True) as hf:
             self.pixels_per_meter = float(hf.attrs['pixels_per_meter'])
             self.world_origin = np.array(hf.attrs['world_offset_in_meters'], dtype=np.float32)
@@ -299,8 +281,13 @@ class WorldMappingProcessor:
 
         print(f'self.pixels_per_meter: {self.pixels_per_meter}')
         print(f'self.world_origin: {self.world_origin}')
-        # print(f'self.road_pts_world_2d shape: {self.road_pts_world_2d.shape}')
         print(f'self.road_mask_world_dilated shape: {self.road_mask_world_dilated.shape}')
+
+        # Costs
+        self.free_space_cost = 0
+        self.static_obstacle_cost = 200
+        self.dynamic_min_cost = 220
+        self.dynamic_max_cost = 255
 
         # road_img = (self.road_mask_world_dilated * 255).astype(np.uint8)
         # cv2.namedWindow("BirdView World Map", cv2.WINDOW_NORMAL)
@@ -394,14 +381,12 @@ class WorldMappingProcessor:
         corners_world_4d = (T_box_world @ local.T).T    # [4x4]
         return corners_world_4d[:, :3]
 
-    def get_occupancy_map_lidar(
+    def get_base_cost_maps(
         self,
-        cameras : Dict[str, CameraInterface],
-        lidar_sensor : carla.Sensor,
         lidar_data : Dict,
         ego_tf : carla.Transform,
         grid : BEVGrid
-    ) -> np.ndarray:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         ego_loc = ego_tf.location
         ego_yaw_rad = np.deg2rad(ego_tf.rotation.yaw)
 
@@ -430,7 +415,7 @@ class WorldMappingProcessor:
             ],
         ], dtype=np.float32)
 
-        occupancy_grid = cv2.warpAffine(
+        road_mask_local = cv2.warpAffine(
             self.road_mask_world_dilated,
             warp_matrix,
             (grid.W, grid.H),
@@ -439,42 +424,58 @@ class WorldMappingProcessor:
             borderValue=0,
         ).astype(np.uint8)
 
+        static_cost_map = np.zeros((grid.H, grid.W), dtype=np.uint8)
+        dynamic_cost_map = np.zeros((grid.H, grid.W), dtype=np.uint8)
+
+        static_cost_map[road_mask_local == 0] = self.static_obstacle_cost
+
         # ############################################
         # # Actor Processing
         # ############################################
 
         actors = self.world.get_actors()
         vehicles = list(actors.filter('*vehicle*'))
+        pedestrians = list(actors.filter('*walker*'))
+        dynamic_actors = vehicles + pedestrians
 
-        for actor in vehicles:
-            if ego_loc.distance(actor.get_location()) <= R and actor.actor_state == carla.ActorState.Active:
-                # print(f'actor type_id: {actor.type_id}')
-                actor_corners_world_3d = self.get_bb_corners_world(actor)
-                # print(f'actor_corners_world_3d: {actor_corners_world_3d}')
-                actor_dx = actor_corners_world_3d[:, 0] - ego_loc.x
-                actor_dy = actor_corners_world_3d[:, 1] - ego_loc.y
+        for actor in dynamic_actors:
+            if actor.id == self.ego_vehicle.id:
+                continue
 
-                actor_corners_ego_x = C*actor_dx + S*actor_dy
-                actor_corners_ego_y = -S*actor_dx + C*actor_dy
+            if not actor.is_active:
+                continue
 
-                # print(f'actor_corners_ego_x: {actor_corners_ego_x}')
-                # print(f'actor_corners_ego_y: {actor_corners_ego_y}')
+            if ego_loc.distance(actor.get_location()) > R:
+                continue
 
-                crop_box_filter = \
-                    (actor_corners_ego_x >= grid.x_min) & (actor_corners_ego_x < grid.x_max) & \
-                    (actor_corners_ego_y >= grid.y_min) & (actor_corners_ego_y < grid.y_max)
+            actor_corners_world_3d = self.get_bb_corners_world(actor)
+            actor_dx = actor_corners_world_3d[:, 0] - ego_loc.x
+            actor_dy = actor_corners_world_3d[:, 1] - ego_loc.y
 
-                actor_corners_ego_x, actor_corners_ego_y = actor_corners_ego_x[crop_box_filter], actor_corners_ego_y[crop_box_filter]
+            actor_corners_ego_x = C * actor_dx + S * actor_dy
+            actor_corners_ego_y = -S * actor_dx + C * actor_dy
 
-                i, j = grid.world_to_grid(actor_corners_ego_x, actor_corners_ego_y)
-                # valid = (i >= 0) & (i < grid.H) & (j >= 0) & (j < grid.W)
-                poly = np.stack([j, i], axis=1)
-                if poly.size == 0:
-                    continue
+            crop_box_filter = (
+                (actor_corners_ego_x >= grid.x_min) & (actor_corners_ego_x < grid.x_max) &
+                (actor_corners_ego_y >= grid.y_min) & (actor_corners_ego_y < grid.y_max)
+            )
 
-                # print(f'polygon shape: {poly.shape}')
-                hull = cv2.convexHull(poly)
-                cv2.fillConvexPoly(occupancy_grid, np.array(hull).astype(np.int32), 0)
+            actor_corners_ego_x = actor_corners_ego_x[crop_box_filter]
+            actor_corners_ego_y = actor_corners_ego_y[crop_box_filter]
+
+            if actor_corners_ego_x.size == 0:
+                continue
+
+            i, j = grid.world_to_grid(actor_corners_ego_x, actor_corners_ego_y)
+            poly = np.stack([j, i], axis=1)
+            if poly.size == 0:
+                continue
+
+            hull = cv2.convexHull(poly.astype(np.float32))
+            hull_pts = np.squeeze(hull).astype(np.int32)
+            if hull_pts.ndim != 2 or hull_pts.shape[0] < 3:
+                continue
+            cv2.fillConvexPoly(dynamic_cost_map, hull_pts, self.static_obstacle_cost)
 
         # ############################################
         # # Lidar Processing
@@ -537,25 +538,23 @@ class WorldMappingProcessor:
 
         # Create occupancy mask
         occ_mask = crop_box_filter & semantic_filter
-        lidar_pts_ego_3d = lidar_pts_ego_3d[occ_mask]   # (M,3)
+        if np.any(occ_mask):
+            lidar_pts_ego_3d = lidar_pts_ego_3d[occ_mask] # (M,3)
+            lidar_tags_filtered = lidar_semantic_tags[occ_mask]
 
-        # print(f'occ_mask shape: {occ_mask.shape}')
-        # occ_mask = occ_mask.astype(bool)          # (N,1)
+            dynamic_semantic_mask = np.isin(lidar_tags_filtered, list(self.dynamic_classes))
 
-        # print(f'occ_mask post filter shape: {occ_mask.shape}')
+            static_pts = lidar_pts_ego_3d[~dynamic_semantic_mask]
+            if static_pts.size > 0:
+                i_static, j_static = grid.world_to_grid(static_pts[:, 0], static_pts[:, 1])
+                static_cost_map[i_static, j_static] = self.static_obstacle_cost
 
-        # # rows = np.where(occ_mask[:, 0])[0]        # 1-D row indices from the 2-D mask
-        # # lidar_pts_ego_3d = lidar_pts_ego_3d[rows, :]   # (M,3)
+            dynamic_pts = lidar_pts_ego_3d[dynamic_semantic_mask]
+            if dynamic_pts.size > 0:
+                i_dyn, j_dyn = grid.world_to_grid(dynamic_pts[:, 0], dynamic_pts[:, 1])
+                dynamic_cost_map[i_dyn, j_dyn] = np.maximum(dynamic_cost_map[i_dyn, j_dyn], self.static_obstacle_cost)
 
-        # print(f'lidar_pts_ego_3d filtered shape: {lidar_pts_ego_3d.shape}')
-        # # Convert to grid coordinates and set occupancy cells
-        i, j = grid.world_to_grid(lidar_pts_ego_3d[:, 0], lidar_pts_ego_3d[:, 1])
-        # valid = (i >= 0) & (i < grid.H) & (j >= 0) & (j < grid.W)
-
-        # occupancy_grid[i[valid], j[valid]] = 0
-        occupancy_grid[i, j] = 0
-
-        return occupancy_grid
+        return static_cost_map, dynamic_cost_map
 
     def get_cost_map(
         self,

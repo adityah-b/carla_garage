@@ -85,7 +85,8 @@ class GridMapper:
 
     def update_maps(
         self,
-        lidar_data : Dict
+        lidar_data: Dict,
+        route_points_world: Optional[np.ndarray] = None
     ) -> Maps:
         ego_tf = self.ego_vehicle.get_transform()
         # occupancy_map = self.processor.get_occupancy_map_visualize_lidar(
@@ -96,13 +97,15 @@ class GridMapper:
         #     self.grid,
         #     point_list=self.point_list
         # )
-        occupancy_map = self.processor.get_occupancy_map_lidar(
-            self.cameras,
-            self.lidar_sensor,
+        static_cost_map, dynamic_cost_map = self.processor.get_base_cost_maps(
             lidar_data,
             ego_tf,
-            self.grid,
+            self.grid
         )
+        total_cost_map = np.maximum(static_cost_map, dynamic_cost_map)
+        occupancy_map = np.ones_like(static_cost_map, dtype=np.uint8)
+        occupancy_map[static_cost_map > 0] = 0
+        occupancy_map[dynamic_cost_map > 0] = 0
 
         cost_map = self.processor.get_cost_map(
             occupancy_map
@@ -122,7 +125,7 @@ class GridMapper:
             semantic_map=None,
             base_cost_map=None,
             dynamic_cost_map=None,
-            total_cost_map=cost_map
+            total_cost_map=total_cost_map
         )
 
         # return Maps(
