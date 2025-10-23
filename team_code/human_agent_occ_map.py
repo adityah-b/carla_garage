@@ -457,11 +457,72 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
             semantic_lidar_data[1]
         )
 
-        occ_img = maps.occupancy_map
-        visu = (occ_img * 255).astype(np.uint8)
+        occupancy_map = maps.occupancy_map
+        occ_img = (occupancy_map * 255).astype(np.uint8)
+        cost_map = maps.total_cost_map
+        heat_map = cv2.applyColorMap(cost_map, cv2.COLORMAP_TURBO)
+
+        # Generate A* path
+        lookahead_distance = 20 * self.config.points_per_meter
+        to_index = min(planner_state.route_points.shape[0] - 1, planner_state.route_index + lookahead_distance)
+
+        start_point_world = ego_location
+        goal_point_world = planner_state.route_points[to_index]
+
+        # print(f'start point: {start_point_world}')
+        # print(f'start point shape: {start_point_world.shape}')
+
+        # print(f'goal point: {goal_point_world}')
+        # print(f'goal point shape: {goal_point_world.shape}')
+        # print(f'start to goal distance: {np.linalg.norm(goal_point_world - start_point_world)}')
+
+        astar_path_grid, path_world_3d = self.grid_mapper.generate_astar_path(
+            maps.occupancy_map,
+            maps.total_cost_map,
+            start_point_world,
+            goal_point_world
+        )
+
+        # Draw on occupancy image
+        H, W = occupancy_map.shape
+        occ_bgr = cv2.cvtColor(occ_img, cv2.COLOR_GRAY2BGR)
+
+        pts = np.asarray([(c_, r_) for (r_, c_) in astar_path_grid], dtype=np.int32)  # (x=col, y=row)
+
+        # Line thickness
+        thickness = max(1, int(round((0.4 / 0.5) * 1.0)))
+
+        # --- Draw on copies ---
+        heat_with_path = heat_map.copy()
+        occ_with_path  = occ_bgr.copy()
+
+        # Path polyline (green), start (red), goal (blue)
+        for img in (heat_with_path, occ_with_path):
+            cv2.polylines(img, [pts], isClosed=False, color=(0,255,0),
+                        thickness=thickness, lineType=cv2.LINE_AA)
+            cv2.circle(img, tuple(pts[0]),  radius=thickness*2, color=(0,0,255), thickness=-1)  # start
+            cv2.circle(img, tuple(pts[-1]), radius=thickness*2, color=(255,0,0), thickness=-1)  # goal
+
         cv2.namedWindow("BirdView Occupancy", cv2.WINDOW_NORMAL)
-        cv2.imshow('BirdView Occupancy', visu)
+        # cv2.imshow('BirdView Occupancy', occ_img)
+        cv2.imshow('BirdView Occupancy', occ_with_path)
         cv2.waitKey(1)
+
+        cv2.namedWindow("BirdView Cost Map", cv2.WINDOW_NORMAL)
+        cv2.imshow('BirdView Cost Map', heat_map)
+        cv2.waitKey(1)
+
+        for loc_arr in path_world_3d:
+            # print(f'loc_arr: {loc_arr}')
+            # print(f'loc_arr shape: {loc_arr.shape}')
+            carla_loc = carla.Location(float(loc_arr[0]), float(loc_arr[1]), float(loc_arr[2] + 0.1))
+            # print(f'carla loc: {carla_loc}')
+            self.world.debug.draw_point(
+                location=carla_loc,
+                size=0.05,
+                color=carla.Color(128, 128, 128),
+                life_time=self.config.draw_life_time
+            )
 
         # OPEN3D VISUALIZATION
         # if self.step == 2:

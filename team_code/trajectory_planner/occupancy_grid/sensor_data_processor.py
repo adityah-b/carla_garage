@@ -47,6 +47,11 @@ class BEVGrid:
         j = np.floor((y - self.y_min) / self.resolution).astype(np.int32)
         return i, j
 
+    def grid_to_world(self, grid_x: np.ndarray, grid_y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        world_x = self.x_max - (grid_x + 0.5) * self.resolution
+        world_y = self.y_min + (grid_y + 0.5) * self.resolution
+        return world_x, world_y
+
 VIRIDIS = np.array(cm.get_cmap('plasma').colors)
 VID_RANGE = np.linspace(0.0, 1.0, VIRIDIS.shape[0])
 LABEL_COLORS = np.array([
@@ -256,6 +261,24 @@ class WorldMappingProcessor:
         map_file = map_dir / (map_name + '.h5')
         print(f"\nLoading map from {map_file}")
 
+        # with h5py.File(map_file, 'r', libver='latest', swmr=True) as hf:
+        #     self.pixels_per_meter = float(hf.attrs['pixels_per_meter'])
+        #     self.world_origin = np.array(hf.attrs['world_offset_in_meters'], dtype=np.float32)
+
+        #     road_mask_pixels = np.array(hf['road'], dtype=np.uint8)
+        #     print(f'road_mask_pixels shape: {road_mask_pixels.shape}')
+
+        #     # Convert to world coordinates
+        #     y_pixels, x_pixels = np.where(road_mask_pixels != 0)
+        #     road_pts_world_x = x_pixels / self.pixels_per_meter + self.world_origin[0]
+        #     road_pts_world_y = y_pixels / self.pixels_per_meter + self.world_origin[1]
+
+        #     self.road_pts_world_2d = np.stack([road_pts_world_x, road_pts_world_y], dtype=np.float32, axis=-1)
+
+        # print(f'self.pixels_per_meter: {self.pixels_per_meter}')
+        # print(f'self.world_origin: {self.world_origin}')
+        # print(f'self.road_pts_world_2d shape: {self.road_pts_world_2d.shape}')
+
         with h5py.File(map_file, 'r', libver='latest', swmr=True) as hf:
             self.pixels_per_meter = float(hf.attrs['pixels_per_meter'])
             self.world_origin = np.array(hf.attrs['world_offset_in_meters'], dtype=np.float32)
@@ -263,30 +286,26 @@ class WorldMappingProcessor:
             road_mask_pixels = np.array(hf['road'], dtype=np.uint8)
             print(f'road_mask_pixels shape: {road_mask_pixels.shape}')
 
-            # Convert to world coordinates
-            y_pixels, x_pixels = np.where(road_mask_pixels != 0)
-            road_pts_world_x = x_pixels / self.pixels_per_meter + self.world_origin[0]
-            road_pts_world_y = y_pixels / self.pixels_per_meter + self.world_origin[1]
-
-            self.road_pts_world_2d = np.stack([road_pts_world_x, road_pts_world_y], dtype=np.float32, axis=-1)
+            # Cache the static road layer (binary) and its smoothed variant for reuse every tick
+            self.road_mask_world = (road_mask_pixels > 0).astype(np.uint8)
+            kernel = np.ones((3, 3), dtype=np.uint8)
+            road_mask_world_counts = cv2.filter2D(
+                self.road_mask_world,
+                -1,
+                kernel,
+                borderType=cv2.BORDER_CONSTANT,
+            )
+            self.road_mask_world_dilated = (road_mask_world_counts >= 5).astype(np.uint8)
 
         print(f'self.pixels_per_meter: {self.pixels_per_meter}')
         print(f'self.world_origin: {self.world_origin}')
-        print(f'self.road_pts_world_2d shape: {self.road_pts_world_2d.shape}')
+        # print(f'self.road_pts_world_2d shape: {self.road_pts_world_2d.shape}')
+        print(f'self.road_mask_world_dilated shape: {self.road_mask_world_dilated.shape}')
 
-    def bresenham(self, gx0, gy0, gx1, gy1):
-        """Yield integer grid coords along a line (including both ends)."""
-        dx, dy = abs(gx1 - gx0), -abs(gy1 - gy0)
-        sx = 1 if gx0 < gx1 else -1
-        sy = 1 if gy0 < gy1 else -1
-        err = dx + dy
-        x, y = gx0, gy0
-        while True:
-            yield x, y
-            if x == gx1 and y == gy1: break
-            e2 = 2 * err
-            if e2 >= dy: err += dy; x += sx
-            if e2 <= dx: err += dx; y += sy
+        # road_img = (self.road_mask_world_dilated * 255).astype(np.uint8)
+        # cv2.namedWindow("BirdView World Map", cv2.WINDOW_NORMAL)
+        # cv2.imshow('BirdView World Map', road_img)
+        # cv2.waitKey(1)
 
     def project_camera_pts_to_ego(
         self,
@@ -351,7 +370,7 @@ class WorldMappingProcessor:
         """
         actor_tf = actor.get_transform()
         bb = actor.bounding_box
-        print(f'bounding box: {str(bb)}')
+        # print(f'bounding box: {str(bb)}')
         cx, cy, cz = bb.location.x + actor_tf.location.x, bb.location.y + actor_tf.location.y, bb.location.z + actor_tf.location.z
         ex, ey, ez = bb.extent.x, bb.extent.y, bb.extent.z
         yaw = np.deg2rad(bb.rotation.yaw + actor_tf.rotation.yaw)  # CARLA stores degrees
@@ -375,37 +394,6 @@ class WorldMappingProcessor:
         corners_world_4d = (T_box_world @ local.T).T    # [4x4]
         return corners_world_4d[:, :3]
 
-    def convert_polygon_to_mask(
-        self,
-        grid : BEVGrid,
-        poly_xy: np.ndarray
-    ) -> np.ndarray:
-        """poly_xy: (K,2) in ego meters → boolean mask (H,W). Scanline PIP on grid-center samples."""
-        H, W = grid.H, grid.W
-        # bbox in grid
-        r, c = grid.world_to_grid(poly_xy[:,0], poly_xy[:,1])
-        rmin, rmax = np.clip([r.min(), r.max()], 0, H-1)
-        cmin, cmax = np.clip([c.min(), c.max()], 0, W-1)
-        if rmax < rmin or cmax < cmin:
-            return np.zeros((H,W), dtype=bool)
-
-        xs = (np.arange(rmin, rmax+1) + 0.5) * grid.res + grid.x_min
-        ys = (np.arange(cmin, cmax+1) + 0.5) * grid.res + grid.y_min
-        XX, YY = np.meshgrid(xs, ys, indexing='ij')  # (rows, cols)
-
-        # vectorized ray-cast PIP
-        inside = np.zeros_like(XX, dtype=bool)
-        P = poly_xy
-        for i in range(len(P)):
-            x1, y1 = P[i]
-            x2, y2 = P[(i+1) % len(P)]
-            cond = ((y1 > YY) != (y2 > YY)) & (XX < (x2 - x1) * (YY - y1) / (y2 - y1 + 1e-12) + x1)
-            inside ^= cond
-
-        mask = np.zeros((H,W), dtype=bool)
-        mask[rmin:rmax+1, cmin:cmax+1] = inside
-        return mask
-
     def get_occupancy_map_lidar(
         self,
         cameras : Dict[str, CameraInterface],
@@ -415,39 +403,41 @@ class WorldMappingProcessor:
         grid : BEVGrid
     ) -> np.ndarray:
         ego_loc = ego_tf.location
-        occupancy_grid = np.zeros((grid.H, grid.W), dtype=np.uint8)
+        ego_yaw_rad = np.deg2rad(ego_tf.rotation.yaw)
 
         # ############################################
         # # Drivable Area Filtering
         # ############################################
 
         R = 100.0
-        C = np.cos(np.deg2rad(ego_tf.rotation.yaw))
-        S = np.sin(np.deg2rad(ego_tf.rotation.yaw))
+        C = np.cos(ego_yaw_rad)
+        S = np.sin(ego_yaw_rad)
 
-        dx = self.road_pts_world_2d[:, 0] - ego_loc.x
-        dy = self.road_pts_world_2d[:, 1] - ego_loc.y
+        grid_res = grid.resolution
+        ppm = self.pixels_per_meter
+        origin_x, origin_y = self.world_origin
 
-        mask_radius = (dx*dx + dy*dy) <= (R*R)
-        dx = dx[mask_radius]
-        dy = dy[mask_radius]
+        warp_matrix = np.array([
+            [
+                ppm * (-S * grid_res),
+                ppm * (-C * grid_res),
+                ppm * ((ego_loc.x + C*grid.x_max - S*grid.y_min) - 0.5*grid_res*(C + S) - origin_x)
+            ],
+            [
+                ppm * ( C * grid_res),
+                ppm * (-S * grid_res),
+                ppm * ((ego_loc.y + S*grid.x_max + C*grid.y_min) + 0.5*grid_res*(C - S) - origin_y)
+            ],
+        ], dtype=np.float32)
 
-        road_pts_ego_x = C*dx + S*dy
-        road_pts_ego_y = -S*dx + C*dy
-
-        crop_box_filter = \
-            (road_pts_ego_x >= grid.x_min) & (road_pts_ego_x < grid.x_max) & \
-            (road_pts_ego_y >= grid.y_min) & (road_pts_ego_y < grid.y_max)
-
-        x_free, y_free = road_pts_ego_x[crop_box_filter], road_pts_ego_y[crop_box_filter]
-
-        i, j = grid.world_to_grid(x_free, y_free)
-        valid = (i >= 0) & (i < grid.H) & (j >= 0) & (j < grid.W)
-        occupancy_grid[i[valid], j[valid]] = 1
-
-        m = (occupancy_grid > 0).astype(np.uint8)
-        s = cv2.filter2D(m, -1, np.ones((3,3), np.uint8), borderType=cv2.BORDER_CONSTANT)
-        occupancy_grid = (s >= 5).astype(np.uint8)
+        occupancy_grid = cv2.warpAffine(
+            self.road_mask_world_dilated,
+            warp_matrix,
+            (grid.W, grid.H),
+            flags=cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        ).astype(np.uint8)
 
         # ############################################
         # # Actor Processing
@@ -458,17 +448,17 @@ class WorldMappingProcessor:
 
         for actor in vehicles:
             if ego_loc.distance(actor.get_location()) <= R and actor.actor_state == carla.ActorState.Active:
-                print(f'actor type_id: {actor.type_id}')
+                # print(f'actor type_id: {actor.type_id}')
                 actor_corners_world_3d = self.get_bb_corners_world(actor)
-                print(f'actor_corners_world_3d: {actor_corners_world_3d}')
+                # print(f'actor_corners_world_3d: {actor_corners_world_3d}')
                 actor_dx = actor_corners_world_3d[:, 0] - ego_loc.x
                 actor_dy = actor_corners_world_3d[:, 1] - ego_loc.y
 
                 actor_corners_ego_x = C*actor_dx + S*actor_dy
                 actor_corners_ego_y = -S*actor_dx + C*actor_dy
 
-                print(f'actor_corners_ego_x: {actor_corners_ego_x}')
-                print(f'actor_corners_ego_y: {actor_corners_ego_y}')
+                # print(f'actor_corners_ego_x: {actor_corners_ego_x}')
+                # print(f'actor_corners_ego_y: {actor_corners_ego_y}')
 
                 crop_box_filter = \
                     (actor_corners_ego_x >= grid.x_min) & (actor_corners_ego_x < grid.x_max) & \
@@ -482,7 +472,7 @@ class WorldMappingProcessor:
                 if poly.size == 0:
                     continue
 
-                print(f'polygon shape: {poly.shape}')
+                # print(f'polygon shape: {poly.shape}')
                 hull = cv2.convexHull(poly)
                 cv2.fillConvexPoly(occupancy_grid, np.array(hull).astype(np.int32), 0)
 
@@ -560,27 +550,34 @@ class WorldMappingProcessor:
         # print(f'lidar_pts_ego_3d filtered shape: {lidar_pts_ego_3d.shape}')
         # # Convert to grid coordinates and set occupancy cells
         i, j = grid.world_to_grid(lidar_pts_ego_3d[:, 0], lidar_pts_ego_3d[:, 1])
-        valid = (i >= 0) & (i < grid.H) & (j >= 0) & (j < grid.W)
+        # valid = (i >= 0) & (i < grid.H) & (j >= 0) & (j < grid.W)
 
-        # occ_mask_lidar = np.ones(occupancy_grid.shape, dtype=np.uint8)
-
-        # # gx = i[valid]
-        # # gy = j[valid]
-
-        # # for cx, cy in zip(gx, gy):
-        # #     # FREE along the ray (except endpoint)
-        # #     for rx, ry in self.bresenham(50, 25, cx, cy):
-        # #         if rx == cx and ry == cy:   # endpoint -> stop before marking FREE
-        # #             break
-        # #         occ_mask_lidar[rx, ry] = 1
-        # #     # OCCUPIED at the hit
-        # #     occ_mask_lidar[cx, cy] = 0
-
-        occupancy_grid[i[valid], j[valid]] = 0
+        # occupancy_grid[i[valid], j[valid]] = 0
+        occupancy_grid[i, j] = 0
 
         return occupancy_grid
 
+    def get_cost_map(
+        self,
+        occupancy_map : np.ndarray,
+        max_cost : float = 255
+    ) -> np.ndarray:
+        """
+        Converts a binary occupancy grid to a smooth cost map.
+        """
+        # 0=occupied, 1=free
+        occ = (occupancy_map == 0).astype(np.uint8)
 
+        # Compute distance transform (distance to nearest obstacle)
+        dist = cv2.distanceTransform(1 - occ, distanceType=cv2.DIST_L2, maskSize=5)
+
+        # Normalize so 0=obstacle, 1=far away
+        dist_norm = dist / dist.max()
+
+        # Invert so cost is *higher* near obstacles
+        cost = (1 - dist_norm ** 0.5) * max_cost
+
+        return cost.astype(np.uint8)
 
     def get_occupancy_map_multiview_camera(
         self,
@@ -597,7 +594,6 @@ class WorldMappingProcessor:
         for cam_dir in ['front', 'left', 'right', 'back', 'bev']:
         # for cam_dir in ['front', 'left', 'right', 'back']:
         # for cam_dir in ['front', 'back']:
-        # for cam_dir in ['bev']:
             instance_camera = cameras[f'instance_{cam_dir}']
             depth_camera = cameras[f'depth_{cam_dir}']
 
