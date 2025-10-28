@@ -15,7 +15,7 @@ from typing import Dict, List, Tuple, Optional, Set
 from matplotlib.colors import ListedColormap
 from enum import IntEnum
 
-from team_code.scene_descriptor.camera_interface import CameraInterface
+from scene_descriptor.camera_interface import CameraInterface
 
 
 from matplotlib import cm
@@ -45,6 +45,10 @@ class BEVGrid:
         # i = np.floor((x - self.x_min) / self.resolution).astype(np.int32)
         i = np.floor((self.x_max - x) / self.resolution).astype(np.int32)
         j = np.floor((y - self.y_min) / self.resolution).astype(np.int32)
+
+        i = np.clip(i, 0, self.H - 1)
+        j = np.clip(j, 0, self.W - 1)
+
         return i, j
 
     def grid_to_world(self, grid_x: np.ndarray, grid_y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -245,7 +249,6 @@ class WorldMappingProcessor:
             ActorClass.TRAIN,
             ActorClass.MOTORCYCLE,
             ActorClass.BICYCLE,
-            ActorClass.DYNAMIC,
         }
 
         # Latest sensor data
@@ -266,10 +269,16 @@ class WorldMappingProcessor:
             self.world_origin = np.array(hf.attrs['world_offset_in_meters'], dtype=np.float32)
 
             road_mask_pixels = np.array(hf['road'], dtype=np.uint8)
+            shoulder_mask_pixels = np.array(hf['shoulder'], dtype=np.uint8)
+            parking_mask_pixels = np.array(hf['parking'], dtype=np.uint8)
             print(f'road_mask_pixels shape: {road_mask_pixels.shape}')
 
             # Cache the static road layer (binary) and its smoothed variant for reuse every tick
-            self.road_mask_world = (road_mask_pixels > 0).astype(np.uint8)
+            self.road_mask_world = (
+                (road_mask_pixels > 0) |
+                (shoulder_mask_pixels > 0) |
+                (parking_mask_pixels > 0)
+            ).astype(np.uint8)
             kernel = np.ones((3, 3), dtype=np.uint8)
             road_mask_world_counts = cv2.filter2D(
                 self.road_mask_world,
@@ -285,7 +294,7 @@ class WorldMappingProcessor:
 
         # Costs
         self.free_space_cost = 0
-        self.static_obstacle_cost = 200
+        self.static_obstacle_cost = 255
         self.dynamic_min_cost = 220
         self.dynamic_max_cost = 255
 
@@ -360,7 +369,13 @@ class WorldMappingProcessor:
         # print(f'bounding box: {str(bb)}')
         cx, cy, cz = bb.location.x + actor_tf.location.x, bb.location.y + actor_tf.location.y, bb.location.z + actor_tf.location.z
         ex, ey, ez = bb.extent.x, bb.extent.y, bb.extent.z
-        yaw = np.deg2rad(bb.rotation.yaw + actor_tf.rotation.yaw)  # CARLA stores degrees
+        # Enforce that x extent corresponds to length (usually extents are swapped for parked static vehicles)
+        if ex < ey:
+            ex = bb.extent.y
+            ey = bb.extent.x
+
+        # yaw = np.deg2rad(bb.rotation.yaw + actor_tf.rotation.yaw)  # CARLA stores degrees
+        yaw = np.deg2rad(actor_tf.rotation.yaw)  # CARLA stores degrees
 
         # local corners at z = cz (middle face) – any constant z works since we drop z later
         local = np.array([
@@ -381,12 +396,65 @@ class WorldMappingProcessor:
         corners_world_4d = (T_box_world @ local.T).T    # [4x4]
         return corners_world_4d[:, :3]
 
+    def convert_frame_to_ego(
+        self,
+        frame_pts : np.ndarray,
+        T_frame_wrt_ego : np.ndarray,
+    ) -> np.ndarray:
+        # Convert frame points to homogenous form
+        ones = np.ones((frame_pts.shape[0], 1), dtype=np.float32) # [Nx1]
+        frame_pts_4d = np.hstack([frame_pts, ones])
+
+        # Transform to ego frame
+        ego_pts_3d = (frame_pts_4d @ T_frame_wrt_ego.T)[:, :3]
+
+        return ego_pts_3d
+
+    def draw_actor_on_map(
+        self,
+        ego_tf : carla.Transform,
+        grid : BEVGrid,
+        actor : carla.Actor,
+        map : np.ndarray,
+        cost : float
+    ) -> None:
+        ego_loc = ego_tf.location
+        ego_yaw_rad = np.deg2rad(ego_tf.rotation.yaw)
+
+        C = np.cos(ego_yaw_rad)
+        S = np.sin(ego_yaw_rad)
+
+        actor_corners_world_3d = self.get_bb_corners_world(actor)
+        actor_dx = actor_corners_world_3d[:, 0] - ego_loc.x
+        actor_dy = actor_corners_world_3d[:, 1] - ego_loc.y
+
+        actor_corners_ego_x = C * actor_dx + S * actor_dy
+        actor_corners_ego_y = -S * actor_dx + C * actor_dy
+
+        crop_box_filter = (
+            (actor_corners_ego_x >= grid.x_min) & (actor_corners_ego_x < grid.x_max) &
+            (actor_corners_ego_y >= grid.y_min) & (actor_corners_ego_y < grid.y_max)
+        )
+
+        actor_corners_ego_x = actor_corners_ego_x[crop_box_filter]
+        actor_corners_ego_y = actor_corners_ego_y[crop_box_filter]
+
+        if actor_corners_ego_x.size == 0:
+            return
+
+        i, j = grid.world_to_grid(actor_corners_ego_x, actor_corners_ego_y)
+        poly = np.stack([j, i], dtype=np.int32, axis=1)
+
+        hull = cv2.convexHull(poly)
+
+        cv2.fillConvexPoly(map, hull, cost)
+
     def get_base_cost_maps(
         self,
         lidar_data : Dict,
         ego_tf : carla.Transform,
         grid : BEVGrid
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         ego_loc = ego_tf.location
         ego_yaw_rad = np.deg2rad(ego_tf.rotation.yaw)
 
@@ -424,20 +492,47 @@ class WorldMappingProcessor:
             borderValue=0,
         ).astype(np.uint8)
 
-        static_cost_map = np.zeros((grid.H, grid.W), dtype=np.uint8)
-        dynamic_cost_map = np.zeros((grid.H, grid.W), dtype=np.uint8)
-
-        static_cost_map[road_mask_local == 0] = self.static_obstacle_cost
+        road_occupancy_map = np.zeros((grid.H, grid.W), dtype=np.uint8)
+        road_occupancy_map[road_mask_local == 0] = 1
 
         # ############################################
         # # Actor Processing
         # ############################################
+        static_cost_map = np.zeros((grid.H, grid.W), dtype=np.uint8)
+        dynamic_cost_map = np.zeros((grid.H, grid.W), dtype=np.uint8)
 
         actors = self.world.get_actors()
         vehicles = list(actors.filter('*vehicle*'))
         pedestrians = list(actors.filter('*walker*'))
+
+        static_actors = list(actors.filter('*static*'))
         dynamic_actors = vehicles + pedestrians
 
+        parked_dynamic_vehicles = set()
+
+        # Static actor processing
+        for actor in static_actors:
+            if not actor.is_active:
+                continue
+
+            if ego_loc.distance(actor.get_location()) > R:
+                continue
+
+            should_draw_actor = False
+            # Draw static vehicle (parked)
+            if actor.type_id == 'static.prop.mesh':
+                if 'mesh_path' in actor.attributes and 'Car' in actor.attributes['mesh_path']:
+                    should_draw_actor = True
+
+            # Draw traffic cones
+            elif actor.type_id == 'static.prop.constructioncone':
+                print(f'ID: {actor.id}, Found Construction Cone')
+                should_draw_actor = True
+
+            if should_draw_actor:
+                self.draw_actor_on_map(ego_tf, grid, actor, static_cost_map, self.static_obstacle_cost)
+
+        # Dynamic actor processing
         for actor in dynamic_actors:
             if actor.id == self.ego_vehicle.id:
                 continue
@@ -448,34 +543,17 @@ class WorldMappingProcessor:
             if ego_loc.distance(actor.get_location()) > R:
                 continue
 
-            actor_corners_world_3d = self.get_bb_corners_world(actor)
-            actor_dx = actor_corners_world_3d[:, 0] - ego_loc.x
-            actor_dy = actor_corners_world_3d[:, 1] - ego_loc.y
+            # Check if actor is dynamically spawned non-moving vehicle (treat as static object)
+            if isinstance(actor, carla.Vehicle):
+                veh_control = actor.get_control()
+                if veh_control.hand_brake:
+                    parked_dynamic_vehicles.add(actor.id)
+                    self.draw_actor_on_map(ego_tf, grid, actor, static_cost_map, self.static_obstacle_cost)
+                    continue
 
-            actor_corners_ego_x = C * actor_dx + S * actor_dy
-            actor_corners_ego_y = -S * actor_dx + C * actor_dy
-
-            crop_box_filter = (
-                (actor_corners_ego_x >= grid.x_min) & (actor_corners_ego_x < grid.x_max) &
-                (actor_corners_ego_y >= grid.y_min) & (actor_corners_ego_y < grid.y_max)
+            self.draw_actor_on_map(
+                ego_tf, grid, actor, dynamic_cost_map, self.static_obstacle_cost
             )
-
-            actor_corners_ego_x = actor_corners_ego_x[crop_box_filter]
-            actor_corners_ego_y = actor_corners_ego_y[crop_box_filter]
-
-            if actor_corners_ego_x.size == 0:
-                continue
-
-            i, j = grid.world_to_grid(actor_corners_ego_x, actor_corners_ego_y)
-            poly = np.stack([j, i], axis=1)
-            if poly.size == 0:
-                continue
-
-            hull = cv2.convexHull(poly.astype(np.float32))
-            hull_pts = np.squeeze(hull).astype(np.int32)
-            if hull_pts.ndim != 2 or hull_pts.shape[0] < 3:
-                continue
-            cv2.fillConvexPoly(dynamic_cost_map, hull_pts, self.static_obstacle_cost)
 
         # ############################################
         # # Lidar Processing
@@ -484,8 +562,7 @@ class WorldMappingProcessor:
         # Get 3D lidar points and semantic tags
         lidar_pts_3d = lidar_data['xyz'].astype(np.float32) # [Nx3]
         lidar_semantic_tags = lidar_data['object_tag'].astype(np.int32) # [Nx1]
-
-        # print(f'lidar_pts_3d shape: {lidar_pts_3d.shape}')
+        lidar_instance_tags = lidar_data['object_idx'].astype(np.int32) # [Nx1]
 
         # Convert to homogenous form [Nx4]
         ones = np.ones((lidar_pts_3d.shape[0], 1), dtype=np.float32)
@@ -508,8 +585,6 @@ class WorldMappingProcessor:
         # Get 3D lidar points in ego frame [Nx3]
         lidar_pts_ego_3d = lidar_pts_ego_4d[:, :3]
 
-        # print(f'lidar_pts_ego_3d shape: {lidar_pts_ego_3d.shape}')
-
         # Lidar points bounds filtering
         x_ok = (lidar_pts_ego_3d[:, 0] >= grid.x_min) & (lidar_pts_ego_3d[:, 0] < grid.x_max)
         y_ok = (lidar_pts_ego_3d[:, 1] >= grid.y_min) & (lidar_pts_ego_3d[:, 1] < grid.y_max)
@@ -530,21 +605,17 @@ class WorldMappingProcessor:
             ],
             invert=True)
 
-        # print(f'x_ok shape: {x_ok.shape}')
-        # print(f'y_ok shape: {y_ok.shape}')
-        # print(f'z_ok shape: {z_ok.shape}')
-        # print(f'semantic_filter shape: {semantic_filter.shape}')
-        # print(f'crop box filter shape: {crop_box_filter.shape}')
-
         # Create occupancy mask
         occ_mask = crop_box_filter & semantic_filter
         if np.any(occ_mask):
             lidar_pts_ego_3d = lidar_pts_ego_3d[occ_mask] # (M,3)
             lidar_tags_filtered = lidar_semantic_tags[occ_mask]
+            lidar_instances_filtered = lidar_instance_tags[occ_mask]
 
+            static_vehicle_mask = np.isin(lidar_instances_filtered, list(parked_dynamic_vehicles))
             dynamic_semantic_mask = np.isin(lidar_tags_filtered, list(self.dynamic_classes))
 
-            static_pts = lidar_pts_ego_3d[~dynamic_semantic_mask]
+            static_pts = lidar_pts_ego_3d[~dynamic_semantic_mask | static_vehicle_mask]
             if static_pts.size > 0:
                 i_static, j_static = grid.world_to_grid(static_pts[:, 0], static_pts[:, 1])
                 static_cost_map[i_static, j_static] = self.static_obstacle_cost
@@ -554,7 +625,127 @@ class WorldMappingProcessor:
                 i_dyn, j_dyn = grid.world_to_grid(dynamic_pts[:, 0], dynamic_pts[:, 1])
                 dynamic_cost_map[i_dyn, j_dyn] = np.maximum(dynamic_cost_map[i_dyn, j_dyn], self.static_obstacle_cost)
 
-        return static_cost_map, dynamic_cost_map
+        return road_occupancy_map, static_cost_map, dynamic_cost_map
+
+    def _compute_road_cost(
+        self,
+        road_occupancy_map : np.ndarray,
+        grid : BEVGrid,
+        offroad_tau_m : float = 0.5,
+        max_offroad_cost : float = 200.0
+    ) -> np.ndarray:
+        # Compute distance transform (distance to nearest road boundary)
+        dist_cells = cv2.distanceTransform(road_occupancy_map, distanceType=cv2.DIST_L2, maskSize=5)
+
+        # Convert to meters
+        dist_m = dist_cells * grid.resolution
+
+        # Apply road inflation (Exponential decay from max cost offroad to 0 cost on road)
+        road_cost = max_offroad_cost * (1.0 - np.exp(-dist_m / max(offroad_tau_m, 1e-6)))
+
+        return road_cost.astype(np.float32)
+
+    def _compute_static_obstacle_cost(
+        self,
+        static_cost_map : np.ndarray,
+        grid : BEVGrid,
+        obstacle_inflation_radius_m : float = 1.0,
+        obstacle_max_cost : float = 255.0
+    ) -> np.ndarray:
+        # Convert to binary occupancy (0 cost = free space)
+        occ = (static_cost_map != 0).astype(np.uint8)
+
+        # Compute distance transform (distance to nearest obstacle)
+        dist = cv2.distanceTransform(1 - occ, distanceType=cv2.DIST_L2, maskSize=5)
+
+        # Convert to meters
+        dist_m = dist * grid.resolution
+
+        # Apply obstacle inflation
+        norm = np.clip(1.0 - (dist_m / obstacle_inflation_radius_m), 0.0, 1.0)
+        obstacle_cost = (norm ** 0.5) * obstacle_max_cost
+
+        # Hard block actual occupied cells
+        obstacle_cost[static_cost_map != 0] = obstacle_max_cost
+
+        return obstacle_cost.astype(np.float32)
+
+    def _compute_route_cost(
+        self,
+        route_points_grid : Tuple[np.ndarray, np.ndarray],
+        grid : BEVGrid,
+        route_inflation_radius_m : float = 1.5,
+        route_min_cost : float = 0.0,
+        route_max_cost : float = 50.0
+    ) -> np.ndarray:
+        grid_x, grid_y = route_points_grid
+
+        # Create route occupancy mask (0 = route)
+        route_mask = np.ones((grid.H, grid.W), dtype=np.uint8)
+        route_mask[grid_x, grid_y] = 0
+
+        # Compute distance transform (distance to nearest route point)
+        dist = cv2.distanceTransform(route_mask, distanceType=cv2.DIST_L2, maskSize=5)
+
+        # Convert to meters
+        dist_m = dist * grid.resolution
+
+        # Apply route inflation (0 near route, 1 when far)
+        norm = np.clip(dist_m / route_inflation_radius_m, 0.0, 1.0)
+        route_cost = route_min_cost + norm * (route_max_cost - route_min_cost)
+
+        return route_cost.astype(np.float32)
+
+    def augment_static_cost_map(
+        self,
+        road_cost_map : np.ndarray,
+        static_cost_map : np.ndarray,
+        ego_vehicle : carla.Actor,
+        route_points_world : np.ndarray,
+        grid : BEVGrid,
+        w_obst : float = 1.0,
+        w_route : float = 0.3,
+        w_road : float = 1.0,
+        max_cost : float = 255.0
+    ) -> np.ndarray:
+        # ############################################
+        # # Base Cost
+        # ############################################
+        road_cost = self._compute_road_cost(road_cost_map, grid)
+
+        # ############################################
+        # # Static Obstacle Inflation
+        # ############################################
+        obstacle_cost = self._compute_static_obstacle_cost(static_cost_map, grid)
+
+        # ############################################
+        # # Global Route Bias
+        # ############################################
+
+        # Transform world route points into ego frame
+        ego_tf = ego_vehicle.get_transform()
+        T_world_wrt_ego = np.array(ego_tf.get_inverse_matrix(), dtype=np.float32)
+        route_pts_ego = self.convert_frame_to_ego(route_points_world, T_world_wrt_ego)
+
+        # Convert to grid points
+        grid_x, grid_y = grid.world_to_grid(route_pts_ego[:, 0], route_pts_ego[:, 1])
+
+        # Get route cost
+        route_cost = self._compute_route_cost((grid_x, grid_y), grid)
+
+        # ############################################
+        # # Costmap Construction
+        # ############################################
+
+        # Weighted sum
+        cost_map = w_obst * obstacle_cost + w_route * route_cost + w_road * road_cost
+
+        # Hard block actual occupied cells
+        cost_map[static_cost_map != 0] = max_cost
+
+        cost_map = np.clip(cost_map, 0.0, max_cost)
+
+        return cost_map.astype(np.uint8)
 
     def get_cost_map(
         self,

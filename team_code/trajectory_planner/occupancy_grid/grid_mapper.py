@@ -6,7 +6,7 @@ import open3d as o3d
 
 from math import sqrt
 from dataclasses import dataclass
-from typing import Iterable, Optional, Sequence, Tuple, Set, Dict, List
+from typing import Iterable, Optional, Sequence, Tuple, Set, Dict, List, Any
 
 from team_code.trajectory_planner.occupancy_grid.sensor_data_processor import WorldMappingProcessor, BEVGrid
 from team_code.scene_descriptor.camera_interface import CameraInterface
@@ -57,6 +57,14 @@ class GridMapper:
 
         self.point_list = o3d.geometry.PointCloud()
 
+        # TESTING PAYLOAD
+        self.payload :Dict[str, Any] = {
+            'static_occupancy_map' : None,
+            'static_cost_map' : None,
+            'start_point_ego' : None,
+            'goal_point_ego' : None
+        }
+
     def setup_sensors(
         self,
         cameras : List[Tuple[str, carla.Sensor]],
@@ -86,30 +94,35 @@ class GridMapper:
     def update_maps(
         self,
         lidar_data: Dict,
-        route_points_world: Optional[np.ndarray] = None
+        route_points_world: np.ndarray
     ) -> Maps:
         ego_tf = self.ego_vehicle.get_transform()
-        # occupancy_map = self.processor.get_occupancy_map_visualize_lidar(
-        #     self.cameras,
-        #     self.lidar_sensor,
-        #     lidar_data,
-        #     ego_tf,
-        #     self.grid,
-        #     point_list=self.point_list
-        # )
-        static_cost_map, dynamic_cost_map = self.processor.get_base_cost_maps(
+
+        # Get base cost maps
+        road_cost_map, static_cost_map, dynamic_cost_map = self.processor.get_base_cost_maps(
             lidar_data,
             ego_tf,
             self.grid
         )
-        total_cost_map = np.maximum(static_cost_map, dynamic_cost_map)
-        occupancy_map = np.ones_like(static_cost_map, dtype=np.uint8)
+        occupancy_map = np.ones_like(road_cost_map, dtype=np.uint8)
+        occupancy_map[road_cost_map > 0] = 0
         occupancy_map[static_cost_map > 0] = 0
-        occupancy_map[dynamic_cost_map > 0] = 0
+        # occupancy_map[dynamic_cost_map > 0] = 0
 
-        cost_map = self.processor.get_cost_map(
-            occupancy_map
+        # Augment static cost map with route information
+        static_cost_map_route = self.processor.augment_static_cost_map(
+            road_cost_map,
+            static_cost_map,
+            self.ego_vehicle,
+            route_points_world,
+            self.grid
         )
+
+        # total_cost_map = np.maximum(static_cost_map_route, dynamic_cost_map)
+
+        # cost_map = self.processor.get_cost_map(
+        #     occupancy_map
+        # )
 
         # occupancy_map = self.processor.get_occupancy_map_multiview_camera(
         #     self.cameras,
@@ -119,23 +132,18 @@ class GridMapper:
         #     self.grid,
         # )
 
+        # TESTING PAYLOAD
+        self.payload['static_occupancy_map'] = occupancy_map
+        self.payload['static_cost_map'] = static_cost_map_route
+
         return Maps(
             occupancy_map=occupancy_map,
             instance_map=None,
             semantic_map=None,
             base_cost_map=None,
             dynamic_cost_map=None,
-            total_cost_map=total_cost_map
+            total_cost_map=static_cost_map_route
         )
-
-        # return Maps(
-        #     occupancy_map=occupancy_map,
-        #     instance_map=self.point_list,
-        #     semantic_map=None,
-        #     base_cost_map=None,
-        #     dynamic_cost_map=None,
-        #     total_cost_map=None
-        # )
 
     def generate_astar_path(
         self,
@@ -163,6 +171,10 @@ class GridMapper:
 
         # Convert ego points to grid frame
         ego_pts_2d = (world_pts_4d @ T_world_wrt_ego.T)[:, :2]
+
+        # TESTING PAYLOAD
+        self.payload['start_point_ego'] = ego_pts_2d[0, :]
+        self.payload['goal_point_ego'] = ego_pts_2d[1, :]
 
         # print(f'ego points: {ego_pts_2d}')
         # print(f'ego points shape: {ego_pts_2d.shape}')
