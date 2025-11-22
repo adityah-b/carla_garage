@@ -30,3 +30,5 @@ GLOBAL SAFETY AND SEQUENCING RULES
 - Match target-lane flow speed before crossing lane boundary.
 - Prefer creating a gap via slight increases/decreases in speed before initiating the lane change.
 - Monotonicity: requesting higher 'spd' must NOT reduce 't_head' or 'f_dist' UNLESS changing lanes.
+- ONLY call change_lane_left/change_lane_right for LANE CHANGES, call follow_route when making left or right TURNS.
+- You must ONLY call follow_route AFTER any CONDITIONAL or LATERAL COMMANDS. NEVER at the beginning of a sequence

@@ -1,33 +1,50 @@
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 from enum import Enum
 
 class Action(str, Enum):
+    ########################################
+    # LONGITUDINAL
+    ########################################
+
     FOLLOW_ROUTE = "follow_route"
-    STOP_FOR = "stop_for"
-    YIELD_FOR = "yield_for"
+    # HOLD_POSITION = "hold_position"
+
+    ########################################
+    # LATERAL
+    ########################################
+
+    # Turns
+    TURN_LEFT = "turn_left"
+    TURN_RIGHT = "turn_right"
+
+    # Lane changes
     CHANGE_LANE_LEFT = "change_lane_left"
     CHANGE_LANE_RIGHT = "change_lane_right"
 
-class LongitudinalParams(BaseModel):
-    spd: Optional[float] = Field(default=None, ge=0.0, description="Desired absolute speed setpoint in m/s")
-    t_head: Optional[float] = Field(default=1.5, ge=1.0, le=2.5, description="Desired time headway in seconds. Larger = more cautious")
-    f_dist: Optional[float] = Field(default=4.0, ge=2.0, le=8.0, description="Desired following distance in metres. Larger = more cautious")
+    # Overtakes
+    OVERTAKE_LEFT = "overtake_left"
+    OVERTAKE_RIGHT = "overtake_right"
 
-class LateralParams(BaseModel):
-    gap_time: float = Field(default=1.5, ge=1.0, le=3.0, description="Minimum acceptable time gap in target lane (ahead and behind) in seconds")
-    gap_dist: float = Field(default=10.0, ge=4.0, le=30.0, description="Minimum acceptable distance margins in target lane (ahead and behind) in metres")
+class ConditionAction(str, Enum):
+    YIELD_FOR = "yield_for"
+    STOP_FOR = "stop_for"
+    WATCH_OUT_FOR = "watch_out_for"
 
-class ConditionalParams(BaseModel):
-    target : Literal["vehicle", "cyclist", "ped", "obstacle", "stop_sign", "traffic_light"] = Field(description="The type of the target object")
+class ConditionCommand(BaseModel):
+    condition_action : ConditionAction
     id : int = Field(description="The actor ID of the chosen target")
-
-class LowLevelAction(BaseModel):
-    action : Action
-    longitudinal_params : Optional[LongitudinalParams] = None
-    lateral_params : Optional[LateralParams] = None
-    conditional_params : Optional[ConditionalParams] = None
+    obj_type : Literal["vehicle", "cyclist", "ped", "obstacle", "stop_sign", "traffic_light"] = Field(description="The type of the target object")
+    importance : float = 1.0
 
 class EgoPlan(BaseModel):
-    plan : List[LowLevelAction] = Field(min_length=1)
+    # High-level action
+    action : Action
+
+    # Optional adjustment parameters
+    target_speed : Optional[float] = None
+    # target_route_adjustments : Optional[List[Tuple[float, float]]] = None
+
+    # Conditions
+    conditions : List[ConditionCommand]
     reasoning : List[str] = Field(min_length=1, description="Step by step reasoning on why each step and parameter choice is valid")

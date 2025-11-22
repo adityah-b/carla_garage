@@ -1,11 +1,11 @@
 scenario:
-<one paragraph natural language summary describing the driving scenario from the provided image and text along with the necessary high-level driving behaviours to navigate the scenario>
+<one paragraph natural language summary describing the driving scenario from the provided image and text along with the necessary high-level driving behaviour to navigate the scenario>
 
 key_actors:
 1) actor = {
         'id' : <key_actor_id>,
-        'type' : <vehicle | ped | cyclist | traffic_light | stop_sign>,
-        'traffic' : <leading | trailing | oncoming | cross | None>,
+        'type' : <vehicle | ped | cyclist | traffic_light | stop_sign | obstacle>,
+        'traffic' : <leading | trailing | oncoming | cross | other>,
    }
 2) ...
 

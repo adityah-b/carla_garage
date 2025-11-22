@@ -84,12 +84,18 @@ class HighLevelBehaviourParser:
             if "id" not in kvs or "type" not in kvs:
                 continue
 
+            id_raw = kvs["id"]
+            id = None if id_raw in (None, "None") else int(id_raw)
+
+            obj_type_raw = kvs["type"]
+            obj_type = None if obj_type_raw in (None, "None") else str(obj_type_raw)
+
             traffic_raw = kvs.get("traffic")
             traffic = None if traffic_raw in (None, "None") else str(traffic_raw)
 
             actors.append({
-                "id": int(kvs["id"]),
-                "type": str(kvs["type"]),
+                "id": id,
+                "type": obj_type,
                 "traffic": traffic
             })
 

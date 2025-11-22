@@ -1,18 +1,21 @@
-plan:
-<sequence list using ONLY: follow_route, stop_for, yield_for, change_lane_left, change_lane_right>
-1) <action_name>:
-   longitudinal_params = {
-     'spd': <number>, 't_head': <number>, 'f_dist': <number>
-   }
-2) <action_name>:
-   lateral_params = {
-     'gap_time': <number>, 'gap_dist': <number>
-   }
-3) <action_name>:
-   conditional_params = {
-     'target' : <string>, 'id' : <number>
-   }
-4) ...
+action:
+<low level action using ONLY: follow_route, turn_left, turn_right, change_lane_left, change_lane_right, overtake_left, overtake_right>
+
+target_speed:
+<optional target speed for maneuver>
+
+target_route_adjustments:
+<optional route adjustments for lateral maneuvers as list of [x,y] coordinates>
+
+conditions:
+<optional list of conditions using ONLY: yield_for, stop_for, watch_out_for>
+1) <condition_1>:
+   condition_action: ConditionAction
+   id: int
+   obj_type: str
+   importance: float
+2) ...
+
 reasoning:
-1. <Why each step and parameter choice is valid; cite memory IDs if used, e.g., "Uses Memory 2, 5">
+1. <Why each condition is necessary; cite memory IDs if used, e.g., "Uses Memory 2, 5">
 2. ...

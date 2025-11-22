@@ -4,51 +4,61 @@ import os
 import pathlib
 from dataclasses import dataclass, asdict
 from enum import Enum, auto
-from typing import Any, Iterable, List, Mapping, Protocol, Sequence
+from typing import Any, Iterable, List, Dict
 from pydantic import BaseModel
 
 from .message_api import *
-from .api_clients import OpenAIClient, OpenRouterClient
+from .api_clients import *
 
 class ModelCatalogue:
-    _catalogue : Mapping[str, Sequence[str]] = {
-        "openai": ["openai/gpt-4.1-2025-04-14"],
-        "qwen": ["qwen/qwen2.5-vl-72b-instruct:free"],
-        "google": ["google/gemini-2.5-flash"],
-        "anthropic": ["anthropic/claude-3-7-sonnet-20250219"],
+    _clients : Dict[str, APIClient] = {
+        "openai" : OpenAIClient,
+        "openrouter" : OpenRouterClient,
+        "vllm" : VLLMClient
     }
 
-    @classmethod
-    def validate(cls, model_name: str):
-        provider = model_name.split("/", 1)[0]
-        if provider not in cls._catalogue:
+    _catalogue : Dict[str, List[str]] = {
+        "openai" : ["gpt-4.1-mini-2025-04-14"],
+        "openrouter" : ["openai/gpt-4.1-2025-04-14", "qwen/qwen2.5-vl-72b-instruct:free", "google/gemini-2.5-flash", "anthropic/claude-3-7-sonnet-20250219"],
+        "vllm" : ["Qwen/Qwen2.5-VL-72B-Instruct-AWQ", "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"],
+    }
+
+    @staticmethod
+    def validate(provider : str, model_name: str):
+        if provider not in ModelCatalogue._catalogue:
             raise ValueError(
-                f"Unknown provider '{provider}'. Valid providers: {list(cls._catalogue)}"
+                f"Unknown provider '{provider}'. Valid providers: {list(ModelCatalogue._catalogue)}"
             )
-        if model_name not in cls._catalogue[provider]:
+        if model_name not in ModelCatalogue._catalogue[provider]:
             raise ValueError(
                 f"Unknown model '{model_name}' for provider '{provider}'. "
-                f"Choices: {cls._catalogue[provider]}"
+                f"Choices: {ModelCatalogue._catalogue[provider]}"
             )
 
-    @classmethod
-    def providers(cls) -> Sequence[str]:
-        return tuple(cls._catalogue)
+    @staticmethod
+    def providers() -> List[str]:
+        return tuple(ModelCatalogue._catalogue)
 
-    @classmethod
-    def models(cls, provider: str) -> Sequence[str]:
-        return tuple(cls._catalogue[provider])
+    @staticmethod
+    def models(provider: str) -> List[str]:
+        return tuple(ModelCatalogue._catalogue[provider])
+
+    @staticmethod
+    def client(provider : str) -> APIClient:
+        return ModelCatalogue._clients[provider]
 
 class VLMAgent:
-    def __init__(self, model_name: str, **kwargs: Any):
-        # ModelCatalogue.validate(model_name)
+    def __init__(self, provider : str, model_name: str, **kwargs: Any):
+        ModelCatalogue.validate(provider, model_name)
 
         self.model_name = model_name
-        # self.client = OpenRouterClient(self.model_name)
-        self.client = OpenAIClient(self.model_name)
+        self.provider = provider
+
+        self.client = ModelCatalogue.client(provider)(self.model_name)
 
         self.temperature = kwargs.get("temperature", 0.0)
-        self.max_output_tokens = kwargs.get("max_output_tokens", 500)
+        self.max_output_tokens = kwargs.get("max_output_tokens", 2048)
+        print(f'max_output_tokens: {self.max_output_tokens}')
 
     def create_user_message(self, text : str = None, image : Union[Path, np.ndarray] = None) -> Message:
         builder = MessageBuilder(MessageRole.USER)
