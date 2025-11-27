@@ -138,9 +138,10 @@ class OpenRouterClient(APIClient):
 class VLLMClient(APIClient):
     def __init__(self, model_name : str):
         self.api_key = os.getenv("VLLM_API_KEY", "EMPTY")
-        # self.base_url = "http://0.0.0.0:8000/v1"
+        # self.base_url = "http://localhost:8000/v1"
         # self.base_url = "http://127.0.0.1:8000/v1"
-        self.base_url = "http://192.168.42.200:8000/v1"
+        # self.base_url = "http://192.168.42.200:8000/v1"
+        self.base_url = "http://192.168.42.135:8000/v1"
 
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         self.model_name = model_name

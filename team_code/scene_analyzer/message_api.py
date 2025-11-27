@@ -34,7 +34,7 @@ class Message:
 class ImageEncoder:
     @staticmethod
     def encode_image(image: Union[Path, np.ndarray]) -> str:
-        def resize_image(img: np.ndarray, scale: float = 0.3) -> np.ndarray:
+        def resize_image(img: np.ndarray, scale: float = 0.5) -> np.ndarray:
             height, width = img.shape[:2]
             new_size = (int(width * scale), int(height * scale))
             return cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)

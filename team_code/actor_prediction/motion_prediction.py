@@ -9,7 +9,7 @@ from privileged_route_planner import PrivilegedRoutePlanner
 from scene_descriptor.data_extractors.vehicle_data_extractor import LaneVehicleData
 from scene_descriptor.data_extractors.ped_data_extractor import PedestrianData
 
-from .geometric_utils import GeometricUtils
+from .collision_checker import CollisionChecker, CollisionInterval
 from .trajectory_forecasting import MotionForecaster
 
 @dataclass(frozen=True, slots=True)
@@ -67,29 +67,52 @@ class MotionPrediction:
         self,
         vehicle_traffic : Dict[str, Dict[str, List[LaneVehicleData]]]
     ) -> Dict[int, List[carla.BoundingBox]]:
+        if not vehicle_traffic:
+            return {}
+
         forecasted_vehicle_bbs = {}
         forecast_length = self.config.default_forecast_length
         num_future_frames = int(self.config.bicycle_frame_rate * forecast_length)
 
         predicted_waypoints = self._predict_vehicle_waypoints(vehicle_traffic)
-        for vehicle, wps in predicted_waypoints.items():
-            # Supersample path
-            veh_route_pts = [wp.transform.location for wp in wps]
-            veh_route_pts = np.array([[loc.x, loc.y, loc.z] for loc in veh_route_pts])
-            veh_route_pts, _ = self.waypoint_planner.smooth_and_supersample(veh_route_pts)
-
-            forecasted_vehicle_bbs[vehicle.id] = self.forecaster.forecast_vehicle_bbs(
-                vehicle=vehicle,
-                vehicle_route_points=veh_route_pts,
-                num_future_frames=num_future_frames
+        all_vehicles = list(predicted_waypoints.keys())
+        if all_vehicles:
+            return self.forecaster.forecast_vehicle_bbs_array(
+                    all_vehicles,
+                    num_future_frames=num_future_frames
             )
+        return {}
 
-        return forecasted_vehicle_bbs
+    # def predict_vehicle_motion(
+    #     self,
+    #     vehicle_traffic : Dict[str, Dict[str, List[LaneVehicleData]]]
+    # ) -> Dict[int, List[carla.BoundingBox]]:
+    #     forecasted_vehicle_bbs = {}
+    #     forecast_length = self.config.default_forecast_length
+    #     num_future_frames = int(self.config.bicycle_frame_rate * forecast_length)
+
+    #     predicted_waypoints = self._predict_vehicle_waypoints(vehicle_traffic)
+    #     for vehicle, wps in predicted_waypoints.items():
+    #         # Supersample path
+    #         veh_route_pts = [wp.transform.location for wp in wps]
+    #         veh_route_pts = np.array([[loc.x, loc.y, loc.z] for loc in veh_route_pts])
+    #         veh_route_pts, _ = self.waypoint_planner.smooth_and_supersample(veh_route_pts)
+
+    #         forecasted_vehicle_bbs[vehicle.id] = self.forecaster.forecast_vehicle_bbs(
+    #             vehicle=vehicle,
+    #             vehicle_route_points=veh_route_pts,
+    #             num_future_frames=num_future_frames
+    #         )
+
+    #     return forecasted_vehicle_bbs
 
     def predict_ped_motion(
         self,
         peds : List[PedestrianData]
     ) -> Dict[int, List[carla.BoundingBox]]:
+        if not peds:
+            return {}
+
         forecast_length = self.config.default_forecast_length
         num_future_frames = int(self.config.bicycle_frame_rate * forecast_length)
 
@@ -106,16 +129,3 @@ class MotionPrediction:
         num_future_frames = int(self.config.bicycle_frame_rate * forecast_length)
 
         return self.forecaster.forecast_vehicle_bbs(ego_vehicle, ego_route_pts, num_future_frames, target_speed)
-
-    def check_collision_point(
-        self,
-        bounding_boxes_a : List[carla.BoundingBox],
-        bounding_boxes_b : List[carla.BoundingBox]
-    ) -> Tuple[bool, Optional[carla.BoundingBox], Optional[carla.BoundingBox]]:
-        for i, bb_a in enumerate(bounding_boxes_a):
-            bb_b = bounding_boxes_b[i]
-            bb_intersects = GeometricUtils.check_obb_intersection(bb_a, bb_b)
-            if bb_intersects:
-                return (bb_intersects, bb_a, bb_b)
-
-        return (False, None, None)

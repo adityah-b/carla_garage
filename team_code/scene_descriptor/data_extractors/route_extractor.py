@@ -48,6 +48,7 @@ class RouteData:
 
     # highway merge
 
+# TODO: Store intersection and lane change state so as to avoid recomputing the same shit
 class RouteDataExtractor:
     LOOKAHEAD_DISTANCE = 50.0
 
@@ -190,7 +191,7 @@ class RouteDataExtractor:
         for i in range(route_index, to_index):
             cmd = route_cmds[i]
             wp = route_wps[i]
-            if (wp.is_junction) and (cmd in (RoadOption.LEFT, RoadOption.STRAIGHT, RoadOption.RIGHT)):
+            if (wp.is_junction) and (cmd in (RoadOption.LEFT, RoadOption.STRAIGHT, RoadOption.LANEFOLLOW, RoadOption.RIGHT)):
                 intersection_idx = i
                 intersection_cmd = cmd
                 break
@@ -206,15 +207,16 @@ class RouteDataExtractor:
         while (end_idx < max_route_length) and route_wps[end_idx].is_junction and route_cmds[end_idx] == intersection_cmd:
             end_idx +=1
 
-        next_tl = planner_state.next_traffic_lights[start_idx]
-        next_ss = planner_state.next_stop_signs[start_idx]
+        dist_next_tl = planner_state.dist_to_next_traffic_lights[start_idx]
+        dist_next_ss = planner_state.dist_to_next_stop_signs[start_idx]
 
-        if next_tl and not next_ss:
+        if dist_next_tl == np.inf and dist_next_ss == np.inf:
+            return None
+
+        if dist_next_tl < dist_next_ss:
             signalized = IntersectionType.SIGNALIZED
-        elif not next_tl and next_ss:
-            signalized = IntersectionType.UNSIGNALIZED
         else:
-            signalized = IntersectionType.OTHER
+            signalized = IntersectionType.UNSIGNALIZED
 
         return (intersection_cmd, start_idx, end_idx, signalized)
 

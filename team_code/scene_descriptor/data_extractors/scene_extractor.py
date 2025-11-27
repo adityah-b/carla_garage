@@ -10,6 +10,7 @@ from .traffic_data_extractor import TrafficData, TrafficDataExtractor
 from .ego_data_extractor import EgoVehicleData, EgoVehicleDataExtractor
 from .vehicle_data_extractor import LaneVehicleData, VehicleDataExtractor
 from .ped_data_extractor import PedestrianData, PedestrianDataExtractor
+from .obstacle_data_extractor import ObstacleData, ObstacleDataExtractor
 from .route_extractor import RouteData, RouteDataExtractor
 
 @dataclass(frozen=True, slots=True)
@@ -18,6 +19,7 @@ class SceneData:
     ego_data : Optional[EgoVehicleData]
     vehicle_data : Optional[Dict[str, Dict[str, List[LaneVehicleData]]]]
     ped_data : Optional[List[PedestrianData]]
+    obstacle_data : Optional[List[ObstacleData]]
     route_data : Optional[RouteData]
 
 
@@ -30,13 +32,15 @@ class SceneExtractor:
         self._ego_extractor = EgoVehicleDataExtractor(self.config)
         self._vehicle_extractor = VehicleDataExtractor(self.config, self.carla_map)
         self._ped_extractor = PedestrianDataExtractor(self.config, self.carla_map)
+        self._obstacle_extractor = ObstacleDataExtractor(self.config, self.carla_map)
         self._route_extractor = RouteDataExtractor(self.config)
 
     def extract_scene(
         self,
         ego_vehicle : carla.Vehicle,
         actors : carla.ActorList,
-        planner_state : PlannerState
+        planner_state : PlannerState,
+        lidar_data : Dict,
     ) -> SceneData:
         ego_wp = self.carla_map.get_waypoint(ego_vehicle.get_location(), lane_type=carla.LaneType.Any)
         ego_loc = ego_vehicle.get_location()
@@ -57,6 +61,17 @@ class SceneExtractor:
         ]
         ped_data = self._ped_extractor.extract_ped_data(ego_wp=ego_wp, peds=pedestrians)
 
+        static_obstacles = list(actors.filter("static.*"))
+        # Check if actor is dynamically spawned non-moving vehicle (treat as static object)
+        for vehicle in npc_vehicles:
+            veh_control = vehicle.get_control()
+            if veh_control.hand_brake:
+                static_obstacles.append(vehicle)
+
+        obstacle_data = self._obstacle_extractor.extract_obstacle_data(
+            ego_wp=ego_wp, obstacles=static_obstacles, planner_state=planner_state, lidar_data=lidar_data
+        )
+
         route_data = self._route_extractor.extract_route_data(ego_vehicle, ego_wp, planner_state)
 
         return SceneData(
@@ -64,5 +79,6 @@ class SceneExtractor:
             ego_data=ego_data if ego_data else None,
             vehicle_data=vehicle_data if vehicle_data else None,
             ped_data=ped_data if ped_data else None,
+            obstacle_data=obstacle_data if obstacle_data else None,
             route_data=route_data if route_data else None,
         )

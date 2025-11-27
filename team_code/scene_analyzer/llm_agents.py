@@ -57,8 +57,7 @@ class VLMAgent:
         self.client = ModelCatalogue.client(provider)(self.model_name)
 
         self.temperature = kwargs.get("temperature", 0.0)
-        self.max_output_tokens = kwargs.get("max_output_tokens", 2048)
-        print(f'max_output_tokens: {self.max_output_tokens}')
+        self.max_output_tokens = kwargs.get("max_output_tokens", 4096)
 
     def create_user_message(self, text : str = None, image : Union[Path, np.ndarray] = None) -> Message:
         builder = MessageBuilder(MessageRole.USER)

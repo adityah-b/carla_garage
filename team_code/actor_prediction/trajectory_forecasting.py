@@ -42,6 +42,81 @@ class MotionForecaster:
 
         return vehicle_route_points[route_index + route_index_offset:], route_index_offset
 
+    def forecast_vehicle_bbs_array(
+        self,
+        nearby_actors : List[carla.Vehicle],
+        num_future_frames : int
+    ) -> Dict[int, List[carla.BoundingBox]]:
+        predicted_bounding_boxes = {}
+
+        previous_controls = [actor.get_control() for actor in nearby_actors]
+        previous_actions = np.array([[control.steer, control.throttle, control.brake] for control in previous_controls])
+
+        # Get the current velocities, locations, and headings of the nearby actors
+        velocities = np.array([actor.get_velocity().length() for actor in nearby_actors])
+        locations = np.array([[actor.get_location().x,
+                               actor.get_location().y,
+                               actor.get_location().z] for actor in nearby_actors])
+        headings = np.deg2rad(np.array([actor.get_transform().rotation.yaw for actor in nearby_actors]))
+
+        # Initialize arrays to store future locations, headings, and velocities
+        future_locations = np.empty((num_future_frames, len(nearby_actors), 3), dtype="float")
+        future_headings = np.empty((num_future_frames, len(nearby_actors)), dtype="float")
+        future_velocities = np.empty((num_future_frames, len(nearby_actors)), dtype="float")
+
+        # Forecast the future locations, headings, and velocities for the nearby actors
+        for i in range(num_future_frames):
+            locations, headings, velocities = self.vehicle_model.forecast_other_vehicles(
+                locations, headings, velocities, previous_actions)
+            future_locations[i] = locations.copy()
+            future_velocities[i] = velocities.copy()
+            future_headings[i] = headings.copy()
+
+        # Convert future headings to degrees
+        future_headings = np.rad2deg(future_headings)
+
+        # Calculate the predicted bounding boxes for each nearby actor and future frame
+        for actor_idx, actor in enumerate(nearby_actors):
+            predicted_actor_boxes = []
+
+            for i in range(num_future_frames):
+                # Calculate the future location of the actor
+                location = carla.Location(x=future_locations[i, actor_idx, 0].item(),
+                                        y=future_locations[i, actor_idx, 1].item(),
+                                        z=future_locations[i, actor_idx, 2].item())
+
+                # Calculate the future rotation of the actor
+                rotation = carla.Rotation(pitch=0, yaw=future_headings[i, actor_idx], roll=0)
+
+                # Get the extent (dimensions) of the actor's bounding box
+                extent = actor.bounding_box.extent
+                # Otherwise we would increase the extent of the bounding box of the vehicle
+                extent = carla.Vector3D(x=extent.x, y=extent.y, z=extent.z)
+
+                # Adjust the bounding box size based on velocity and lane change maneuver to adjust for
+                # uncertainty during forecasting
+                s = self.config.high_speed_min_extent_x_other_vehicle
+                extent.x *= self.config.slow_speed_extent_factor_ego if future_velocities[
+                    i, actor_idx] < self.config.extent_other_vehicles_bbs_speed_threshold else max(
+                        s,
+                        self.config.high_speed_min_extent_x_other_vehicle * float(i) / float(num_future_frames))
+                extent.y *= self.config.slow_speed_extent_factor_ego if future_velocities[
+                    i, actor_idx] < self.config.extent_other_vehicles_bbs_speed_threshold else max(
+                        self.config.high_speed_min_extent_y_other_vehicle,
+                        self.config.high_speed_extent_y_factor_other_vehicle * float(i) / float(num_future_frames))
+
+                # Create the bounding box for the future frame
+                bounding_box = carla.BoundingBox(location, extent)
+                bounding_box.rotation = rotation
+
+                # Append the bounding box to the list of predicted bounding boxes for this actor
+                predicted_actor_boxes.append(bounding_box)
+
+            # Store the predicted bounding boxes for this actor in the dictionary
+            predicted_bounding_boxes[actor.id] = predicted_actor_boxes
+
+        return predicted_bounding_boxes
+
     def forecast_vehicle_bbs(
         self,
         vehicle : carla.Vehicle,
@@ -57,7 +132,7 @@ class MotionForecaster:
         vehicle_heading_angle = np.array([np.deg2rad(vehicle.get_transform().rotation.yaw)])
         vehicle_speed = np.array([vehicle.get_velocity().length()])
 
-        vehicle_target_speed = np.array([target_speed]) if target_speed else vehicle_speed
+        vehicle_target_speed = np.array([target_speed]) if target_speed is not None else vehicle_speed
 
         # Calculate the throttle command based on the target speed and current speed
         throttle = self.long_controller.get_throttle_extrapolation(vehicle_target_speed, vehicle_speed)

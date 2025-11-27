@@ -17,7 +17,7 @@ class SceneAnalyzer(VLMAgent):
         model_name: str,
         **kwargs
     ):
-        super().__init__(provider, model_name, kwargs=kwargs)
+        super().__init__(provider, model_name, **kwargs)
 
         self.sys_prompts = SysPrompts()
         self.planning_memory = PlannerMemory()
@@ -56,7 +56,7 @@ class SceneAnalyzer(VLMAgent):
 
         print(f'\n\nPlanning Prompt\n\n')
         print(f'{plan_prompt}')
-        user_message = self.create_user_message(text=plan_prompt, image=None)
+        user_message = self.create_user_message(text=plan_prompt, image=image)
 
         messages = [system_message, user_message]
 

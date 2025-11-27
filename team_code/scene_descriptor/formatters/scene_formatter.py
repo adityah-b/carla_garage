@@ -4,6 +4,7 @@ from .ego_formatter import EgoVehicleFormatter
 from .vehicle_formatter import VehicleFormatter
 from .traffic_formatter import TrafficFormatter
 from .ped_formatter import PedestrianFormatter
+from .obstacle_formatter import ObstacleFormatter
 from .route_formatter import RouteFormatter
 
 class SceneFormatter:
@@ -21,6 +22,8 @@ class SceneFormatter:
             formatted_text.append(VehicleFormatter.format_vehicles(grouped_vehicles=scene_data.vehicle_data, precision=precision))
         if scene_data.ped_data:
             formatted_text.append(PedestrianFormatter.format_pedestrians(peds=scene_data.ped_data, precision=precision))
+        if scene_data.obstacle_data:
+            formatted_text.append(ObstacleFormatter.format_obstacles(obstacles=scene_data.obstacle_data, precision=precision))
         if scene_data.route_data:
             formatted_text.append(RouteFormatter.format_route(route_data=scene_data.route_data, precision=precision))
 
