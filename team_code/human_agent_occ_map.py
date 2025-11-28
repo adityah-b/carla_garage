@@ -39,19 +39,45 @@ from scene_descriptor.data_extractors.lane_handler import LaneHandler, WaypointU
 # Privileged route planner
 from config import GlobalConfig
 
+# Vehicle data extractor
+from scene_descriptor.data_extractors.vehicle_data_extractor import VehicleDataExtractor
+
+# Vehicle formatter
+from scene_descriptor.formatters.vehicle_formatter import VehicleFormatter
+
+# Vehicle predictor
+from team_code.actor_prediction.motion_prediction import MotionPrediction
+
 # Scene descriptor
 from scene_descriptor.scene_descriptor import SceneDescriptor
 import cv2
 
 # Trajectory planner
 from trajectory_planner.trajectory_planner import TrajectoryPlanner
-from trajectory_planner.occupancy_grid.grid_mapper import GridMapper, Maps
+
+# Lateral planner
+from local_planner.lateral.config_specs import *
+from local_planner.lateral.lat_planner import LatPlanner
 
 from pprint import pprint
 from scene_analyzer.parsers.ego_plan_parser import *
 
 
 import open3d as o3d
+
+from datetime import datetime
+import os
+import json
+from pathlib import Path
+import pickle
+
+def bbox_to_vec7(bb):
+    return np.array([
+        bb.location.x, bb.location.y, bb.location.z,
+        bb.extent.x,   bb.extent.y,   bb.extent.z,
+        bb.rotation.yaw
+    ], dtype=np.float32)
+
 
 color_red     = carla.Color(r=100, g=0,   b=0)
 color_green   = carla.Color(r=0,   g=100, b=0)
@@ -134,6 +160,7 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
         Setup the agent parameters
         """
         self.track = Track.MAP
+        self.config_path = path_to_conf_file
 
         self.agent_engaged = False
         self.camera_width = 1280
@@ -161,6 +188,12 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
         # Setup privileged waypoint planner
         self.config = GlobalConfig()
 
+        # Setup vehicle data extractor
+        self.vehicle_data_extractor = VehicleDataExtractor(self.config, self.world_map)
+
+        # Setup vehicle predictor
+        self.vehicle_predictor = MotionPrediction(self.config, self.world_map)
+
         # Setup scene descriptor
         self.scene_descriptor = SceneDescriptor(self.config, self.world_map)
 
@@ -168,15 +201,22 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
 
         # Setup trajectory planner
         self.trajectory_planner = TrajectoryPlanner(self.config, self.world_map, self.ego_agent)
+        scenario_name = os.environ['SCENARIO_NAME']
+        starts_with_parking_exit = True if "ParkingExit" in scenario_name else False
+        print(f'starts_with_parking_exit: {starts_with_parking_exit}, scenario_name: {scenario_name}')
         self.trajectory_planner.setup_route(
             self.org_dense_route_world_coord,
             self.world,
             self.world_map,
-            False,
+            starts_with_parking_exit,
             self.ego_agent.get_location()
         )
+        print(f'Initial route index: {self.trajectory_planner.waypoint_planner.route_index}')
 
-        self.grid_mapper = GridMapper(self.ego_agent)
+        # Lateral planner
+        lat_algo_spec = LatAlgoSpec()
+        lat_grid_spec = LatGridSpec()
+        self.lat_planner = LatPlanner(self.ego_agent, lat_grid_spec=lat_grid_spec, lat_algo_spec=lat_algo_spec)
 
         # OPEN3D VISUALIZATION
         # self.vis = o3d.visualization.Visualizer()
@@ -445,15 +485,10 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
         cv2.imshow("BirdView RGB", bb_final)
         cv2.waitKey(1)
 
-        # Set grid mapper camera data
-        # grid_mapper_image_obvs = []
-        # for tag in self.grid_mapper_cam_tags:
-        #     grid_mapper_image_obvs.append((tag, input_data[tag][1][:, :, :3]))
-        # self.grid_mapper.set_camera_observations(grid_mapper_image_obvs)
-
         semantic_lidar_data = input_data['lidar_semantic']
 
-        lookahead_distance = 20 * self.config.points_per_meter
+        print(f'Cur route_index: {planner_state.route_index}')
+        lookahead_distance = 40 * self.config.points_per_meter
         num_route_points = planner_state.route_points.shape[0]
         if num_route_points > 0:
             route_end_index = min(
@@ -469,85 +504,146 @@ class HumanAgent(autonomous_agent_local.AutonomousAgent):
             route_end_index = planner_state.route_index
             route_points_subset = np.empty((0, 3), dtype=np.float32)
 
-        maps : Maps = self.grid_mapper.update_maps(
-            semantic_lidar_data[1],
-            route_points_world=route_points_subset
+        # Draw route subset
+        loc = carla.Location(cur_loc.x, cur_loc.y, cur_loc.z + 0.1)
+        cmd_str = f'{planner_state.route_index}'
+        self.world.debug.draw_string(
+          location=loc,
+          text=cmd_str,
+          color=self.config.other_vehicles_forecasted_bbs_color,
+          life_time=self.config.draw_life_time
         )
 
-        occupancy_map = maps.occupancy_map
-        occ_img = (occupancy_map * 255).astype(np.uint8)
-        cost_map = maps.total_cost_map
-        heat_map = cv2.applyColorMap(cost_map, cv2.COLORMAP_TURBO)
+        for i in range(min(route_points_subset.shape[0] - 1, lookahead_distance)):
+            loc = route_points_subset[i]
+            loc = carla.Location(loc[0], loc[1], loc[2] + 0.1)
+            self.world.debug.draw_point(location=loc,
+                                        size=0.05,
+                                        color=self.config.future_route_color,
+                                        life_time=self.config.draw_life_time)
 
-        # Generate A* path
-        if num_route_points > 0:
-            to_index = max(
-                planner_state.route_index,
-                route_end_index - 1
-            )
-        else:
-            to_index = planner_state.route_index
 
         start_point_world = ego_location
-        if num_route_points > 0:
-            goal_point_world = planner_state.route_points[to_index]
-        else:
-            goal_point_world = start_point_world
+        goal_point_world = route_points_subset[-1]
 
-        # print(f'start point: {start_point_world}')
-        # print(f'start point shape: {start_point_world.shape}')
+        # VEHICLE PREDICTION
+        all_vehicle_traffic = self.vehicle_data_extractor.extract_vehicle_data(cur_wp, planner_state, npc_vehicles)
+        veh_data_str = VehicleFormatter.format_vehicles(all_vehicle_traffic)
 
-        # print(f'goal point: {goal_point_world}')
-        # print(f'goal point shape: {goal_point_world.shape}')
-        # print(f'start to goal distance: {np.linalg.norm(goal_point_world - start_point_world)}')
+        # print(f'\n\nFormatted Vehicles\n\n')
+        # print(f'{veh_data_str}')
 
-        astar_path_grid, path_world_3d = self.grid_mapper.generate_astar_path(
-            maps.occupancy_map,
-            maps.total_cost_map,
-            start_point_world,
-            goal_point_world
+        forecasted_bbs = self.vehicle_predictor.predict_vehicle_motion(all_vehicle_traffic)
+        speed_limit = 0.72 * planner_state.speed_limits[planner_state.route_index]
+        # print(f'Speed Limit: {speed_limit}')
+        ego_bbs = self.vehicle_predictor.predict_ego_motion(
+            self.ego_agent,
+            planner_state.route_points[planner_state.route_index:],
+            speed_limit
         )
 
-        # Draw on occupancy image
-        H, W = occupancy_map.shape
-        occ_bgr = cv2.cvtColor(occ_img, cv2.COLOR_GRAY2BGR)
+        # for v_data, bbs in forecasted_bbs.items():
+        #     for bb in bbs:
+        #         self.world.debug.draw_box(box=bb,
+        #                             rotation=bb.rotation,
+        #                             thickness=0.1,
+        #                             color=self.config.other_vehicles_forecasted_bbs_color,
+        #                             life_time=self.config.draw_life_time)
 
-        pts = np.asarray([(c_, r_) for (r_, c_) in astar_path_grid], dtype=np.int32)  # (x=col, y=row)
+        # for bb in ego_bbs:
+        #     self.world.debug.draw_box(box=bb,
+        #                         rotation=bb.rotation,
+        #                         thickness=0.1,
+        #                         color=self.config.ego_vehicle_forecasted_bbs_normal_color,
+        #                         life_time=self.config.draw_life_time)
 
-        # Line thickness
-        thickness = max(1, int(round((0.4 / 0.5) * 1.0)))
 
-        # --- Draw on copies ---
-        heat_with_path = heat_map.copy()
-        occ_with_path  = occ_bgr.copy()
-
-        # Path polyline (green), start (red), goal (blue)
-        for img in (heat_with_path, occ_with_path):
-            cv2.polylines(img, [pts], isClosed=False, color=(0,255,0),
-                        thickness=thickness, lineType=cv2.LINE_AA)
-            cv2.circle(img, tuple(pts[0]),  radius=thickness*2, color=(0,0,255), thickness=-1)  # start
-            cv2.circle(img, tuple(pts[-1]), radius=thickness*2, color=(255,0,0), thickness=-1)  # goal
-
-        cv2.namedWindow("BirdView Occupancy", cv2.WINDOW_NORMAL)
-        # cv2.imshow('BirdView Occupancy', occ_img)
-        cv2.imshow('BirdView Occupancy', occ_with_path)
-        cv2.waitKey(1)
-
-        cv2.namedWindow("BirdView Cost Map", cv2.WINDOW_NORMAL)
-        cv2.imshow('BirdView Cost Map', heat_map)
-        cv2.waitKey(1)
-
-        for loc_arr in path_world_3d:
-            # print(f'loc_arr: {loc_arr}')
-            # print(f'loc_arr shape: {loc_arr.shape}')
-            carla_loc = carla.Location(float(loc_arr[0]), float(loc_arr[1]), float(loc_arr[2] + 0.1))
-            # print(f'carla loc: {carla_loc}')
-            self.world.debug.draw_point(
-                location=carla_loc,
-                size=0.05,
-                color=carla.Color(128, 128, 128),
-                life_time=self.config.draw_life_time
+        if self.step % int(self.config.carla_fps // 2) == 0:
+            lidar_data = {
+                'sensor' : self.sensor_interface._sensors_objects['lidar_semantic'],
+                'raw_data' : semantic_lidar_data[1]
+            }
+            scene_context = self.scene_descriptor.process_complete_scene(
+                self.ego_agent,
+                actors,
+                planner_state,
+                lidar_data=lidar_data
             )
+            scene_text = scene_context.formatted_text
+            print(f'\n\nStructured Data\n\n')
+            print(f'{scene_text}')
+
+            # Generate A* path
+            if num_route_points > 0:
+                to_index = max(
+                    planner_state.route_index,
+                    route_end_index - 1
+                )
+            else:
+                to_index = planner_state.route_index
+
+            start_point_world = ego_location
+            if num_route_points > 0:
+                goal_point_world = planner_state.route_points[to_index]
+            else:
+                goal_point_world = start_point_world
+
+            # print(f'start point: {start_point_world}')
+            # print(f'start point shape: {start_point_world.shape}')
+
+            # print(f'goal point: {goal_point_world}')
+            # print(f'goal point shape: {goal_point_world.shape}')
+            print(f'start to goal distance: {np.linalg.norm(goal_point_world - start_point_world)}')
+
+            path_world_3d = self.lat_planner.run_step(
+                route_points_world_3d=route_points_subset,
+                lidar_data=semantic_lidar_data[1],
+                start_point_world_3d=start_point_world,
+                goal_point_world_3d=goal_point_world
+            )
+
+            for loc_arr in path_world_3d:
+                # print(f'loc_arr: {loc_arr}')
+                # print(f'loc_arr shape: {loc_arr.shape}')
+                carla_loc = carla.Location(float(loc_arr[0]), float(loc_arr[1]), float(loc_arr[2]))
+                # print(f'carla loc: {carla_loc}')
+                self.world.debug.draw_point(
+                    location=carla_loc,
+                    size=0.1,
+                    color=carla.Color(128, 128, 128),
+                    life_time=self.config.draw_life_time * 2
+                )
+
+            payload = self.lat_planner.grid_mapper.payload.copy()
+
+            forecasted_bbs_payload = {vid: np.stack([bbox_to_vec7(bb) for bb in bbs], axis=0)
+               for vid, bbs in forecasted_bbs.items()}
+
+            ego_forecasted_bbs_payload = {self.ego_agent.id: np.stack([bbox_to_vec7(bb) for bb in ego_bbs], axis=0)}
+
+            payload['forecasted_bbs'] = forecasted_bbs_payload.copy()
+            payload['ego_forecasted_bbs'] = ego_forecasted_bbs_payload.copy()
+            payload['T_world_wrt_ego'] = np.array(self.ego_agent.get_transform().get_inverse_matrix(), dtype=np.float32)
+            payload['route_subset'] = route_points_subset.copy()
+            payload['path_world_3d'] = path_world_3d.copy()
+            payload['route_points'] = planner_state.route_points.copy()
+            payload['start_idx'] = planner_state.route_index
+            payload['goal_idx'] = to_index
+
+            # PAYLOAD TESTING
+            if not hasattr(self, '_output_dir'):
+                scenario_name = os.environ['SCENARIO_NAME']
+                scenario_number = os.environ['SCENARIO_NUM']
+
+                # Construct the log file path
+                log_file_name = f"{scenario_name}_{scenario_number}"
+                self._output_dir = f"path_planning_data/{log_file_name}"
+                os.makedirs(self._output_dir, exist_ok=True)
+            output_dir = self._output_dir
+
+            text_output_path = os.path.join(output_dir, f"payload_{self.step:04d}.pkl")
+            with open(text_output_path, 'wb') as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         # OPEN3D VISUALIZATION
         # if self.step == 2:

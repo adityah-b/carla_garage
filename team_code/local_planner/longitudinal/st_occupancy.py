@@ -257,13 +257,15 @@ class STOccupancyGrid:
             action_type: Optional[str] = None
             actor_type: Optional[str] = None
             importance: float = 0.0
-            if actor_id in all_conditions:
-                action_type, actor_type, importance = all_conditions[actor_id]
+            # NOTE : TEMPORARY, DEBUGGING
+            # if actor_id in all_conditions:
+            #     action_type, actor_type, importance = all_conditions[actor_id]
+            action_type, actor_type, importance = "yield_for", "vehicle", 1.0
 
             # Determine time padding driven by the action type (if any)
             pad_before = pad_after = 0
             if action_type is not None:
-                pad_before, pad_after = time_extension_steps[action_type.value]
+                pad_before, pad_after = time_extension_steps[action_type]
 
             extended_start = max(0, start_idx - pad_before)
             extended_end = min(bboxes_arr.shape[0] - 1, end_idx + pad_after)

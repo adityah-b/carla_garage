@@ -121,6 +121,7 @@ class RoadHandler:
 
         if remaining:
             for other_veh in remaining:
+                print(f'other_veh id: {other_veh.id}')
                 other_veh_wp = vehicle_wp_map[other_veh]
                 lanelet = LaneHandler.generate_lanelet(other_veh_wp, self.grp)[0]
                 grouped_vehicles[f"other-{other_veh_wp.lane_id}"] = [LaneVehicles(lanelet=lanelet, vehicles=[other_veh])]
@@ -238,7 +239,7 @@ class RoadHandler:
             raise ValueError(f"Unknown traffic_type: {traffic_type}")
 
         # 10) return filtered list
-        return [v for v,m in zip(npc_vehicles, mask) if m]
+        return [v for v,m in zip(npc_vehicles, mask) if m and not v.get_control().hand_brake]
 
     def get_leading_vehicles(
         self,

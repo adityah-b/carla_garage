@@ -2,7 +2,7 @@ import carla
 import numpy as np
 
 from dataclasses import dataclass
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 from config import GlobalConfig
 from .base_actor_extractor import BaseActorExtractor
@@ -28,9 +28,9 @@ class ObstacleDataExtractor(BaseActorExtractor):
         obstacles: List[carla.Actor],
         planner_state : PlannerState,
         lidar_data : Dict
-    ) -> List[ObstacleData]:
+    ) -> Tuple[List[ObstacleData], Optional[ObstacleData]]:
         if not obstacles:
-            return []
+            return [], None
 
         ego_location = ego_wp.transform.location
         ego_forward = ego_wp.transform.get_forward_vector()
@@ -92,7 +92,7 @@ class ObstacleDataExtractor(BaseActorExtractor):
             lane_obstacles.append(obstacle)
 
         if not lane_obstacles:
-            return []
+            return [], None
 
         ego_transform_matrix = self._get_ego_transform_matrix(ego_wp)
         obstacle_matrices = np.array([obs.get_transform().get_matrix() for obs in lane_obstacles])
@@ -113,4 +113,5 @@ class ObstacleDataExtractor(BaseActorExtractor):
             )
 
         obstacle_data.sort(key=lambda o: o.relative_distance)
-        return obstacle_data
+        closest_obstacle = None if not obstacle_data else obstacle_data[0]
+        return obstacle_data, closest_obstacle

@@ -20,6 +20,8 @@ class SceneData:
     vehicle_data : Optional[Dict[str, Dict[str, List[LaneVehicleData]]]]
     ped_data : Optional[List[PedestrianData]]
     obstacle_data : Optional[List[ObstacleData]]
+    # TODO: REFACTOR THIS SHIT
+    nearest_obstacle : Optional[ObstacleData]
     route_data : Optional[RouteData]
 
 
@@ -68,7 +70,7 @@ class SceneExtractor:
             if veh_control.hand_brake:
                 static_obstacles.append(vehicle)
 
-        obstacle_data = self._obstacle_extractor.extract_obstacle_data(
+        obstacle_data, closest_obstacle = self._obstacle_extractor.extract_obstacle_data(
             ego_wp=ego_wp, obstacles=static_obstacles, planner_state=planner_state, lidar_data=lidar_data
         )
 
@@ -80,5 +82,7 @@ class SceneExtractor:
             vehicle_data=vehicle_data if vehicle_data else None,
             ped_data=ped_data if ped_data else None,
             obstacle_data=obstacle_data if obstacle_data else None,
+            # TODO: REFACTOR THIS SHIT
+            nearest_obstacle=closest_obstacle if closest_obstacle else None,
             route_data=route_data if route_data else None,
         )

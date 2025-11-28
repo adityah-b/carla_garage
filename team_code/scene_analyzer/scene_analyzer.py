@@ -8,7 +8,7 @@ from .sys_prompts import SysPrompts
 from .rag_utils.planner_memory.planner_memory import PlannerMemory
 
 from .parsers.hl_beh_pydantic_models import HighLevelBehaviour
-from .parsers.ego_plan_pydantic_models import EgoPlan
+from .parsers.ego_plan_pydantic_models import EgoPlan, PlanExecution
 
 class SceneAnalyzer(VLMAgent):
     def __init__(
@@ -44,7 +44,8 @@ class SceneAnalyzer(VLMAgent):
     def get_ego_plan(
         self,
         text: str,
-        image: Union[Path, np.ndarray] = None
+        image: Union[Path, np.ndarray] = None,
+        prev_plan : Optional[PlanExecution] = None,
     ) -> EgoPlan:
         system_instruction = self.sys_prompts.get_plan_gen_prompt()
 
@@ -52,7 +53,7 @@ class SceneAnalyzer(VLMAgent):
         # print(f'{system_instruction}')
 
         system_message = self.create_system_message(text=system_instruction)
-        plan_prompt = self._build_planning_prompt(text)
+        plan_prompt = self._build_planning_prompt(text, prev_plan)
 
         print(f'\n\nPlanning Prompt\n\n')
         print(f'{plan_prompt}')
@@ -70,7 +71,8 @@ class SceneAnalyzer(VLMAgent):
 
     def _build_planning_prompt(
         self,
-        text : str
+        text : str,
+        prev_plan: Optional[PlanExecution] = None,
     ) -> str:
         few_shot_results = self.planning_memory.retrieve_memories(text, k=2)
 #         plan_prompt = f"""
@@ -82,8 +84,11 @@ class SceneAnalyzer(VLMAgent):
 # ## Current Scenario
 # {text}
 # """
-        plan_prompt = f"""
-## Current Scenario
+        prev_plan_text = ""
+        if prev_plan:
+            prev_plan_text = f"""## Previous Ego Plan\n{prev_plan.to_string()}\n\n"""
+
+        plan_prompt = f"""{prev_plan_text}## Current Scenario
 {text}
 """
         return plan_prompt

@@ -13,6 +13,8 @@ import numpy as np
 import carla
 import transfuser_utils as t_u
 
+from typing import List, Dict
+
 from collections import deque
 from agents.navigation.local_planner import RoadOption
 from scipy.integrate import RK45
@@ -30,14 +32,42 @@ from kinematic_bicycle_model import KinematicBicycleModel
 
 
 # ------------- NEW CODE ------------- #
+
+########################################
+# PERCEPTION
+########################################
+
 # Scene descriptor
 from scene_descriptor.scene_descriptor import SceneDescriptor
 
 # Scene analyzer
 from scene_analyzer.scene_analyzer import SceneAnalyzer
 
+########################################
+# PREDICTION
+########################################
+
+# Motion predictor
+from actor_prediction.motion_prediction import MotionPrediction
+
+# Collision checker
+from actor_prediction.collision_checker import CollisionChecker
+
+########################################
+# PLANNING
+########################################
+
 # Trajectory planner
 from trajectory_planner.trajectory_planner import TrajectoryPlanner
+
+# Longitudinal planner
+from local_planner.longitudinal.config_specs import *
+from local_planner.longitudinal.long_planner import LongPlanner
+
+# Lateral planner
+from local_planner.lateral.config_specs import *
+from local_planner.lateral.lat_planner import LatPlanner
+
 # ------------- NEW CODE ------------- #
 
 from agents.navigation.global_route_planner import GlobalRoutePlanner
@@ -146,14 +176,6 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     # ------------- NEW CODE ------------- #
     self.traffic_manager = traffic_manager
 
-    # Scene descriptor
-    self.scene_descriptor = SceneDescriptor(self.config, self.world_map)
-
-    # Scene analyzer
-    self.scene_analyzer = SceneAnalyzer()
-
-    # Trajectory planner
-    self.trajectory_planner = TrajectoryPlanner(self.config, self.world_map, CarlaDataProvider.get_hero_actor())
     # ------------- NEW CODE ------------- #
 
     # Set up the save path if specified
@@ -239,6 +261,62 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
                                        starts_with_parking_exit, self._vehicle.get_location())
 
     # ------------- NEW CODE ------------- #
+
+    ########################################
+    # PERCEPTION
+    ########################################
+
+    # Scene descriptor
+    self.scene_descriptor = SceneDescriptor(self.config, self.world_map)
+
+    # Scene analyzer
+    scene_analyzer_config = self.config.scene_analyzer_config
+    self.scene_analyzer = SceneAnalyzer(
+      provider=scene_analyzer_config['provider'],
+      model_name=scene_analyzer_config['model_name'],
+      temperature=scene_analyzer_config['temperature'],
+      max_output_tokens=scene_analyzer_config['max_output_tokens'],
+    )
+
+    ########################################
+    # PREDICTION
+    ########################################
+
+    # Motion prediction
+    self.motion_prediction = MotionPrediction(self.config, self.world_map)
+
+    ########################################
+    # PLANNING
+    ########################################
+
+    # Trajectory planner
+    self.trajectory_planner = TrajectoryPlanner(self.config, self.world_map, self._vehicle)
+
+    # Longitudinal planner
+    # st_algo_spec = STAlgoSpec(
+    #   A_max=self.config.idm_maximum_acceleration,
+    #   J_max=50.0,
+    #   W_vel=1.0,
+    #   W_acc=1.0,
+    #   W_jerk=1.0,
+    #   ds_grid=0.25,
+    #   dt_grid=0.05
+    # )
+    # st_grid_spec = STGridSpec(
+    #   S_max=10.0,
+    #   ds=0.25,
+    #   T_max=2.0,
+    #   dt=0.05
+    # )
+    # self.long_planner = LongPlanner(st_grid_spec=st_grid_spec, st_algo_spec=st_algo_spec, algo_name='dijkstra', sim_freq=self.config.fps)
+    # self.long_planner_vel_profile = None
+    # self.long_planner_vel_idx = -1
+
+    # # Lateral planner
+    # lat_algo_spec = LatAlgoSpec()
+    # lat_grid_spec = LatGridSpec()
+    # self.lat_planner = LatPlanner(self._vehicle, lat_grid_spec, lat_algo_spec)
+
     self.trajectory_planner.setup_route(
       self.org_dense_route_world_coord, self._world, self.world_map, starts_with_parking_exit, self._vehicle.get_location()
     )
@@ -334,6 +412,15 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
         'fov': self.config.camera_fov,
         'id': 'rgb_bev'
       }, {
+        'type': 'sensor.lidar.ray_cast_semantic',
+        'x': self.config.lidar_pos[0],
+        'y': self.config.lidar_pos[1],
+        'z': self.config.lidar_pos[2],
+        'roll': self.config.lidar_rot[0],
+        'pitch': self.config.lidar_rot[1],
+        'yaw': self.config.lidar_rot[2],
+        'id': 'lidar_semantic'
+      }, {
         "type": "sensor.speedometer",
         "reading_frequency": 20,
         "id": "speed"
@@ -401,6 +488,30 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     return control
 
+  def _update_local_trajectory(self, input_data, planner_state, ego_position):
+    """
+        Update the local trajectory planner with occupancy information when available.
+
+        Args:
+            input_data (dict): Raw sensor input for the current tick.
+            planner_state (PlannerState): Current state of the privileged route planner.
+            ego_position (np.ndarray): Ego vehicle position in world coordinates.
+        """
+    if self.trajectory_planner is None:
+      return
+
+    lidar_entry = input_data.get('lidar_semantic')
+    if lidar_entry is None:
+      return
+
+    lidar_data = lidar_entry[1]
+    self.trajectory_planner.update_local_environment(
+      lidar_data=lidar_data,
+      planner_state=planner_state,
+      ego_location=ego_position,
+      current_step=self.step
+    )
+
   def _get_control(self, input_data, plant):
     """
         Compute the control commands and save the driving data for the current frame.
@@ -436,23 +547,121 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
 
     # ------------- NEW CODE ------------- #
 
-    # Get all actors in the scene
-    actors = self._world.get_actors()
-
     # Update planner state
     self.trajectory_planner.update_planner(ego_position)
 
     # Get planner state
     planner_state = self.trajectory_planner.get_planner_state()
 
-    # Process scene
-    scene_context = self.scene_descriptor.process_complete_scene(self._vehicle, actors, planner_state)
+    # self._update_local_trajectory(input_data, planner_state, ego_position)
 
-    # Update scene data
-    self.trajectory_planner.update_scene_data(scene_context)
+    ########################################
+    # PERCEPTION
+    ########################################
+
+    # Get all actors in the scene
+    actors = self._world.get_actors()
+
+    # Compile lidar sensor measurements
+    lidar_data = {
+        'sensor' : self.sensor_interface._sensors_objects['lidar_semantic'],
+        'raw_data' : input_data['lidar_semantic'][1]
+    }
+
+    # Process scene
+    scene_context = self.scene_descriptor.process_complete_scene(
+      self._vehicle,
+      actors,
+      planner_state,
+      lidar_data
+    )
 
     # Get formatted text
     scene_text = scene_context.formatted_text
+
+    ########################################
+    # PREDICTION
+    ########################################
+
+    # # Predict ego bounding boxes
+    # ego_bb_preds = self.motion_prediction.predict_ego_motion(self._vehicle, route_np, target_speed=target_speed_initial)
+
+    # # Predict vehicle bounding boxes
+    # vehicle_predictions = self.motion_prediction.predict_vehicle_motion(scene_context.scene_data.vehicle_data)
+
+    # # Predict pedestrian bounding boxes
+    # ped_predictions = self.motion_prediction.predict_ped_motion(scene_context.scene_data.ped_data)
+
+    # # Predict actor collisions
+    # actor_predictions = vehicle_predictions | ped_predictions
+    # all_actor_collisions = CollisionChecker.predict_actor_collisions(
+    #   ego_bb_preds=ego_bb_preds,
+    #   actor_predictions=actor_predictions
+    # )
+
+    # for actor_id, collision_intervals in all_actor_collisions.items():
+    #   collision_interval = collision_intervals[0]
+    #   collision_bbs = collision_interval.collision_bboxes_b
+
+    #   self._world.debug.draw_string(
+    #     location=collision_bbs[0].location,
+    #     text=str(actor_id),
+    #     color=self.config.other_vehicles_forecasted_bbs_color,
+    #     life_time=self.config.draw_life_time)
+
+    #   for bb in collision_bbs:
+    #     self._world.debug.draw_box(
+    #       box=bb,
+    #       rotation=bb.rotation,
+    #       thickness=0.1,
+    #       color=self.config.ego_vehicle_forecasted_bbs_hazard_color,
+    #       life_time=self.config.draw_life_time)
+
+
+    ########################################
+    # PLANNING
+    ########################################
+
+    # # Update scene data
+    # self.trajectory_planner.update_scene_data(scene_context)
+
+    # if self.step > 20:
+    #   lidar_entry = input_data.get('lidar_semantic')
+    #   lidar_data = lidar_entry[1]
+
+    #   # Generate path
+    #   planned_path = self.lat_planner.run_step(
+    #     route_points_world_3d=planner_state.route_points,
+    #     lidar_data=lidar_data,
+    #     start_point_world_3d=planner_state.route_points[0],
+    #     goal_point_world_3d=planner_state.route_points[planner_state.route_index + 300]
+    #   )
+
+    #   print(f'planned_path_len: {planned_path.size}')
+
+    #   for xyz in planned_path:
+    #     loc = carla.Location(float(xyz[0]), float(xyz[1]), float(xyz[2] + 0.1))
+    #     self._world.debug.draw_point(location=loc,
+    #                                 size=0.05,
+    #                                 color=self.config.future_route_color,
+    #                                 life_time=self.config.draw_life_time)
+
+    #   # Generate velocity profile
+    #   target_speed = self.long_planner.run_step(
+    #     ego_route_points_3d=route_np,
+    #     ego_speed=scene_context.scene_data.ego_data.speed,
+    #     ego_max_speed=scene_context.scene_data.traffic_data.speed_limit,
+    #     actor_collisions=all_actor_collisions,
+    #     plan_tick_counter=self.step
+    #   )
+    #   if self.long_planner.current_vel_profile.size == 0:
+    #     print(f'Unable to find path, using IDM')
+    #   else:
+    #     print(f'Found path')
+    # else:
+    #   target_speed = 0.0
+
+    # brake = False
 
     # _______ IMAGE RENDERING AND SAVING _______
 
@@ -495,36 +704,79 @@ class AutoPilot(autonomous_agent_local.AutonomousAgent):
     # _______ IMAGE RENDERING AND SAVING _______
 
 
-    # Check if LLM reasoning required
-    if self.trajectory_planner.plan_with_reasoning():
-      if self.trajectory_planner.cur_plan is None and self.trajectory_planner.needs_replan is True:
-        print(f'\n\nStructured Data\n\n')
-        print(f'{scene_text}')
+    # Update scene data
+    self.trajectory_planner.update_scene_data(scene_context, lidar_data['raw_data'])
 
-        # Perform high-level scene analysis
-        hl_beh = self.scene_analyzer.get_high_level_behaviour(text=scene_text, image=bb_final)
-        print(f'\n\nHigh Level Behaviour\n\n')
-        print(f'\tScenario: {hl_beh.scenario}')
-        print(f'\tKey Actors: {hl_beh.key_actors}')
-        print(f'\tReasoning: {hl_beh.reasoning}')
-
-        # Update key actors for planner
-        self.trajectory_planner.update_key_actors(hl_beh.key_actors)
-
-        # Generate ego plan
-        ego_plan = self.scene_analyzer.get_ego_plan(text=hl_beh.scenario)
-        print(f'\n\nEgo Plan\n\n')
-        print(f"\tPlan: {ego_plan.plan}")
-        print(f"\tReasoning: {ego_plan.reasoning}")
-
-        # Set the plan
-        self.trajectory_planner.set_plan(ego_plan)
-
-      target_speed, brake, route_np, route_wp = self.trajectory_planner.execute_plan()
-
+    if self.step <= 20:
+      target_speed = 0.0
+      brake = True
     else:
-      brake = False
-      target_speed, route_np, route_wp = self.trajectory_planner.follow_route(target_speed_initial)
+      # Check if LLM reasoning required
+      if self.trajectory_planner.plan_with_reasoning():
+        if self.trajectory_planner.cur_plan is None and self.trajectory_planner.needs_replan is True:
+          print(f'\n\nStructured Data\n\n')
+          print(f'{scene_text}')
+
+          if self.trajectory_planner.prev_plan_execution:
+            scene_text = scene_text + f'\nPrevious Plan:\n{self.trajectory_planner.prev_plan_execution.to_string()}'
+
+          hl_beh = self.scene_analyzer.get_high_level_behaviour(text=scene_text, image=bb_final)
+          print(f'\n\nHigh Level Behaviour\n\n')
+          print(f'\tScenario:\n {hl_beh.to_string()}')
+          print(f'\tKey Actors: {hl_beh.key_actors}')
+          # print(f'\tReasoning: {hl_beh.reasoning}')
+
+          # # Update key actors for planner
+          # self.trajectory_planner.update_key_actors(hl_beh.key_actors)
+
+          # Generate ego plan
+          ego_plan = self.scene_analyzer.get_ego_plan(
+              text=hl_beh.to_string(),
+              prev_plan=self.trajectory_planner.prev_plan_execution,
+          )
+          print(f'\n\nEgo Plan\n\n')
+          print(f"\tPlan: {ego_plan.action.value}")
+          print(f"\tConditions: {ego_plan.conditions}")
+          print(f"\tReasoning: {ego_plan.reasoning}")
+
+          # Set the plan
+          self.trajectory_planner.set_plan(ego_plan)
+
+      if self.trajectory_planner.cur_plan is None:
+        brake = False
+        target_speed, route_np, route_wp = self.trajectory_planner.follow_route(target_speed_initial)
+      else:
+        target_speed, brake, route_np, route_wp = self.trajectory_planner.execute_plan(self.step)
+
+    for i in range(0, min(route_np.shape[0] - 1, self.config.draw_future_route_till_distance)):
+        loc = route_np[i]
+        loc = carla.Location(loc[0], loc[1], loc[2] + 0.1)
+        self._world.debug.draw_point(location=loc,
+                                    size=0.05,
+                                    color=self.config.future_route_color,
+                                    life_time=self.config.draw_life_time)
+
+        # route_cmd = planner_state.route_commands[i]
+        # cmd_str = ''
+        # if route_cmd == RoadOption.LEFT:
+        #   cmd_str = 'left'
+        # elif route_cmd == RoadOption.RIGHT:
+        #   cmd_str = 'right'
+        # # elif route_cmd == RoadOption.STRAIGHT:
+        # #   cmd_str = 'straight'
+        # # elif route_cmd == RoadOption.LANEFOLLOW:
+        # #   cmd_str = 'lanefollow'
+        # # elif route_cmd == RoadOption.CHANGELANELEFT:
+        # #   cmd_str = 'CHANGELANELEFT'
+        # # elif route_cmd == RoadOption.CHANGELANERIGHT:
+        # #   cmd_str = 'CHANGELANERIGHT'
+
+        # self._world.debug.draw_string(
+        #   location=loc,
+        #   text=cmd_str,
+        #   color=self.config.other_vehicles_forecasted_bbs_color,
+        #   life_time=self.config.draw_life_time
+        # )
 
     # brake = False
     # target_speed, route_np, route_wp = self.trajectory_planner.follow_route(target_speed_initial)

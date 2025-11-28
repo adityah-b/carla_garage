@@ -11,10 +11,8 @@ from matplotlib.patches import Polygon
 
 from actor_prediction.geometric_utils import GeometricUtils
 from trajectory_planner.occupancy_grid.planners.hybrid_astar import HybridAStar
-from trajectory_planner.occupancy_grid.planners.astar import AStar
-from trajectory_planner.occupancy_grid.sensor_data_processor import BEVGrid
 
-file_name = '/home/carla/carla_garage/path_planning_data/SignalizedJunctionLeftTurn_9_0/payload_0250.pkl'
+file_name = '/home/carla/carla_garage/path_planning_data/AccidentTwoWays_26_0/payload_0030.pkl'
 with open(file_name,'rb') as f:
     payload = pickle.load(f)
 
@@ -275,20 +273,76 @@ def obb_corners_world_xy(rows7: np.ndarray, use_ue4_yaw: bool = True) -> np.ndar
 # -----------------------------------------------------------------------------
 # Convert vehicles → s-interval bands
 # -----------------------------------------------------------------------------
+
+
 def compute_vehicle_s_bands(
     predictions: Dict[int, np.ndarray],
     route_points: np.ndarray,
     *,
     window: int = 2,
     use_ue4_yaw: bool = True,
+    all_conditions: Optional[Dict[int, Tuple[str, str, float]]] = None,
 ) -> Dict[int, Dict[str, np.ndarray]]:
     """
     For each vehicle (T,7), project its four OBB corners per time to s, then
     take min/max across corners → s_min(t), s_max(t).
-    Optionally expand by pad_s (safety buffer) and mask by 'presence_by_vid'.
+
+    `all_conditions` lets callers describe how to extend and weight the costs
+    for specific actors using (action_type, actor_type, importance):
+        - action_type ∈ {"yield_for", "watch_out_for"}
+        - actor_type  ∈ {"vehicle", "cyclist", "ped"}
+        - importance  ∈ [0.0, 1.0]
+
+    "yield_for" emphasises waiting until the actor passes the conflict region
+    by padding the time dimension primarily after the collision interval.
+    "watch_out_for" builds symmetric time padding and a larger spatial buffer
+    around the collision band. Actor type and importance scale the collision
+    cost and dilation to reflect perceived risk.
     """
     geom = precompute_route_geometry(route_points)
     out: Dict[int, Dict[str, np.ndarray]] = {}
+
+    condition_lookup: Dict[int, Tuple[str, str, float]] = {}
+    if all_conditions:
+        for actor_id, condition in all_conditions.items():
+            if not isinstance(condition, tuple) or len(condition) != 3:
+                raise ValueError(
+                    "Conditions must be tuples of (action_type, actor_type, importance)."
+                )
+            action_type, actor_type, importance = condition
+            if action_type not in {"yield_for", "watch_out_for"}:
+                raise ValueError(
+                    f"Unsupported action_type '{action_type}' for actor {actor_id}."
+                )
+            if actor_type not in {"vehicle", "cyclist", "ped"}:
+                raise ValueError(
+                    f"Unsupported actor_type '{actor_type}' for actor {actor_id}."
+                )
+            if not (0.0 <= float(importance) <= 1.0):
+                raise ValueError(
+                    f"Importance must be in [0.0, 1.0], got {importance} for actor {actor_id}."
+                )
+            condition_lookup[int(actor_id)] = (
+                action_type,
+                actor_type,
+                float(importance),
+            )
+
+    # Number of discrete time indices to extend before/after the true
+    # collision interval for each action type.
+    time_extension_steps = {
+        # "yield_for": (2, 10),      # wait longer after the collision
+        "yield_for": (20, 0),      # wait longer after the collision
+        "watch_out_for": (5, 5),   # symmetric caution window
+    }
+
+    # Spatial dilation (in metres) based on actor type and action flavour.
+    base_space_dilation = 0.5
+    space_dilation_by_actor_type = {"vehicle": 0.6, "cyclist": 0.9, "ped": 1.1}
+    space_dilation_by_action = {"yield_for": 0.3, "watch_out_for": 0.8}
+
+    # Collision cost scaling based on actor type + importance.
+    collision_cost_scale = {"vehicle": 1.0, "cyclist": 1.2, "ped": 1.4}
 
     all_collision_intervals : Dict[int, List[CollisionInterval]] = {}
 
@@ -313,7 +367,6 @@ def compute_vehicle_s_bands(
             ego_forecasted_bbs_carla,
             bb_list_carla
         )
-        print(collision_intervals)
         if len(collision_intervals) > 0:
             all_collision_intervals[vid] = collision_intervals
 
@@ -326,23 +379,62 @@ def compute_vehicle_s_bands(
         start_idx = collision_interval.start_idx
         end_idx = collision_interval.end_idx
 
-        collision_range = np.arange(start_idx, end_idx + 1, dtype=np.int32)
-        arr_collisions = arr[collision_range]
-        T = arr_collisions.shape[0]
+        action_type: Optional[str] = None
+        actor_type: Optional[str] = None
+        importance: float = 0.0
+        if vid in condition_lookup:
+            action_type, actor_type, importance = condition_lookup[vid]
 
-        corners = obb_corners_world_xy(arr_collisions, use_ue4_yaw=use_ue4_yaw)  # (T,4,2)
-        s_all   = project_points_to_route_s(corners.reshape(-1, 2), geom, window=window)\
-                    .reshape(T, 4)
+        # Determine time padding driven by the action type (if any)
+        pad_before = pad_after = 0
+        if action_type is not None:
+            pad_before, pad_after = time_extension_steps[action_type]
 
-        s_min = np.min(s_all, axis=1)
-        s_max = np.max(s_all, axis=1)
-        # print(f'vid: {vid}, s_min: {s_min}, s_max: {s_max}')
+        extended_start = max(0, start_idx - pad_before)
+        extended_end = min(arr.shape[0] - 1, end_idx + pad_after)
+
+        extended_indices = np.arange(extended_start, extended_end + 1, dtype=np.int32)
+        arr_extended = arr[extended_indices]
+        T_ext = arr_extended.shape[0]
+
+        corners_ext = obb_corners_world_xy(arr_extended, use_ue4_yaw=use_ue4_yaw)
+        s_all_ext = project_points_to_route_s(
+            corners_ext.reshape(-1, 2), geom, window=window
+        ).reshape(T_ext, 4)
+
+        s_min_ext = np.min(s_all_ext, axis=1)
+        s_max_ext = np.max(s_all_ext, axis=1)
+
+        collision_mask = (extended_indices >= start_idx) & (extended_indices <= end_idx)
+        time_distance_steps = np.zeros_like(extended_indices, dtype=np.float32)
+        if collision_mask.any():
+            # Distance in discrete steps to the nearest point inside the collision interval
+            before_dist = np.maximum(0, start_idx - extended_indices)
+            after_dist = np.maximum(0, extended_indices - end_idx)
+            time_distance_steps = np.maximum(before_dist, after_dist).astype(np.float32)
+
+        action_dilation = space_dilation_by_action.get(action_type, 0.0)
+        actor_dilation = space_dilation_by_actor_type.get(actor_type, 0.0)
+        space_dilation = base_space_dilation + action_dilation + actor_dilation
+        cost_scale = collision_cost_scale.get(actor_type, 1.0) * (1.0 + 0.75 * importance)
 
         out[vid] = {
-            "s_min": s_min.astype(np.float32),
-            "s_max": s_max.astype(np.float32),
-            "start_idx" : start_idx,
-            "end_idx" : end_idx
+            "s_min": s_min_ext.astype(np.float32),
+            "s_max": s_max_ext.astype(np.float32),
+            "start_idx": int(extended_start),
+            "end_idx": int(extended_end),
+            "collision_start_idx": int(start_idx),
+            "collision_end_idx": int(end_idx),
+            "collision_mask": collision_mask.astype(np.bool_),
+            "time_indices": extended_indices.astype(np.int32),
+            "time_distance_steps": time_distance_steps.astype(np.float32),
+            "time_extension_steps_before": int(pad_before),
+            "time_extension_steps_after": int(pad_after),
+            "space_dilation": float(space_dilation),
+            "action_type": action_type,
+            "actor_type": actor_type,
+            "importance": float(importance),
+            "cost_scale": float(cost_scale),
         }
 
     return out
@@ -747,16 +839,21 @@ def make_grids(
     return t, s
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Occupancy: dynamic obstacles (bands) → binary grid
-# bands_by_vid: {vid: {"s_min": (K,), "s_max": (K,)}}, aligned to t
+# Costmap: dynamic obstacles (bands) → floating grid
+# bands_by_vid: {vid: {"s_min": (K,), "s_max": (K,), ...}}, aligned to t
 # ──────────────────────────────────────────────────────────────────────────────
-def build_occupancy_from_bands(
+def build_costmap_from_bands(
     t: np.ndarray,
     s: np.ndarray,
     bands_by_vid: Dict[int, Dict[str, np.ndarray]],
+    *,
+    collision_cost: float = 1.0,
+    yield_decay_exponent: float = 0.9,
+    watch_out_decay_exponent: float = 1.2,
+    default_decay_exponent: float = 1.1,
 ) -> np.ndarray:
     """
-    Rasterize collision bands (per-vehicle) into a boolean occupancy grid occ[k,i].
+    Rasterize collision bands (per-vehicle) into a floating cost map cost[k,i].
 
     Inputs
     ------
@@ -767,42 +864,64 @@ def build_occupancy_from_bands(
     bands_by_vid : dict
         For each vehicle id:
           {
-            "s_min": (L,) float32,        # s_min at each collision timestep
-            "s_max": (L,) float32,        # s_max at each collision timestep
-            "start_idx": int,             # global time index (inclusive)
-            "end_idx": int                # global time index (inclusive)
+            "s_min": (L,) float32,
+            "s_max": (L,) float32,
+            "start_idx": int,
+            "end_idx": int,
+            "collision_start_idx": int,
+            "collision_end_idx": int,
+            "collision_mask": (L,) bool,
+            "time_indices": (L,) int,
+            "time_distance_steps": (L,) float32,
+            "time_extension_steps_before": int,
+            "time_extension_steps_after": int,
+            "space_dilation": float,
+            "action_type": Optional[str],
+            "actor_type": Optional[str],
+            "importance": float,
+            "cost_scale": float,
           }
         where L = end_idx - start_idx + 1 and arrays are aligned to that subrange.
 
     Output
     ------
-    occ : (K, S) bool
-        True where the (t_k, s_i) cell is occupied by any vehicle band.
-        Only time rows k ∈ [start_idx, end_idx] of each vehicle are painted.
+    cost : (K, S) float32
+        Non-negative costs for each (t_k, s_i) cell. Occupied cells receive the
+        highest cost, while extension regions receive a decaying penalty.
 
     Notes
     -----
     - This function assumes the collision arrays are already trimmed to the interval
-      [start_idx, end_idx] (as your compute_vehicle_s_bands does).
+      [start_idx, end_idx] (as `compute_vehicle_s_bands` does).
     - If a band’s interval partially falls outside the planner’s [0, K-1] time window,
       it is clipped gracefully.
-    - Vectorized `np.searchsorted` converts each (s_min[k], s_max[k]) to index spans
-      on the S grid; we then paint contiguous slices per timestep (fast & cache-friendly).
+    - The main collision interval is treated as a hard cost while the
+      action-driven time extension and spatial dilation smoothly decay towards
+      zero cost at their limits.
+    - Decay exponents are derived from the action type to shape how quickly the
+      time-dependent decay falls off on either side of the collision window.
     """
     t = t.reshape(-1)
     s = s.reshape(-1)
     K, S = t.size, s.size
 
-    occ = np.zeros((K, S), dtype=bool)
+    ds = float(s[1] - s[0]) if S > 1 else 1.0
+
+    cost = np.zeros((K, S), dtype=np.float32)
     if not bands_by_vid:
-        return occ
+        return cost
+
+    decay_exponent_lookup = {
+        "yield_for": float(yield_decay_exponent),
+        "watch_out_for": float(watch_out_decay_exponent),
+    }
 
     for vid, band in bands_by_vid.items():
         smin_local = band["s_min"]
         smax_local = band["s_max"]
 
         k_start = int(band["start_idx"])  # inclusive
-        k_end   = int(band["end_idx"])    # inclusive
+        k_end = int(band["end_idx"])    # inclusive
 
         # Length checks and early outs
         L = k_end - k_start + 1
@@ -810,7 +929,7 @@ def build_occupancy_from_bands(
             continue
         if smin_local.size != L or smax_local.size != L:
             raise ValueError(
-                f"vid {vid}: expected len(s_min)==len(s_max)==end_idx-start_idx+1 "
+                f"band {vid}: expected len(s_min)==len(s_max)==end_idx-start_idx+1 "
                 f"({L}), got {smin_local.size} and {smax_local.size}"
             )
 
@@ -821,22 +940,138 @@ def build_occupancy_from_bands(
             continue  # completely outside
 
         span = (k1 - k0 + 1)             # how many rows to paint
+        offset = k0 - k_start
+        idx_hi = offset + span
+
+        smin_slice = smin_local[offset:idx_hi]
+        smax_slice = smax_local[offset:idx_hi]
 
         # Convert s-intervals to column index ranges on the global S grid
-        # TODO: Replace s[1] with ds
-        j_lo = np.floor(smin_local / s[1])
-        j_hi = np.floor(smax_local / s[1])
+        j_lo = np.floor(smin_slice / ds)
+        j_hi = np.floor(smax_slice / ds)
 
-        j_lo = np.clip(j_lo, 0, S - 1)
-        j_hi = np.clip(j_hi, 0, S - 1)
+        j_lo = np.clip(j_lo, 0, S - 1).astype(np.int32)
+        j_hi = np.clip(j_hi, 0, S - 1).astype(np.int32)
 
-        # Paint each time row (contiguous slices are efficient)
-        # Note: rows in occ are global indices k = k0..k1
+        action_type = band.get("action_type")
+        collision_mask = band.get("collision_mask")
+        time_indices = band.get("time_indices")
+        time_distances = band.get("time_distance_steps")
+        space_dilation = float(band.get("space_dilation", 0.0))
+        collision_start_idx = int(band.get("collision_start_idx", k_start))
+        collision_end_idx = int(band.get("collision_end_idx", k_end))
+        ext_before = int(band.get("time_extension_steps_before", 0))
+        ext_after = int(band.get("time_extension_steps_after", 0))
+        cost_scale = float(band.get("cost_scale", 1.0))
+        importance = float(band.get("importance", 0.0))
+        actor_type = band.get("actor_type")
+        decay_exponent = decay_exponent_lookup.get(action_type, float(default_decay_exponent))
+        decay_exponent = float(max(decay_exponent - 0.2 * importance, 1e-6))
+        actual_before = max(0, min(ext_before, collision_start_idx - k0))
+        actual_after = max(0, min(ext_after, k1 - collision_end_idx))
+        if actual_before > 0:
+            before_norm_denom = float(max(actual_before - 1, 1))
+        else:
+            before_norm_denom = 1.0
+        if actual_after > 0:
+            after_norm_denom = float(max(actual_after - 1, 1))
+        else:
+            after_norm_denom = 1.0
+
         for r in range(span):
-            lo = int(j_lo[r]); hi = int(j_hi[r])
-            occ[k0 + r, lo:hi + 1] |= True
+            lo = int(j_lo[r])
+            hi = int(j_hi[r])
+            if hi < lo:
+                continue
 
-    return occ
+            s_values = s[lo:hi + 1]
+            s_min_val = float(smin_slice[r])
+            s_max_val = float(smax_slice[r])
+
+            s_min_dil = s_min_val - space_dilation
+            s_max_dil = s_max_val + space_dilation
+
+            j_lo_dil = int(np.clip(np.floor(s_min_dil / ds), 0, S - 1))
+            j_hi_dil = int(np.clip(np.floor(s_max_dil / ds), 0, S - 1))
+            if j_hi_dil < j_lo_dil:
+                continue
+
+            # Update with dilated indices if they extend beyond the initial
+            # discretisation.
+            if j_lo_dil < lo or j_hi_dil > hi:
+                lo = min(lo, j_lo_dil)
+                hi = max(hi, j_hi_dil)
+                s_values = s[lo:hi + 1]
+
+            # Collision vs extension handling
+            is_collision = True
+            if collision_mask is not None and time_indices is not None:
+                idx = offset + r
+                if 0 <= idx < collision_mask.size:
+                    is_collision = bool(collision_mask[idx])
+
+            if is_collision:
+                base_cost = collision_cost * cost_scale
+            else:
+                if action_type is None or time_distances is None or time_indices is None:
+                    continue
+
+                idx = offset + r
+                if not (0 <= idx < time_distances.size and 0 <= idx < time_indices.size):
+                    continue
+
+                time_distance = float(time_distances[idx])
+                if time_distance <= 0.0:
+                    base_cost = collision_cost * cost_scale
+                else:
+                    time_idx_val = int(time_indices[idx])
+                    if time_idx_val < collision_start_idx:
+                        denom = actual_before
+                        norm_denom = before_norm_denom
+                    else:
+                        denom = actual_after
+                        norm_denom = after_norm_denom
+
+                    if denom <= 0:
+                        continue
+
+                    if denom == 1:
+                        # Only a single extension step → treat as immediate drop to zero.
+                        norm = float(time_distance >= 1.0)
+                    else:
+                        norm = (time_distance - 1.0) / norm_denom
+
+                    norm = np.clip(norm, 0.0, 1.0)
+                    time_decay = (1.0 - norm) ** decay_exponent
+                    if time_decay <= 0.0:
+                        continue
+                    base_cost = collision_cost * cost_scale * time_decay
+
+            # Apply spatial decay outside the true collision band.
+            s_min_collision = s_min_val
+            s_max_collision = s_max_val
+
+            s_values = s[lo:hi + 1]
+            inside_collision = (s_values >= s_min_collision) & (s_values <= s_max_collision)
+
+            if space_dilation <= 1e-6:
+                # No dilation → all cells inside collision band take the base cost.
+                row_costs = np.where(inside_collision, base_cost, 0.0)
+            else:
+                lower_dist = np.clip(s_min_collision - s_values, a_min=0.0, a_max=None)
+                upper_dist = np.clip(s_values - s_max_collision, a_min=0.0, a_max=None)
+                dist = lower_dist + upper_dist
+                space_decay = 1.0 - np.clip(dist / space_dilation, 0.0, 1.0)
+                row_costs = base_cost * space_decay
+                row_costs = np.where(inside_collision, base_cost, row_costs)
+
+            if np.all(row_costs <= 0.0):
+                continue
+
+            row_slice = slice(lo, hi + 1)
+            cost[k0 + r, row_slice] = np.maximum(cost[k0 + r, row_slice], row_costs.astype(np.float32))
+
+    return cost
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Envelope (v_max_diag): prune vertices above s = (s_max/T) * t
@@ -1220,7 +1455,7 @@ def dijkstra_st(
 # Quick visualizer: costmap/occupancy + envelope
 # ──────────────────────────────────────────────────────────────────────────────
 def plot_st_map(t: np.ndarray, s: np.ndarray,
-                occmap: np.ndarray, envelope_slope: float,
+                costmap: np.ndarray, envelope_slope: float,
                 title: str = "s–T occupancy/costmap",
                 path: Optional[List[Tuple[int, int, float, float]]] = None,
                 start_idx: Optional[int] = None,
@@ -1228,9 +1463,9 @@ def plot_st_map(t: np.ndarray, s: np.ndarray,
     Tgrid, Sgrid = np.meshgrid(t, s, indexing="ij")  # (K,S)
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    # pcolormesh expects numeric; show occupied cells as 1.0
-    im = ax.pcolormesh(Tgrid, Sgrid, occmap.astype(float),
-                       shading="nearest", cmap="Greys")
+    im = ax.pcolormesh(Tgrid, Sgrid, costmap.astype(float),
+                       shading="nearest", cmap="inferno", vmin=0.0, vmax=max(1.0, float(costmap.max())))
+    fig.colorbar(im, ax=ax, label="cost")
 
     # Envelope
     Tfin = float(t[-1])
@@ -1340,94 +1575,269 @@ def plot_st_profiles(
 
     return fig, axs, profiles
 
+# if __name__ == "__main__":
+#     slope_env = 20.0  # m/s (your example)
+
+#     # Dynamics limits & weights
+#     v0   = 0.0
+#     a0   = 0.0
+#     vmax = slope_env           # safe choice; can be tighter
+#     amax = 25.0                 # m/s^2 (example)
+#     jmax = 50.0                # m/s^3 (example)
+#     w_vel, w_acc, w_jerk = 1.0, 0.2, 0.05
+
+#     # ---------------- 1) grids ----------------
+#     # ds = 0.1
+#     # dt = 0.05
+#     ds = 1.0
+#     dt = 0.25
+#     t, s = make_grids(s_max=40.0, ds=ds, T_horizon=5.0, dt=dt)
+#     K, S = t.size, s.size
+#     ds_res, dt_res = ds, 2 * np.sqrt((2 * ds) / amax).round(2)
+#     print(f'dt_res: {dt_res}')
+
+#     # ---------------- 2) dynamic obstacles → cost map ----------------
+#     demo_conditions: Dict[int, Tuple[str, str, float]] = {}
+#     if forecasted_bbs:
+#         demo_ids = list(forecasted_bbs.keys())
+#         for idx, actor_id in enumerate(demo_ids):
+#             # action_type = "yield_for" if idx == 0 else "watch_out_for"
+#             action_type = "yield_for"
+#             # actor_type = "vehicle" if idx % 2 == 0 else "ped"
+#             actor_type = "vehicle"
+#             importance = 0.8 if idx == 0 else 0.4
+#             demo_conditions[int(actor_id)] = (action_type, actor_type, importance)
+
+#     bands = compute_vehicle_s_bands(
+#         forecasted_bbs,      # {vid: (T,7)}
+#         route_subset,        # (N,2)
+#         window=2,
+#         use_ue4_yaw=False,
+#         all_conditions=demo_conditions
+#     )
+#     # If your bands dict has start/end indices as shown earlier, use the interval-aware
+#     # painter; otherwise keep your existing builder.
+#     cost_dyn = build_costmap_from_bands(t, s, bands_by_vid=bands)
+#     occ_dyn = cost_dyn > 1e-3
+
+#     # ---------------- 3) envelope → valid mask ----------------
+#     valid = envelope_mask_under_diagonal(t, s, slope=slope_env)  # your signature uses 'slope='
+#     occ_env = ~valid  # treat outside envelope as blocked
+
+#     # ---------------- 4) combine & (optionally) inflate ----------------
+#     occ_total = occ_dyn | occ_env  # boolean occupancy used by neighbours/Dijkstra
+#     cost_total = np.maximum(cost_dyn, occ_env.astype(np.float32))
+#     _fig_dyn, _ax_dyn = plot_st_map(
+#         t,
+#         s,
+#         cost_dyn,
+#         envelope_slope=slope_env,
+#         title="Dynamic actor costmap (demo)",
+#     )
+#     # occ_total = occ_env  # boolean occupancy used by neighbours/Dijkstra
+
+#     # ---------------- 5) Dijkstra setup ----------------
+#     # Start at smallest free s at t=0 (or just s_idx=0 if you prefer)
+#     s_start_idx = 0
+
+#     # Goal: reach highest s (right edge of grid)
+#     s_goal_idx = S - 1
+
+
+#     # ---------------- 6) run Dijkstra ----------------
+#     start_time = time.time()
+#     path = dijkstra_st(
+#         occupancy_grid=cost_total,
+#         s_start_idx=s_start_idx,
+#         s_goal_idx=s_goal_idx,
+#         ds_res=ds_res,
+#         dt_res=dt_res,
+#         v0=v0,
+#         a0=a0,
+#         v_max=vmax,
+#         a_max=amax,
+#         j_max=jmax,
+#         w_vel=w_vel,
+#         w_acc=w_acc,
+#         w_jerk=w_jerk,
+#         allow_wait=True
+#     )
+#     print("--- Execution Time: %s seconds ---" % (time.time() - start_time))
+
+#     if len(path) == 0:
+#         print("Dijkstra: no feasible path found.")
+
+#     # ---------------- 7) visualize ----------------
+#     fig, ax = plot_st_map(
+#         t, s, cost_total, envelope_slope=slope_env,
+#         title="s–T costmap with diagonal envelope + Dijkstra path",
+#         path=path,
+#         start_idx=(path[0][1] if path else None),
+#         goal_idx=S - 1
+#     )
+#     # plt.show()
+
+#     if path:
+#         fig2, axs2, prof = plot_st_profiles(
+#             t=t, s=s, path=path, dt_res=dt_res,
+#             title="Planned longitudinal profiles"
+#         )
+#         # Access arrays if you need them programmatically:
+#         # prof["t"], prof["s"], prof["v"], prof["a"], prof["j"]
+#     else:
+#         print("No path -> no profiles to plot.")
+
+#     plt.show()
+
+from local_planner.longitudinal.config_specs import *
+from local_planner.longitudinal.long_planner import LongPlanner
+from actor_prediction.collision_checker import CollisionChecker, CollisionInterval
+
+def get_collision_intervals(
+    predictions: Dict[int, np.ndarray],
+    route_points: np.ndarray,
+    *,
+    window: int = 2,
+    use_ue4_yaw: bool = True,
+    all_conditions: Optional[Dict[int, Tuple[str, str, float]]] = None,
+) -> Dict[int, Dict[str, np.ndarray]]:
+    """
+    For each vehicle (T,7), project its four OBB corners per time to s, then
+    take min/max across corners → s_min(t), s_max(t).
+
+    `all_conditions` lets callers describe how to extend and weight the costs
+    for specific actors using (action_type, actor_type, importance):
+        - action_type ∈ {"yield_for", "watch_out_for"}
+        - actor_type  ∈ {"vehicle", "cyclist", "ped"}
+        - importance  ∈ [0.0, 1.0]
+
+    "yield_for" emphasises waiting until the actor passes the conflict region
+    by padding the time dimension primarily after the collision interval.
+    "watch_out_for" builds symmetric time padding and a larger spatial buffer
+    around the collision band. Actor type and importance scale the collision
+    cost and dilation to reflect perceived risk.
+    """
+    geom = precompute_route_geometry(route_points)
+    out: Dict[int, Dict[str, np.ndarray]] = {}
+
+    condition_lookup: Dict[int, Tuple[str, str, float]] = {}
+    if all_conditions:
+        for actor_id, condition in all_conditions.items():
+            if not isinstance(condition, tuple) or len(condition) != 3:
+                raise ValueError(
+                    "Conditions must be tuples of (action_type, actor_type, importance)."
+                )
+            action_type, actor_type, importance = condition
+            if action_type not in {"yield_for", "watch_out_for"}:
+                raise ValueError(
+                    f"Unsupported action_type '{action_type}' for actor {actor_id}."
+                )
+            if actor_type not in {"vehicle", "cyclist", "ped"}:
+                raise ValueError(
+                    f"Unsupported actor_type '{actor_type}' for actor {actor_id}."
+                )
+            if not (0.0 <= float(importance) <= 1.0):
+                raise ValueError(
+                    f"Importance must be in [0.0, 1.0], got {importance} for actor {actor_id}."
+                )
+            condition_lookup[int(actor_id)] = (
+                action_type,
+                actor_type,
+                float(importance),
+            )
+
+    # Number of discrete time indices to extend before/after the true
+    # collision interval for each action type.
+    time_extension_steps = {
+        # "yield_for": (2, 10),      # wait longer after the collision
+        "yield_for": (20, 0),      # wait longer after the collision
+        "watch_out_for": (5, 5),   # symmetric caution window
+    }
+
+    # Spatial dilation (in metres) based on actor type and action flavour.
+    base_space_dilation = 0.5
+    space_dilation_by_actor_type = {"vehicle": 0.6, "cyclist": 0.9, "ped": 1.1}
+    space_dilation_by_action = {"yield_for": 0.3, "watch_out_for": 0.8}
+
+    # Collision cost scaling based on actor type + importance.
+    collision_cost_scale = {"vehicle": 1.0, "cyclist": 1.2, "ped": 1.4}
+
+    all_collision_intervals : Dict[int, List[CollisionInterval]] = {}
+
+    # Find collision intervals
+    for vid, arr in predictions.items():
+        bb_list_carla : List[carla.BoundingBox] = [
+            carla.BoundingBox(
+                carla.Location(
+                    x=float(bb_arr[0]),
+                    y=float(bb_arr[1]),
+                    z=float(bb_arr[2])
+                ),
+                carla.Vector3D(
+                    x=float(bb_arr[3]),
+                    y=float(bb_arr[4]),
+                    z=float(bb_arr[5])
+                )
+            ) for bb_arr in arr
+        ]
+
+        # collision_intervals = find_collision_intervals(
+        #     ego_forecasted_bbs_carla,
+        #     bb_list_carla
+        # )
+        collision_intervals = CollisionChecker._find_collision_intervals(
+            ego_forecasted_bbs_carla,
+            bb_list_carla
+        )
+        if len(collision_intervals) > 0:
+            all_collision_intervals[vid] = collision_intervals
+
+    return all_collision_intervals
+
 if __name__ == "__main__":
-    slope_env = 20.0  # m/s (your example)
+    st_algo_spec = STAlgoSpec(
+        A_max=24.0,
+        J_max=50.0,
+        W_vel=1.0,
+        W_acc=1.0,
+        W_jerk=1.0,
+        ds_grid=1.0,
+        dt_grid=0.25
+    )
+    st_grid_spec = STGridSpec(
+        S_max=40.0,
+        ds=1.0,
+        T_max=6.0,
+        dt=0.25
+    )
+    long_planner = LongPlanner(st_grid_spec=st_grid_spec, st_algo_spec=st_algo_spec, algo_name='dijkstra', sim_freq=20)
 
-    # Dynamics limits & weights
-    v0   = 0.0
-    a0   = 0.0
-    vmax = slope_env           # safe choice; can be tighter
-    amax = 25.0                 # m/s^2 (example)
-    jmax = 50.0                # m/s^3 (example)
-    w_vel, w_acc, w_jerk = 1.0, 0.2, 0.05
+    demo_conditions: Dict[int, Tuple[str, str, float]] = {}
+    if forecasted_bbs:
+        demo_ids = list(forecasted_bbs.keys())
+        for idx, actor_id in enumerate(demo_ids):
+            # action_type = "yield_for" if idx == 0 else "watch_out_for"
+            action_type = "yield_for"
+            # actor_type = "vehicle" if idx % 2 == 0 else "ped"
+            actor_type = "vehicle"
+            importance = 0.8 if idx == 0 else 0.4
+            demo_conditions[int(actor_id)] = (action_type, actor_type, importance)
 
-    # ---------------- 1) grids ----------------
-    ds = 0.1
-    dt = 0.05
-    t, s = make_grids(s_max=40.0, ds=ds, T_horizon=3.0, dt=dt)
-    K, S = t.size, s.size
-    ds_res, dt_res = ds, 2 * np.sqrt((2 * ds) / amax).round(2)
-    print(f'dt_res: {dt_res}')
-
-    # ---------------- 2) dynamic obstacles → occupancy ----------------
-    bands = compute_vehicle_s_bands(
+    actor_collisions = get_collision_intervals(
         forecasted_bbs,      # {vid: (T,7)}
         route_subset,        # (N,2)
         window=2,
-        use_ue4_yaw=False
-    )
-    # If your bands dict has start/end indices as shown earlier, use the interval-aware
-    # painter; otherwise keep your existing builder.
-    occ_dyn = build_occupancy_from_bands(t, s, bands_by_vid=bands)
-
-    # ---------------- 3) envelope → valid mask ----------------
-    valid = envelope_mask_under_diagonal(t, s, slope=slope_env)  # your signature uses 'slope='
-    occ_env = ~valid  # treat outside envelope as blocked
-
-    # ---------------- 4) combine & (optionally) inflate ----------------
-    occ_total = occ_dyn | occ_env  # boolean occupancy used by neighbours/Dijkstra
-    # occ_total = occ_env  # boolean occupancy used by neighbours/Dijkstra
-
-    # ---------------- 5) Dijkstra setup ----------------
-    # Start at smallest free s at t=0 (or just s_idx=0 if you prefer)
-    s_start_idx = 0
-
-    # Goal: reach highest s (right edge of grid)
-    s_goal_idx = S - 1
-
-
-    # ---------------- 6) run Dijkstra ----------------
-    path = dijkstra_st(
-        occupancy_grid=occ_total,
-        s_start_idx=s_start_idx,
-        s_goal_idx=s_goal_idx,
-        ds_res=ds_res,
-        dt_res=dt_res,
-        v0=v0,
-        a0=a0,
-        v_max=vmax,
-        a_max=amax,
-        j_max=jmax,
-        w_vel=w_vel,
-        w_acc=w_acc,
-        w_jerk=w_jerk,
-        allow_wait=True
+        use_ue4_yaw=False,
+        all_conditions=demo_conditions
     )
 
-    if len(path) == 0:
-        print("Dijkstra: no feasible path found.")
-
-    # ---------------- 7) visualize ----------------
-    fig, ax = plot_st_map(
-        t, s, occ_total, envelope_slope=slope_env,
-        title="s–T occupancy with diagonal envelope + Dijkstra path",
-        path=path,
-        start_idx=(path[0][1] if path else None),
-        goal_idx=S - 1
+    long_planner.run_step(
+        route_subset,
+        0.0,
+        13.89,
+        actor_collisions=actor_collisions,
+        plan_tick_counter=20
     )
-    # plt.show()
-
-    if path:
-        fig2, axs2, prof = plot_st_profiles(
-            t=t, s=s, path=path, dt_res=dt_res,
-            title="Planned longitudinal profiles"
-        )
-        # Access arrays if you need them programmatically:
-        # prof["t"], prof["s"], prof["v"], prof["a"], prof["j"]
-    else:
-        print("No path -> no profiles to plot.")
-
-    plt.show()
 
 # if __name__ == "__main__":
 #     N = 40

@@ -36,7 +36,10 @@ class ImageEncoder:
     def encode_image(image: Union[Path, np.ndarray]) -> str:
         def resize_image(img: np.ndarray, scale: float = 0.5) -> np.ndarray:
             height, width = img.shape[:2]
-            new_size = (int(width * scale), int(height * scale))
+            # new_size = (int(width * scale), int(height * scale))
+            # NOTE: MAKE SURE TO CHECK RESIZE DIMENSIONS
+            # TODO: UPDATE API TO PASS IN MULTIPLE IMAGES AT ONCE (IF DECIDE TO USE MULTIPLE IMAGES, CURRENT APPROACH IS CONCAT BEV AND FRONT VIEW)
+            new_size = (int(532), int(476))
             return cv2.resize(img, new_size, interpolation=cv2.INTER_AREA)
 
         if isinstance(image, Path):
