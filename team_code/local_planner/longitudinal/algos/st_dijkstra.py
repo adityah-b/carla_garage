@@ -1,6 +1,5 @@
 import heapq
 import numpy as np
-
 from typing import List, Tuple, Dict, Optional, Any
 
 class STDijkstra:
@@ -13,231 +12,192 @@ class STDijkstra:
     def find_neighbours(
         self,
         occupancy_grid: np.ndarray,
-        s_idx: int,
-        t_idx: int,
+        s_idx_algo: int,   # planner s-index (coarse lattice, ds_algo)
+        t_idx_grid: int,   # occupancy time index (rows)
         v_cur: float,
         a_cur: float,
-        ds_res: float,
-        dt_res: float,
+        ds_algo: float,
+        dt_algo: float,
         v_max: float,
         a_max: float,
         j_max: float
     ) -> List[Tuple[int, int, float, float]]:
         """
-        Vectorized successor generator for a layered s–T grid.
-        Monotonicity (no backwards s) is enforced; waiting (Δs=0) is allowed if feasible.
+        Generate successors on a coarse s–T lattice, with collision checks on a finer s_grid × t_grid occupancy.
 
-        Returns a list of (next_s_idx, next_t_idx, next_v, next_a).
-
-        Math (discrete to continuous mapping)
-        -------------------------------------
-        di = next_s_idx - s_idx                         (integer step in s-index, di >= 0)
-        ds = di * ds_res
-        dt = dt_res
-        next_v = ds / dt
-        next_a = (next_v - v_cur) / dt
-        next_j = (next_a - a_cur) / dt
-
-        Constraints → bounds on di
-        --------------------------
-        1) speed:     next_v ≤ v_max
-                ⇒ di ≤ floor((v_max * dt)/ds_res)
-        2) accel:     |next_a| ≤ a_max
-                ⇒ di ∈ [ ceil((v_cur*dt - a_max*dt^2)/ds_res),
-                        floor((v_cur*dt + a_max*dt^2)/ds_res) ]
-        3) jerk:      |next_j| ≤ j_max  ⇔  |next_a - a_cur| ≤ j_max * dt
-                ⇒ next_a ∈ [a_cur - j_max*dt, a_cur + j_max*dt]
-                ⇒ di ∈ [ ceil((v_cur*dt + (a_cur - j_max*dt)*dt^2)/ds_res),
-                        floor((v_cur*dt + (a_cur + j_max*dt)*dt^2)/ds_res) ]
-
-        We intersect all di-ranges, clamp to grid, then mask by occupancy.
-
-        Notes
-        -----
-        - If you disallow waiting, just set di_min = max(di_min, 1).
-        - The occupancy grid can already include the velocity-envelope mask.
+        - s_idx_algo lives on the planner's ds_algo lattice.
+        - t_idx_grid indexes rows of occupancy_grid (dt_grid spacing).
+        - We sample the continuous segment in (s,t) and project to grid using ds_grid, dt_grid.
         """
         neighbours: List[Tuple[int, int, float, float]] = []
 
-        # grid extents
-        T, S = occupancy_grid.shape
+        occ = occupancy_grid
+        T_grid, S_grid = occ.shape
 
-        # next_t_idx = t_idx + 1
-        next_t_idx = t_idx + int(dt_res / self.st_algo_spec.dt_grid)
-        if next_t_idx >= T:
+        # Resolutions
+        ds_grid = self.st_algo_spec.ds_grid   # [m] per occupancy column
+        dt_grid = self.st_algo_spec.dt_grid   # [s] per occupancy row
+
+        ds = float(ds_algo)                   # [m] per planner s-index
+        dt = float(dt_algo)                   # [s] per planner time step
+
+        # Map planner dt to a stride on the occupancy grid
+        time_stride = int(dt / dt_grid)
+        if time_stride <= 0:
+            time_stride = 1
+
+        next_t_idx_grid = t_idx_grid + time_stride
+        if next_t_idx_grid >= T_grid:
             return neighbours
 
-        ds = float(ds_res)
-        dt = float(dt_res)
+        # --- world extent and max planner index allowed ---
+        S_world_max = (S_grid - 1) * ds_grid
+        S_algo_max_idx = int(np.floor(S_world_max / ds))
 
-        # --- convert constraints to integer bounds on di ---
+        # --- kinematic bounds in terms of di (jump on ds_algo lattice) ---
         # Speed bound
         di_max_speed = int(np.floor((v_max * dt) / ds + 1e-12))
 
-        # Acceleration bound → di range
-        #   di = (v_cur*dt + next_a*dt^2) / ds
+        # Acceleration bound
         di_min_acc = int(np.ceil(((v_cur * dt) - (a_max * dt * dt)) / ds - 1e-12))
         di_max_acc = int(np.floor(((v_cur * dt) + (a_max * dt * dt)) / ds + 1e-12))
 
-        # Jerk bound → next_a ∈ [a_cur - j_max*dt, a_cur + j_max*dt] → di range
+        # Jerk bound
         a_lo = a_cur - j_max * dt
         a_hi = a_cur + j_max * dt
         di_min_jerk = int(np.ceil(((v_cur * dt) + (a_lo * dt * dt)) / ds - 1e-12))
         di_max_jerk = int(np.floor(((v_cur * dt) + (a_hi * dt * dt)) / ds + 1e-12))
 
-        # Intersect all ranges, also enforce monotonicity (di >= 0) and grid bound
+        # Intersect ranges + monotonicity + world bound
         di_min = max(0, di_min_acc, di_min_jerk)
-        di_max = min(di_max_speed, di_max_acc, di_max_jerk, S - 1 - s_idx)
+        di_max = min(di_max_speed, di_max_acc, di_max_jerk, S_algo_max_idx - s_idx_algo)
 
         if di_min > di_max:
             return neighbours
 
-        # ---- candidate destinations ----
-        di_vec  = np.arange(di_min, di_max + 1, dtype=np.int32)       # (N,)
-        next_s  = s_idx + di_vec                                      # (N,)
-        next_v  = (di_vec.astype(np.float32) * ds) / dt               # slope in m/s  (N,)
+        # Candidate jumps on the planner lattice
+        di_vec = np.arange(di_min, di_max + 1, dtype=np.int32)   # (N,)
+        next_s_algo_vec = s_idx_algo + di_vec                    # (N,)
+        next_v_vec = (di_vec.astype(np.float32) * ds) / dt       # (N,) m/s
 
-        # ---- diagonal sampling inside the slab (one per grid row) ----
-        # absolute s at samples: s0 + v_edge * Δt_k, where Δt_k = k*grid_dt
-        # TODO: MAKE THE CODE CLEARER HERE
-        stride = int(dt_res / self.st_algo_spec.dt_grid)
-        dt_steps = (np.arange(stride + 1, dtype=np.float32) * self.st_algo_spec.dt_grid)[:, None]  # (R,1)
-        s0 = (s_idx * ds)
-        s_diag = s0 + dt_steps * next_v[None, :]                      # (R,N) meters
-        # print(f'\nMeasurements\n')
-        # print(f'di_vec: {di_vec}')
-        # print(f'next_s: {next_s}')
-        # print(f'stride: {stride}')
-        # print(f'v_edge: {v_edge}')
-        # print(f'dt_steps: {dt_steps}')
-        # print(f's0: {s0}')
-        # print(f's_diag: {s_diag}')
+        # --- Collision sampling along each candidate edge ---
+        # Time samples: 0, dt_grid, 2*dt_grid, ..., dt (approx)
+        dt_grid_steps = (np.arange(time_stride + 1, dtype=np.float32) * dt_grid)[:, None]  # (R,1)
 
-        # station indices via floor, clamped
-        i_diag = np.floor(s_diag / ds).astype(np.int32)               # (R,N)
-        i_diag = np.clip(i_diag, 0, S - 1)
+        # World s at start of edge
+        s0_world = s_idx_algo * ds                               # meters
 
-        i_diag = np.vstack([i_diag, next_s])
+        # World s along diagonals: s(t) = s0 + v_edge * Δt_k
+        s_diag_world = s0_world + dt_grid_steps * next_v_vec[None, :]  # (R, N)
 
-        # Row indices: t_idx + k for k in [0, 1, ..., stride + 1]
-        rows = t_idx + np.arange(stride + 2, dtype=np.int32)          # (R,)
-        rows = np.clip(rows, 0, T - 1)  # Clamp to valid time indices
+        # Convert to occupancy columns
+        i_diag = np.floor(s_diag_world / ds_grid).astype(np.int32)
+        i_diag = np.clip(i_diag, 0, S_grid - 1)
 
-        # print(f'rows: {rows}')
-        # print(f'i_diag shape: {i_diag.shape}')
-        # print(f'i_diag:\n{i_diag}')
+        # Also include the final landing positions as samples
+        s_end_world = next_s_algo_vec.astype(np.float32) * ds
+        i_end = np.floor(s_end_world / ds_grid).astype(np.int32)
+        i_end = np.clip(i_end, 0, S_grid - 1)
 
-        # Occupancy along the diagonal samples
-        hit = occupancy_grid[rows[:, None], i_diag]                   # (R,N)
-        keep = ~hit.any(axis=0)                                       # (N,)
-        # print(f'hit: {hit}')
-        # print(f'keep: {keep}')
+        i_diag = np.vstack([i_diag, i_end])                      # (R+1, N)
+
+        # Occupancy rows spanned by this step: t_idx_grid .. t_idx_grid + time_stride (+1 margin)
+        rows = t_idx_grid + np.arange(time_stride + 2, dtype=np.int32)
+        rows = np.clip(rows, 0, T_grid - 1)
+
+        # Check occupancy along each diagonal
+        hit = occ[rows[:, None], i_diag]                         # (R+1, N)
+        keep = ~hit.any(axis=0)                                  # (N,)
 
         if not np.any(keep):
             return neighbours
 
         di_vec = di_vec[keep]
-        next_s = next_s[keep]
+        next_s_algo_vec = next_s_algo_vec[keep]
+        next_v_vec = next_v_vec[keep]
 
-        # next_s = next_s[keep]
-        # v_edge = v_edge[keep]
+        next_a_vec = (next_v_vec - v_cur) / dt
 
-        # # --- candidate next s-indices ---
-        # di_vec = np.arange(di_min, di_max + 1, dtype=np.int32)
-        # next_s = s_idx + di_vec
+        # Return neighbours in planner-index space + kinematics
+        for s_algo, v_next, a_next in zip(next_s_algo_vec, next_v_vec, next_a_vec):
+            neighbours.append((int(s_algo), next_t_idx_grid, float(v_next), float(a_next)))
 
-        # # --- occupancy pruning (False = free) ---
-        # free_mask = ~occupancy_grid[next_t_idx, next_s]
-        # if not np.any(free_mask):
-        #     return neighbours
-
-        # di_vec = di_vec[free_mask]
-        # next_s = next_s[free_mask]
-
-        # --- compute kinematics for the survivors (redundant with bounds, but safe) ---
-        # next_v = (di_vec.astype(np.float32) * ds) / dt
-        # next_a = (next_v - v_cur) / dt
-        next_v = next_v[keep]
-        next_a = (next_v - v_cur) / dt
-
-        # assemble results
-        neighbours = [(int(sj), next_t_idx, float(vj), float(aj))
-                    for sj, vj, aj in zip(next_s, next_v, next_a)]
         return neighbours
 
     def run(
         self,
-        occupancy_grid : np.ndarray,
-        s_start_idx : int,
-        s_goal_idx : int,
+        occupancy_grid: np.ndarray,
+        s_start_idx: int,   # START and GOAL are given in *grid* index space
+        s_goal_idx: int,
         *,
         v0: float,
-        v_max : float,
+        v_max: float,
         a0: float = 0.0,
         **_: Any,
     ) -> List[Tuple[int, int, float, float]]:
         """
-        Dijkstra on a time-layered s–T grid with dynamics enforced by `findNeighbours`.
+        Dijkstra on a coarse s–T lattice (ds_algo, dt_algo) with collision checks
+        on a finer occupancy grid (ds_grid, dt_grid).
 
-        State we store and key by (all integers):
-            (t_idx, s_idx, di_prev, ai_prev)
-        where di_prev = (s_idx - s_{idx-1}) in indices (0..),
-                ai_prev = (di_prev - di_prevprev) in indices (can be negative).
-        These let us derive:
-                v_cur = di_prev * ds / dt,
-                a_cur = ai_prev * ds / dt^2,
-                j_next = ((di_next - di_prev - ai_prev) * ds) / dt^3.
+        External API:
+            - occupancy_grid[t, s_grid] : bool or cost-like
+            - s_start_idx, s_goal_idx   : indices along s_grid
 
-        Returns:
-            List[(t_idx, s_idx, v, a)] along the optimal path in chronological order,
-            or [] if no solution was found.
-
-        Notes:
-        - The step cost is evaluated at the *landing* node (next state).
-        - If you want soft obstacles, pass a *costmap* instead of a boolean grid and
-        replace the last term accordingly (e.g., cost += costmap[next_t, next_s]).
+        Internal planner state:
+            - (t_idx_grid, s_idx_algo, di_prev, ai_prev)
+        We convert back to s_grid indices when returning the path.
         """
         occ = occupancy_grid.astype(bool)
-        K, S = occ.shape
-        dt = self.st_algo_spec.dt_algo_res
-        ds = self.st_algo_spec.ds_algo_res
+        K_grid, S_grid = occ.shape
 
-        a_max = self.st_algo_spec.A_max
-        j_max = self.st_algo_spec.J_max
+        ds_grid = self.st_algo_spec.ds_grid
+        dt_grid = self.st_algo_spec.dt_grid
+        ds_algo = self.st_algo_spec.ds_algo
+        dt_algo = self.st_algo_spec.dt_algo
 
-        w_vel = self.st_algo_spec.W_vel
-        w_acc = self.st_algo_spec.W_acc
-        w_jerk = self.st_algo_spec.W_jerk
+        # World coords (meters) for start/goal based on occupancy grid
+        s_start_world = s_start_idx * ds_grid
+        s_goal_world  = s_goal_idx  * ds_grid
 
-        # --- helpers to go between discrete (di/ai) and continuous (v/a) ---
-        def v_from_di(di: int) -> float:
-            return (di * ds) / dt
+        # Map start/goal from grid to planner lattice
+        s_start_idx_algo = int(round(s_start_world / ds_algo))
+        s_goal_idx_algo  = int(round(s_goal_world  / ds_algo))
 
-        def a_from_ai(ai: int) -> float:
-            return (ai * ds) / (dt * dt)
-
-        # --- initial discrete state (quantize v0, a0 onto the grid) ---
-        # di_prev0 ≈ round(v0*dt/ds), ai_prev0 ≈ round(a0*dt^2/ds)
-        di_prev0 = int(round((v0 * dt) / ds))
-        ai_prev0 = int(round((a0 * dt * dt) / ds))
-
-        # Guard: start cell must be free
-        if not (0 <= s_start_idx < S) or occ[0, s_start_idx]:
+        # Guard: start cell must be free in the occupancy grid
+        if not (0 <= s_start_idx < S_grid) or occ[0, s_start_idx]:
             return []
 
+        A_max = self.st_algo_spec.A_max
+        J_max = self.st_algo_spec.J_max
+
+        w_vel  = self.st_algo_spec.W_vel
+        w_acc  = self.st_algo_spec.W_acc
+        w_jerk = self.st_algo_spec.W_jerk
+
+        # --- helpers: di/ai (planner indices) ↔ v/a (continuous) ---
+        def v_from_di(di: int) -> float:
+            return (di * ds_algo) / dt_algo
+
+        def a_from_ai(ai: int) -> float:
+            return (ai * ds_algo) / (dt_algo * dt_algo)
+
+        # Initial discrete state (quantize v0, a0 onto ds_algo lattice)
+        di_prev0 = int(round((v0 * dt_algo) / ds_algo))
+        ai_prev0 = int(round((a0 * dt_algo * dt_algo) / ds_algo))
+
         # Priority queue entries: (cost_so_far, tie_breaker, state_key)
-        # state_key = (t_idx, s_idx, di_prev, ai_prev)
+        # state_key = (t_idx_grid, s_idx_algo, di_prev, ai_prev)
         pq: List[Tuple[float, int, Tuple[int, int, int, int]]] = []
         tie = 0
 
-        start_key = (0, s_start_idx, di_prev0, ai_prev0)
+        start_key = (0, s_start_idx_algo, di_prev0, ai_prev0)
         heapq.heappush(pq, (0.0, tie, start_key))
         tie += 1
 
         dist: Dict[Tuple[int, int, int, int], float] = {start_key: 0.0}
         parent: Dict[Tuple[int, int, int, int], Optional[Tuple[int, int, int, int]]] = {start_key: None}
 
-        # For reconstruction we also store continuous (v,a) at each node (computed once)
+        # Optional caches, kept here if you want them later
         v_cache: Dict[Tuple[int, int, int, int], float] = {start_key: v_from_di(di_prev0)}
         a_cache: Dict[Tuple[int, int, int, int], float] = {start_key: a_from_ai(ai_prev0)}
 
@@ -247,58 +207,60 @@ class STDijkstra:
             if cost_u != dist.get(key_u, np.inf):
                 continue  # stale
 
-            t_idx, s_idx, di_prev, ai_prev = key_u
-            # Goal: any arrival with s >= s_goal_idx
-            if s_idx >= s_goal_idx:
-                # reconstruct path
+            t_idx_grid, s_idx_algo, di_prev, ai_prev = key_u
+
+            # Goal test in world s via planner index
+            if s_idx_algo * ds_algo >= s_goal_world:
+                # reconstruct path, mapping s_idx_algo back to s_grid indices
                 path: List[Tuple[int, int, float, float]] = []
                 cur = key_u
                 while cur is not None:
-                    t_c, s_c, di_c, ai_c = cur
-                    path.append((t_c, s_c, v_from_di(di_c), a_from_ai(ai_c)))
+                    t_c, s_c_algo, di_c, ai_c = cur
+                    s_c_world = s_c_algo * ds_algo
+                    s_c_grid  = int(round(s_c_world / ds_grid))
+                    s_c_grid  = max(0, min(S_grid - 1, s_c_grid))
+                    path.append((t_c, s_c_grid, v_from_di(di_c), a_from_ai(ai_c)))
                     cur = parent[cur]
                 path.reverse()
                 return path
 
-            # No more time layers
-            if t_idx + 1 >= K:
+            # No more time rows to expand
+            if t_idx_grid + 1 >= K_grid:
                 continue
 
-            # Build neighbours using your dynamics checker
+            # Current continuous kinematics
             v_cur = v_from_di(di_prev)
             a_cur = a_from_ai(ai_prev)
 
+            # Build neighbours
             nbrs = self.find_neighbours(
                 occupancy_grid=occ,
-                s_idx=s_idx,
-                t_idx=t_idx,
+                s_idx_algo=s_idx_algo,
+                t_idx_grid=t_idx_grid,
                 v_cur=v_cur,
                 a_cur=a_cur,
-                ds_res=ds,
-                dt_res=dt,
+                ds_algo=ds_algo,
+                dt_algo=dt_algo,
                 v_max=v_max,
-                a_max=a_max,
-                j_max=j_max,
+                a_max=A_max,
+                j_max=J_max,
             )
-            # print(f'nbrs: {nbrs}')
 
             # Expand
-            for next_s_idx, next_t_idx, v_next, a_next in nbrs:
-                # derive discrete jumps
-                di_next = next_s_idx - s_idx
+            for next_s_algo, next_t_idx_grid, v_next, a_next in nbrs:
+                next_s_idx_grid = np.floor((next_s_algo * ds_algo) / ds_grid).astype(np.int32)
+                di_next = next_s_algo - s_idx_algo
                 ai_next = di_next - di_prev
-                # jerk at this landing state (continuous)
-                j_next = (a_next - a_cur) / dt
+                j_next  = (a_next - a_cur) / dt_algo
 
-                # step cost evaluated at the landing node (next)
                 step_cost = (
                     w_vel * (v_next - v_max) ** 2 +
                     w_acc * (a_next ** 2) +
                     w_jerk * (j_next ** 2) +
-                    255.0 * float(occ[next_t_idx, next_s_idx])  # zero for hard-occupied grids (already filtered)
+                    255.0 * float(occ[next_t_idx_grid, next_s_idx_grid])  # zero for hard-occupied grids (already filtered)
                 )
 
-                key_v = (next_t_idx, next_s_idx, di_next, ai_next)
+                key_v = (next_t_idx_grid, next_s_algo, di_next, ai_next)
                 new_cost = cost_u + step_cost
 
                 if new_cost < dist.get(key_v, np.inf):
@@ -309,5 +271,5 @@ class STDijkstra:
                     heapq.heappush(pq, (new_cost, tie, key_v))
                     tie += 1
 
-        # No path
+        # No path found
         return []
