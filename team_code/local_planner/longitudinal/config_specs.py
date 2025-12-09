@@ -3,32 +3,31 @@ from dataclasses import dataclass
 
 @dataclass
 class STGridSpec:
-    S_max : float = 40.0
-    ds : float = 0.1
+    S_max : float
+    ds : float
 
-    T_max : float = 3.0
-    dt : float = 0.05
+    T_max : float
+    dt : float
 
 @dataclass
 class STAlgoSpec:
     # Kinematic constraints
-    A_max: float = 4.0
-    J_max: float = 6.0
+    A_max: float
+    J_max: float
 
     # Kinematic costs
-    W_vel: float = 1.0
-    W_acc: float = 1.0
-    W_jerk: float = 1.0
+    W_vel: float
+    W_acc: float
+    W_jerk: float
 
     # Grid resolution
-    ds_grid : float = 0.1
-    dt_grid : float = 0.05
+    ds_grid : float
+    dt_grid : float
 
     # Algorithm resolution
-    @property
-    def dt_algo_res(self) -> float:
-        return 2 * np.sqrt((2 * self.ds_grid) / self.A_max).round(2)
+    ds_algo : float
 
     @property
-    def ds_algo_res(self) -> float:
-        return self.ds_grid
+    def dt_algo(self) -> float:
+        # TODO: CHOOSE HOW MUCH TIME BUFFER WE"RE ADDING
+        return 1.25 * np.sqrt((2 * self.ds_algo) / self.A_max).round(2)

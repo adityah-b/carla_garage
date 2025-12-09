@@ -123,9 +123,16 @@ class MotionPrediction:
         self,
         ego_vehicle : carla.Vehicle,
         ego_route_pts : np.ndarray,
-        target_speed : float = None
+        target_speed : float = None,
+        velocity_profile : Optional[np.ndarray] = None,
     ) -> List[carla.BoundingBox]:
         forecast_length = self.config.default_forecast_length
         num_future_frames = int(self.config.bicycle_frame_rate * forecast_length)
 
-        return self.forecaster.forecast_vehicle_bbs(ego_vehicle, ego_route_pts, num_future_frames, target_speed)
+        return self.forecaster.forecast_vehicle_bbs(
+            ego_vehicle,
+            ego_route_pts,
+            num_future_frames,
+            target_speed,
+            velocity_profile
+        )

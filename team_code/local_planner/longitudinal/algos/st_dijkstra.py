@@ -134,18 +134,18 @@ class STDijkstra:
         v_max: float,
         a0: float = 0.0,
         **_: Any,
-    ) -> List[Tuple[int, int, float, float]]:
+    ) -> Tuple[List[Tuple[int, int, float, float]], float]:
         """
         Dijkstra on a coarse s–T lattice (ds_algo, dt_algo) with collision checks
         on a finer occupancy grid (ds_grid, dt_grid).
 
-        External API:
-            - occupancy_grid[t, s_grid] : bool or cost-like
-            - s_start_idx, s_goal_idx   : indices along s_grid
-
-        Internal planner state:
-            - (t_idx_grid, s_idx_algo, di_prev, ai_prev)
-        We convert back to s_grid indices when returning the path.
+        Returns
+        -------
+        path : List[(t_idx_grid, s_idx_grid, v, a)]
+            Path in grid-index space with kinematics.
+        total_cost : float
+            Total accumulated cost of this path. If no path is found,
+            returns ([], np.inf).
         """
         occ = occupancy_grid.astype(bool)
         K_grid, S_grid = occ.shape
@@ -165,7 +165,7 @@ class STDijkstra:
 
         # Guard: start cell must be free in the occupancy grid
         if not (0 <= s_start_idx < S_grid) or occ[0, s_start_idx]:
-            return []
+            return [], float("inf")
 
         A_max = self.st_algo_spec.A_max
         J_max = self.st_algo_spec.J_max
@@ -204,8 +204,9 @@ class STDijkstra:
         # Main loop
         while pq:
             cost_u, _, key_u = heapq.heappop(pq)
+            # Skip stale entries
             if cost_u != dist.get(key_u, np.inf):
-                continue  # stale
+                continue
 
             t_idx_grid, s_idx_algo, di_prev, ai_prev = key_u
 
@@ -222,7 +223,9 @@ class STDijkstra:
                     path.append((t_c, s_c_grid, v_from_di(di_c), a_from_ai(ai_c)))
                     cur = parent[cur]
                 path.reverse()
-                return path
+
+                total_cost = cost_u  # accumulated cost for this goal state
+                return path, total_cost
 
             # No more time rows to expand
             if t_idx_grid + 1 >= K_grid:
@@ -272,4 +275,4 @@ class STDijkstra:
                     tie += 1
 
         # No path found
-        return []
+        return [], float("inf")

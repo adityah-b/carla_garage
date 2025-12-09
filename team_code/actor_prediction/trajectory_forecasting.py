@@ -1,7 +1,7 @@
 import carla
 import numpy as np
 
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 
 from config import GlobalConfig
 from kinematic_bicycle_model import KinematicBicycleModel
@@ -123,6 +123,7 @@ class MotionForecaster:
         vehicle_route_points : np.ndarray,
         num_future_frames : int,
         target_speed : float = None,
+        velocity_profile : Optional[np.ndarray] = None
     ) -> List[carla.BoundingBox]:
         self.lateral_controller.reset_state()
 
@@ -132,7 +133,13 @@ class MotionForecaster:
         vehicle_heading_angle = np.array([np.deg2rad(vehicle.get_transform().rotation.yaw)])
         vehicle_speed = np.array([vehicle.get_velocity().length()])
 
-        vehicle_target_speed = np.array([target_speed]) if target_speed is not None else vehicle_speed
+        has_velocity_profile = velocity_profile is not None and len(velocity_profile) > 0
+        if has_velocity_profile:
+            vehicle_target_speed = np.array([velocity_profile[0]])
+        elif target_speed is not None:
+            vehicle_target_speed = np.array([target_speed])
+        else:
+            vehicle_target_speed = vehicle_speed
 
         # Calculate the throttle command based on the target speed and current speed
         throttle = self.long_controller.get_throttle_extrapolation(vehicle_target_speed, vehicle_speed)
@@ -143,6 +150,10 @@ class MotionForecaster:
         future_bounding_boxes = []
         route_index = 0
         for i in range(num_future_frames):
+            if has_velocity_profile:
+                target_idx = min(i, len(velocity_profile) - 1)
+                vehicle_target_speed = np.array([float(velocity_profile[target_idx])])
+
             # Forecast the next state using the kinematic bicycle model
             vehicle_location, vehicle_heading_angle, vehicle_speed = self.vehicle_model.forecast_ego_vehicle(vehicle_location, vehicle_heading_angle, vehicle_speed, action)
 
