@@ -25,25 +25,27 @@ class PedestrianDataExtractor(BaseActorExtractor):
 
     def extract_ped_data(
         self,
-        ego_wp : carla.Waypoint,
+        ego_transform : carla.Transform,
         peds : List[carla.Walker]
     ) -> List[PedestrianData]:
         if not peds:
             return []
 
-        ego_transform_matrix = self._get_ego_transform_matrix(ego_wp)
-        ego_yaw = self._get_ego_yaw(ego_wp)
-
-        ped_data = self._extract_vectorized_data(peds, ego_transform_matrix, ego_yaw)
+        ped_data = self._extract_vectorized_data(peds, ego_transform)
 
         return ped_data
 
     def _extract_vectorized_data(
         self,
         peds : List[carla.Walker],
-        ego_matrix : np.ndarray,
-        ego_yaw : float
+        ego_transform : carla.Transform,
     ) -> List[PedestrianData]:
+        ego_location = ego_transform.location
+        ego_forward = ego_transform.get_forward_vector()
+
+        ego_matrix = self._get_ego_transform_matrix(ego_transform)
+        ego_yaw = self._get_ego_yaw(ego_transform)
+
         # Extract all data in vectorized form
         transform_matrices = np.array([p.get_transform().get_matrix() for p in peds])
         yaws = np.array([np.deg2rad(p.get_transform().rotation.yaw) for p in peds])
@@ -62,6 +64,11 @@ class PedestrianDataExtractor(BaseActorExtractor):
         # Create PedestrianData objects
         ped_data = []
         for i in range(len(peds)):
+            # Ignore pedestrians behind ego
+            relative_vector = peds[i].get_location() - ego_location
+            if ego_forward.dot(relative_vector) < 0.0:
+                continue
+
             # Check if pedestrian is on road
             ped_wp = self.carla_map.get_waypoint(peds[i].get_location(), project_to_road=False, lane_type=carla.LaneType.Driving)
             is_on_road = True if ped_wp else False

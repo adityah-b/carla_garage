@@ -3,17 +3,17 @@ import numpy as np
 
 
 class BaseActorExtractor:
-    def _get_ego_transform_matrix(self, ego_wp: carla.Waypoint) -> np.ndarray:
+    def _get_ego_transform_matrix(self, ego_transform: carla.Transform) -> np.ndarray:
         """
         Extract ego vehicle transformation matrix.
         """
-        return np.array(ego_wp.transform.get_matrix())
+        return np.array(ego_transform.get_matrix())
 
-    def _get_ego_yaw(self, ego_wp: carla.Waypoint) -> float:
+    def _get_ego_yaw(self, ego_transform: carla.Transform) -> float:
         """
         Extract ego vehicle yaw angle in radians.
         """
-        return np.deg2rad(ego_wp.transform.rotation.yaw)
+        return np.deg2rad(ego_transform.rotation.yaw)
 
     def _calculate_relative_positions(
         self,

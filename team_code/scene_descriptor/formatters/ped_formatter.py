@@ -25,14 +25,13 @@ class PedestrianFormatter(BaseFormatter):
         precision : int = 2
     ) -> str:
         f = cls.fmt
-        on_road = "On road" if ped_data.is_on_road else "Not on road"
-        return (
-            f"{indent}Pedestrian ID: {ped_data.id}, "
-            f"Speed: {f(ped_data.speed, precision)}, "
-            f"Relative Position: {f(ped_data.relative_position, precision)}, "
-            f"Relative Orientation: {f(ped_data.relative_orientation, precision)}, "
-            # f"Relative Distance: {f(ped_data.relative_distance, precision)}, "
-            # f"Pedestrian Location: {on_road}"
-            f"Relative Distance: {f(ped_data.relative_distance, precision)}"
-        )
+        parts = [
+            f"{indent}Pedestrian ID: {ped_data.id}",
+            f"Distance: {f(ped_data.relative_distance, precision)}",
+        ]
+
+        if ped_data.is_on_road:
+            parts.append("Status: Crossing road")
+
+        return ", ".join(parts)
 

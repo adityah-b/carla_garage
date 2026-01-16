@@ -10,7 +10,6 @@ class Action(str, Enum):
     ########################################
 
     FOLLOW_ROUTE = "follow_route"
-    # HOLD_POSITION = "hold_position"
 
     ########################################
     # LATERAL
@@ -28,15 +27,19 @@ class Action(str, Enum):
     OVERTAKE_LEFT = "overtake_left"
     OVERTAKE_RIGHT = "overtake_right"
 
+    # Pull over for emergency vehicles
+    PULL_OVER_LEFT = "pull_over_left"
+    PULL_OVER_RIGHT = "pull_over_right"
+
 class ConditionAction(str, Enum):
     YIELD_FOR = "yield_for"
     STOP_FOR = "stop_for"
-    WATCH_OUT_FOR = "watch_out_for"
 
 class ConditionCommand(BaseModel):
     condition_action : ConditionAction
     id : int = Field(description="The actor ID of the chosen target")
-    obj_type : Literal["vehicle", "cyclist", "ped", "obstacle", "stop_sign", "traffic_light"]
+    obj_type : Literal["vehicle", "cyclist", "pedestrian", "obstacle", "stop_sign", "traffic_light"]
+    traffic_type : Literal["leading", "trailing", "oncoming", "cross", "other"]
     importance : float = 1.0
 
 class EgoPlan(BaseModel):
@@ -45,11 +48,14 @@ class EgoPlan(BaseModel):
 
     # Optional adjustment parameters
     target_speed : Optional[float] = None
-    # target_route_adjustments : Optional[List[Tuple[float, float]]] = None
 
     # Conditions
     conditions : List[ConditionCommand]
-    reasoning : List[str] = Field(min_length=1, max_length=5, description="Step by step reasoning on why each step and parameter choice is valid")
+    reasoning : List[str] = Field(
+        min_length=1,
+        max_length=5,
+        description="Step by step reasoning on why each step and parameter choice is valid"
+    )
 
 class PlanStatus(str, Enum):
     EXECUTING = "executing"

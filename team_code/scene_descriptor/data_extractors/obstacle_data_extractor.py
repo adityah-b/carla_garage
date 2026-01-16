@@ -24,6 +24,7 @@ class ObstacleDataExtractor(BaseActorExtractor):
 
     def extract_obstacle_data(
         self,
+        ego_transform: carla.Transform,
         ego_wp: carla.Waypoint,
         obstacles: List[carla.Actor],
         planner_state : PlannerState,
@@ -32,8 +33,8 @@ class ObstacleDataExtractor(BaseActorExtractor):
         if not obstacles:
             return [], None
 
-        ego_location = ego_wp.transform.location
-        ego_forward = ego_wp.transform.get_forward_vector()
+        ego_location = ego_transform.location
+        ego_forward = ego_transform.get_forward_vector()
 
         lidar_sensor = lidar_data['sensor']
         lidar_raw_data = lidar_data['raw_data']
@@ -66,6 +67,10 @@ class ObstacleDataExtractor(BaseActorExtractor):
 
         lane_obstacles: List[carla.Actor] = []
         for obstacle in obstacles:
+            # Ignore non-disruptive obstacles
+            if any(map(obstacle.type_id.__contains__, ['dirtdebris'])):
+                continue
+
             if ego_location.distance(obstacle.get_location()) > self.config.detection_radius:
                 continue
 
@@ -94,7 +99,7 @@ class ObstacleDataExtractor(BaseActorExtractor):
         if not lane_obstacles:
             return [], None
 
-        ego_transform_matrix = self._get_ego_transform_matrix(ego_wp)
+        ego_transform_matrix = self._get_ego_transform_matrix(ego_transform)
         obstacle_matrices = np.array([obs.get_transform().get_matrix() for obs in lane_obstacles])
 
         relative_positions = self._calculate_relative_positions(obstacle_matrices, ego_transform_matrix)

@@ -15,14 +15,13 @@ class IntersectionType(Enum):
     UNSIGNALIZED = 1
     OTHER = 2
 
-LaneChangeEntry = Tuple[RoadOption, int, int, int]
+LaneChangeEntry = Tuple[RoadOption, int, int]
 IntersectionEntry = Tuple[RoadOption, int, int, IntersectionType]
 
 @dataclass(frozen=True, slots=True)
 class LaneChangeData:
     distance_to_lane_change : float
     inside_lane_change : bool
-    available_lane_change_distance: float
     target_maneuver: Literal[RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT]
     is_executing_maneuver : bool
     entry : LaneChangeEntry
@@ -38,11 +37,21 @@ class IntersectionData:
     entry : IntersectionEntry
 
 @dataclass(frozen=True, slots=True)
-class ObstacleData:
-    distance_to_obstacle : float
+class LaneInfo:
+    has_left_lane : bool
+    has_right_lane : bool
+    left_oncoming : bool
+    right_oncoming : bool
+    can_change_left : bool
+    can_change_right : bool
+
+    @property
+    def same_direction_lane_change_available(self) -> bool:
+        return self.can_change_left or self.can_change_right
 
 @dataclass(frozen=True, slots=True)
 class RouteData:
+    lane_info : LaneInfo
     intersection_data : Optional[IntersectionData]
     lane_change_data : Optional[LaneChangeData]
 
@@ -71,6 +80,7 @@ class RouteDataExtractor:
         planner_state : PlannerState
     ) -> RouteData:
         # TODO: TEMP CHANGE FOR TESTING
+        lane_info = self._extract_lane_info(ego_wp)
         intersection_data=self._extract_intersection_data(ego_wp, planner_state)
         lane_change_data=self._extract_lane_change_data(ego_vehicle, planner_state)
 
@@ -81,8 +91,48 @@ class RouteDataExtractor:
                 intersection_data = None
 
         return RouteData(
+            lane_info=lane_info,
             intersection_data=intersection_data,
             lane_change_data=lane_change_data
+        )
+
+    def _extract_lane_info(self, ego_wp: carla.Waypoint) -> LaneInfo:
+        left_wp = ego_wp.get_left_lane()
+        right_wp = ego_wp.get_right_lane()
+
+        left_available = left_wp is not None and left_wp.lane_type == carla.LaneType.Driving
+        right_available = right_wp is not None and right_wp.lane_type == carla.LaneType.Driving
+
+        ego_forward = ego_wp.transform.get_forward_vector()
+
+        def _is_oncoming(neighbor_wp: Optional[carla.Waypoint]) -> bool:
+            if neighbor_wp is None:
+                return False
+            neighbor_forward = neighbor_wp.transform.get_forward_vector()
+            return ego_forward.dot(neighbor_forward) < 0.0
+
+        left_oncoming = left_available and _is_oncoming(left_wp)
+        right_oncoming = right_available and _is_oncoming(right_wp)
+
+        lane_change = ego_wp.lane_change
+        can_change_left = (
+            left_available
+            and not left_oncoming
+            and (lane_change in (carla.LaneChange.Left, carla.LaneChange.Both) or ego_wp.lane_type != carla.LaneType.Driving)
+        )
+        can_change_right = (
+            right_available
+            and not right_oncoming
+            and (lane_change in (carla.LaneChange.Right, carla.LaneChange.Both) or ego_wp.lane_type != carla.LaneType.Driving)
+        )
+
+        return LaneInfo(
+            has_left_lane=left_available,
+            has_right_lane=right_available,
+            left_oncoming=left_oncoming,
+            right_oncoming=right_oncoming,
+            can_change_left=can_change_left,
+            can_change_right=can_change_right
         )
 
     def _extract_intersection_data(
@@ -144,29 +194,25 @@ class RouteDataExtractor:
             return None
 
         # Unpack lane change information
-        lane_change_cmd, early_start_idx, late_start_idx, end_idx = lane_change_data_raw
+        lane_change_cmd, lc_start_idx, lc_end_idx = lane_change_data_raw
 
-        early_start_wp = planner_state.route_waypoints[early_start_idx]
-        late_start_wp = planner_state.route_waypoints[late_start_idx]
+        start_wp = planner_state.route_waypoints[lc_start_idx]
+        end_wp = planner_state.route_waypoints[lc_end_idx]
+        passed_start_wp = self._has_passed_waypoint(ego_tf, start_wp)
+        passed_end_wp = self._has_passed_waypoint(ego_tf, end_wp)
 
-        passed_early_wp = self._has_passed_waypoint(ego_tf, early_start_wp)
-        passed_late_wp = self._has_passed_waypoint(ego_tf, late_start_wp)
+        inside_lane_change = (passed_start_wp) and not passed_end_wp
 
-        inside_lane_change = (passed_early_wp) and not passed_late_wp
-
-        if not passed_early_wp:
-            dist_to_lane_change = ego_loc.distance(early_start_wp.transform.location)
+        if not passed_start_wp:
+            dist_to_lane_change = ego_loc.distance(start_wp.transform.location)
         else:
             dist_to_lane_change = 0.0
-
-        avail_dist = 0.0 if passed_late_wp else ego_loc.distance(late_start_wp.transform.location)
 
         is_executing_maneuver = (lane_change_cmd == ego_cmd) and inside_lane_change
 
         return LaneChangeData(
             distance_to_lane_change=dist_to_lane_change,
             inside_lane_change=inside_lane_change,
-            available_lane_change_distance=avail_dist,
             target_maneuver=lane_change_cmd,
             is_executing_maneuver=is_executing_maneuver,
             entry=lane_change_data_raw
@@ -186,39 +232,36 @@ class RouteDataExtractor:
         to_index = min(max_route_length - 1, route_index + look_ahead_points)
 
         # Look for upcoming intersection
-        intersection_idx = None
+        intersection_start_idx = None
         intersection_cmd = None
         for i in range(route_index, to_index):
             cmd = route_cmds[i]
             wp = route_wps[i]
             if (wp.is_junction) and (cmd in (RoadOption.LEFT, RoadOption.STRAIGHT, RoadOption.LANEFOLLOW, RoadOption.RIGHT)):
-                intersection_idx = i
+                intersection_start_idx = i
                 intersection_cmd = cmd
                 break
 
-        if intersection_idx is None:
+        if intersection_start_idx is None:
             return None
 
-        start_idx = intersection_idx
-        while (start_idx > 0) and route_wps[start_idx].is_junction and route_cmds[start_idx] == intersection_cmd:
-            start_idx -= 1
+        intersection_end_idx = intersection_start_idx
+        while (intersection_end_idx < max_route_length - 1) and route_cmds[intersection_end_idx] == intersection_cmd:
+            intersection_end_idx +=1
 
-        end_idx = intersection_idx
-        while (end_idx < max_route_length) and route_wps[end_idx].is_junction and route_cmds[end_idx] == intersection_cmd:
-            end_idx +=1
+        print(f'\n\nINTERSECTION TURN')
+        print(f'\t\tstart: {intersection_start_idx}, end: {intersection_end_idx}')
 
-        dist_next_tl = planner_state.dist_to_next_traffic_lights[start_idx]
-        dist_next_ss = planner_state.dist_to_next_stop_signs[start_idx]
+        # Any intersections with traffic lights are automatically signalized
+        dist_next_tl = planner_state.dist_to_next_traffic_lights[route_index]
 
-        if dist_next_tl == np.inf and dist_next_ss == np.inf:
-            return None
+        dist_to_junc = route_wps[intersection_start_idx].transform.location.distance(route_wps[route_index].transform.location)
 
-        if dist_next_tl < dist_next_ss:
-            signalized = IntersectionType.SIGNALIZED
-        else:
-            signalized = IntersectionType.UNSIGNALIZED
+        # TODO: IDEALLY ALL THIS SHOULD BE PRECOMPUTED IN THE PRIVILEGEDROUTEPLANNER
+        if dist_next_tl != np.inf and abs(dist_next_tl - dist_to_junc) < 10.0:
+            return (intersection_cmd, intersection_start_idx, intersection_end_idx, IntersectionType.SIGNALIZED)
 
-        return (intersection_cmd, start_idx, end_idx, signalized)
+        return (intersection_cmd, intersection_start_idx, intersection_end_idx, IntersectionType.UNSIGNALIZED)
 
     def _get_upcoming_lane_change(
         self,
@@ -228,7 +271,6 @@ class RouteDataExtractor:
         # Unpack planner state
         route_index = planner_state.route_index
         route_pts = planner_state.route_points
-        route_wps = planner_state.route_waypoints
         route_cmds = planner_state.route_commands
 
         # Calculate the braking distance based on the ego speed
@@ -244,38 +286,25 @@ class RouteDataExtractor:
         to_index = min(max_route_length - 1, route_index + look_ahead_points)
 
         # Iterate over the points around the current position, checking for lane change commands
-        lane_change_idx = None
+        lc_start_idx = None
         lane_change_cmd = None
         for i in range(route_index, to_index):
             cmd = route_cmds[i]
             if cmd in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
                 # Set the lane change direction and mandatory start point to begin the maneuver
-                lane_change_idx = i
+                lc_start_idx = i
                 lane_change_cmd = cmd
                 break
 
-        if lane_change_idx is None:
+        if lc_start_idx is None:
             return None
 
-        late_wp = route_wps[lane_change_idx]
-
-        early_idx = lane_change_idx
-        traveled_distance = 0.0
-
-        while (early_idx > route_index) and \
-            (route_wps[early_idx].lane_id == late_wp.lane_id) and \
-            (route_wps[early_idx].road_id == late_wp.road_id) and \
-            (traveled_distance < self.LOOKAHEAD_DISTANCE):
-
-            early_idx -= 1
-            traveled_distance = late_wp.transform.location.distance(route_wps[early_idx].transform.location)
-
-        # print(f'R IDX: {route_index}, E IDX: {early_idx}, LC IDX: {lane_change_idx}')
-        # print(f'Traveled distance: {traveled_distance}')
-
         # Find the end point of the lane change, where the lane change is completed
-        end_idx = lane_change_idx
-        while (end_idx < max_route_length) and route_cmds[end_idx] == lane_change_cmd:
-            end_idx += 1
+        lc_end_idx = lc_start_idx
+        while (lc_end_idx < max_route_length - 1) and route_cmds[lc_end_idx] == lane_change_cmd:
+            lc_end_idx += 1
 
-        return (lane_change_cmd, early_idx, lane_change_idx, end_idx)
+        print(f'\n\nLANE CHANGE')
+        print(f'\t\tstart: {lc_start_idx}, end: {lc_end_idx}')
+
+        return (lane_change_cmd, lc_start_idx, lc_end_idx)

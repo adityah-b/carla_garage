@@ -45,23 +45,29 @@ class SceneExtractor:
         lidar_data : Dict,
     ) -> SceneData:
         ego_wp = self.carla_map.get_waypoint(ego_vehicle.get_location(), lane_type=carla.LaneType.Any)
+        ego_transform = ego_vehicle.get_transform()
         ego_loc = ego_vehicle.get_location()
 
         # Extract structured data using specialized extractors
-        traffic_data = self._traffic_extractor.extract_traffic_data(planner_state=planner_state)
+        traffic_data = self._traffic_extractor.extract_traffic_data(ego_transform=ego_transform, planner_state=planner_state)
         ego_data = self._ego_extractor.extract_ego_data(ego_vehicle=ego_vehicle, planner_state=planner_state)
 
         npc_vehicles = [
             veh for veh in actors.filter("*vehicle*")
             if veh.id != ego_vehicle.id
         ]
-        vehicle_data = self._vehicle_extractor.extract_vehicle_data(ego_wp=ego_wp, planner_state=planner_state, vehicles=npc_vehicles)
+        vehicle_data = self._vehicle_extractor.extract_vehicle_data(
+            ego_transform=ego_transform,
+            ego_wp=ego_wp,
+            planner_state=planner_state,
+            vehicles=npc_vehicles
+        )
 
         pedestrians = [
             ped for ped in actors.filter("*walker*")
             if ped.get_location().distance(ego_loc) < self.config.detection_radius
         ]
-        ped_data = self._ped_extractor.extract_ped_data(ego_wp=ego_wp, peds=pedestrians)
+        ped_data = self._ped_extractor.extract_ped_data(ego_transform=ego_transform, peds=pedestrians)
 
         static_obstacles = list(actors.filter("static.*"))
         # Check if actor is dynamically spawned non-moving vehicle (treat as static object)
@@ -71,6 +77,7 @@ class SceneExtractor:
                 static_obstacles.append(vehicle)
 
         obstacle_data, closest_obstacle = self._obstacle_extractor.extract_obstacle_data(
+            ego_transform=ego_transform,
             ego_wp=ego_wp, obstacles=static_obstacles, planner_state=planner_state, lidar_data=lidar_data
         )
 

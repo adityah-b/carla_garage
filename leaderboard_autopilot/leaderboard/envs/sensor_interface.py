@@ -179,8 +179,8 @@ class CallBack(object):
         points = copy.deepcopy(points)
 
         xyz = np.stack([points['x'], points['y'], points['z']], axis=-1) # (N, 3)
-        cos_i = points['cos'].reshape((points['cos'].shape[0], 1))
-        obj_idx = points['object_idx'].reshape((points['object_idx'].shape[0], 1))
+        cos_i = points['cos']
+        obj_idx = points['object_idx']
         obj_tag = points['object_tag']
 
         out = {

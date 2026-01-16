@@ -6,22 +6,31 @@ from dataclasses import dataclass
 from typing import Dict, Tuple
 
 from .camera_interface import CameraInterface
+from .data_extractors.scene_extractor import SceneData
 
 @dataclass(frozen=True, slots=True)
 class ImageRendererConfig:
     # Rendering configuration
     VEHICLE_BBOX_COLOR = (255, 0, 0) # Blue in BGR
-    EGO_BBOX_COLOR = (0, 255, 0) # Green
-    CYCLIST_BBOX_COLOR = (255, 255, 0) # Cyan
-    PED_BBOX_COLOR = (0, 255, 255) # Yellow
+    # EGO_BBOX_COLOR = (0, 255, 0) # Green
+    EGO_BBOX_COLOR = (43, 64, 6) #  Dark Green
+    # CYCLIST_BBOX_COLOR = (255, 255, 0) # Cyan
+    CYCLIST_BBOX_COLOR = (255, 0, 127) # Violet
+    # PED_BBOX_COLOR = (0, 255, 255) # Yellow
+    PED_BBOX_COLOR = (34, 119, 204) # Ochre
+    OBSTACLE_BBOX_COLOR = (0, 0, 255) # Red
 
-    BBOX_THICKNESS = 1
+    BBOX_THICKNESS = 2
     LABEL_COLOR = (255, 255, 255)  # White text
 
     VEHICLE_LABEL_BG_COLOR = (255, 0, 0)  # Blue background
-    EGO_LABEL_BG_COLOR = (0, 255, 0) # Green
-    CYCLIST_LABEL_BG_COLOR = (255, 255, 0) # Cyan
-    PED_LABEL_BG_COLOR = (0, 255, 255) # Yellow
+    # EGO_LABEL_BG_COLOR = (0, 255, 0) # Green
+    EGO_LABEL_BG_COLOR = (43, 64, 6) #  Dark Green
+    # CYCLIST_LABEL_BG_COLOR = (255, 255, 0) # Cyan
+    CYCLIST_LABEL_BG_COLOR = (255, 0, 127) # Violet
+    # PED_LABEL_BG_COLOR = (0, 255, 255) # Yellow
+    PED_LABEL_BG_COLOR = (34, 119, 204) # Ochre
+    OBSTACLE_LABEL_BG_COLOR = (0, 0, 255) # Red
 
     LABEL_FONT = cv2.FONT_HERSHEY_SIMPLEX
     LABEL_FONT_SCALE = 0.5
@@ -51,7 +60,7 @@ class ImageRenderer:
         self,
         cameras : Dict[str, CameraInterface],
         ego_vehicle : carla.Vehicle,
-        actors : carla.ActorList,
+        scene_data : SceneData,
     ) -> Dict[str, np.ndarray]:
         """
         Render bounding boxes for all actors on all camera images.
@@ -68,10 +77,22 @@ class ImageRenderer:
         ego_location = ego_transform.location
         ego_forward_vec = ego_transform.get_forward_vector()
 
-        # Get all vehicles (cyclists included) including ego
-        all_vehicles = list(actors.filter("*vehicle*"))
-        # Get all peds
-        all_peds = list(actors.filter("*walker*"))
+        # Get all pedestrians
+        all_peds = [] if scene_data.ped_data is None else scene_data.ped_data
+
+        # Get all obstacles
+        all_obstacles = [] if scene_data.obstacle_data is None else scene_data.obstacle_data
+
+        # Get all vehicles (cyclists included)
+        all_vehicles = []
+        if scene_data.vehicle_data:
+            all_vehicles = [
+                v_data
+                for lanes in scene_data.vehicle_data.values()
+                for lv_list in lanes.values()
+                for lv in lv_list
+                for v_data in lv.vehicle_data
+            ]
 
         rendered_images = {}
 
@@ -82,7 +103,25 @@ class ImageRenderer:
             # Create copy of image for rendering
             rendered_image = camera.image.copy()
 
-            for vehicle in all_vehicles:
+            # Render ego vehicle
+            bb_color = self.config.EGO_BBOX_COLOR
+            label_bg_color = self.config.EGO_LABEL_BG_COLOR
+            label_text = "EGO"
+            if self._should_render_actor(
+                ego_vehicle, ego_location, ego_forward_vec, tag
+            ):
+                self._render_single_actor(
+                    rendered_image,
+                    camera,
+                    ego_vehicle,
+                    bb_color,
+                    label_bg_color,
+                    label_text
+                )
+
+            for vehicle_entry in all_vehicles:
+                vehicle = vehicle_entry.vehicle
+
                 if self._should_render_actor(
                     vehicle, ego_location, ego_forward_vec, tag
                 ):
@@ -97,10 +136,9 @@ class ImageRenderer:
                             label_text=str(vehicle.id)
                         )
                     else:
-                        is_ego = vehicle.id == ego_vehicle.id
-                        bb_color = self.config.EGO_BBOX_COLOR if is_ego else self.config.VEHICLE_BBOX_COLOR
-                        label_bg_color = self.config.EGO_LABEL_BG_COLOR if is_ego else self.config.VEHICLE_LABEL_BG_COLOR
-                        label_text = "EGO" if is_ego else str(vehicle.id)
+                        bb_color = self.config.VEHICLE_BBOX_COLOR
+                        label_bg_color = self.config.VEHICLE_LABEL_BG_COLOR
+                        label_text = str(vehicle.id)
                         self._render_single_actor(
                             rendered_image,
                             camera,
@@ -110,7 +148,8 @@ class ImageRenderer:
                             label_text
                         )
 
-            for ped in all_peds:
+            for ped_entry in all_peds:
+                ped = ped_entry.pedestrian
                 if self._should_render_actor(
                     ped, ego_location, ego_forward_vec, tag
                 ):
@@ -121,6 +160,20 @@ class ImageRenderer:
                         bb_color=self.config.PED_BBOX_COLOR,
                         label_bg_color=self.config.PED_LABEL_BG_COLOR,
                         label_text=str(ped.id)
+                    )
+
+            for obstacle_entry in all_obstacles:
+                obstacle = obstacle_entry.obstacle
+                if self._should_render_actor(
+                    obstacle, ego_location, ego_forward_vec, tag
+                ):
+                    self._render_single_actor(
+                        rendered_image,
+                        camera,
+                        obstacle,
+                        bb_color=self.config.OBSTACLE_BBOX_COLOR,
+                        label_bg_color=self.config.OBSTACLE_LABEL_BG_COLOR,
+                        label_text=str(obstacle.id)
                     )
 
             rendered_images[tag] = rendered_image
@@ -154,15 +207,16 @@ class ImageRenderer:
         if "bev" in camera_tag.lower():
             return True
 
-        actor_location = actor.get_location()
-        ego_to_actor_vec = actor_location - ego_location
-        distance = actor_location.distance(ego_location)
+        return False
+        # actor_location = actor.get_location()
+        # ego_to_actor_vec = actor_location - ego_location
+        # distance = actor_location.distance(ego_location)
 
-        # Only render actors in front and within distance threshold
-        is_in_front = ego_to_actor_vec.dot(ego_forward_vec) > 0
-        is_within_range = distance < self.config.MAX_FRONT_CAM_DRAW_DISTANCE
+        # # Only render actors in front and within distance threshold
+        # is_in_front = ego_to_actor_vec.dot(ego_forward_vec) > 0
+        # is_within_range = distance < self.config.MAX_FRONT_CAM_DRAW_DISTANCE
 
-        return is_in_front and is_within_range
+        # return is_in_front and is_within_range
 
     def _render_single_actor(
         self,
@@ -192,11 +246,11 @@ class ImageRenderer:
         self,
         image: np.ndarray,
         camera: CameraInterface,
-        actor : carla.Actor,
-        bb_color : Tuple,
+        actor: carla.Actor,
+        bb_color: Tuple,
     ) -> None:
         """
-        Draw 3D bounding box projected to 2D image.
+        Draw a 2D axis-aligned bounding box that encloses the projected 3D actor bbox.
 
         Args:
             image: Image array to draw on
@@ -204,38 +258,51 @@ class ImageRenderer:
             actor: CARLA actor
         """
         # Get bounding box vertices in world coordinates
-        bbox_vertices = [
-            vertex for vertex in
-            actor.bounding_box.get_world_vertices(actor.get_transform())
-        ]
+        bbox_vertices = actor.bounding_box.get_world_vertices(actor.get_transform())
 
         camera_transform = camera.transform
         camera_forward_vec = camera_transform.get_forward_vector()
         camera_location = camera_transform.location
 
-        # Draw each edge of the bounding box
-        for edge in self.BBOX_EDGES:
-            vertex1, vertex2 = bbox_vertices[edge[0]], bbox_vertices[edge[1]]
+        projected_points = []
 
-            # Project vertices to 2D
-            p1_2d = self._project_vertex_with_occlusion_handling(
-                vertex1, camera, camera_forward_vec, camera_location
+        # Project all vertices to 2D
+        for vertex in bbox_vertices:
+            p_2d = self._project_vertex_with_occlusion_handling(
+                vertex, camera, camera_forward_vec, camera_location
             )
-            p2_2d = self._project_vertex_with_occlusion_handling(
-                vertex2, camera, camera_forward_vec, camera_location
-            )
+            if p_2d is not None and camera.is_point_in_canvas(p_2d):
+                projected_points.append(p_2d)
 
-            # Check if both points are visible
-            if (p1_2d is not None and p2_2d is not None and
-                camera.is_point_in_canvas(p1_2d) and camera.is_point_in_canvas(p2_2d)):
+        # If nothing valid was projected, skip drawing
+        if len(projected_points) == 0:
+            return
 
-                cv2.line(
-                    image,
-                    (int(p1_2d[0]), int(p1_2d[1])),
-                    (int(p2_2d[0]), int(p2_2d[1])),
-                    bb_color,
-                    self.config.BBOX_THICKNESS
-                )
+        projected_points = np.array(projected_points)
+
+        min_x = int(np.min(projected_points[:, 0]))
+        max_x = int(np.max(projected_points[:, 0]))
+        min_y = int(np.min(projected_points[:, 1]))
+        max_y = int(np.max(projected_points[:, 1]))
+
+        # Clamp box to image boundaries
+        img_h, img_w = image.shape[:2]
+        min_x = max(0, min_x)
+        max_x = min(img_w - 1, max_x)
+        min_y = max(0, min_y)
+        max_y = min(img_h - 1, max_y)
+
+        # Sanity check: ensure box has area
+        if min_x >= max_x or min_y >= max_y:
+            return
+
+        cv2.rectangle(
+            image,
+            (min_x, min_y),
+            (max_x, max_y),
+            bb_color,
+            self.config.BBOX_THICKNESS,
+        )
 
     def _project_vertex_with_occlusion_handling(
         self,

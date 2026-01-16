@@ -125,14 +125,6 @@ class OpenRouterClient(APIClient):
             max_completion_tokens=1024,
         )
 
-        # print(f'\n\nRAW OUTPUT\n\n')
-        # print(f'{repr(response.choices[0].message.content)}')
-        # print(f'\n\nUSAGE\n\n')
-        # print(f'{response.usage}')
-        # print(f'\n\nSTOP REASON\n\n')
-        # print(f'{response.choices[0].finish_reason}')
-        # print(f'\n\nJSON DUMP\n\n')
-        # print(f'{response.model_dump_json(indent=2)}')
         return response.choices[0].message.content
 
 class VLLMClient(APIClient):
@@ -140,8 +132,8 @@ class VLLMClient(APIClient):
         self.api_key = os.getenv("VLLM_API_KEY", "EMPTY")
         # self.base_url = "http://localhost:8000/v1"
         # self.base_url = "http://127.0.0.1:8000/v1"
-        # self.base_url = "http://192.168.42.200:8000/v1"
-        self.base_url = "http://192.168.42.135:8000/v1"
+        self.base_url = "http://192.168.42.200:8000/v1"
+        # self.base_url = "http://192.168.42.135:8000/v1"
 
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         self.model_name = model_name

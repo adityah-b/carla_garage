@@ -138,7 +138,7 @@ class LongitudinalPIDController(LongitudinalController):
         Returns:
             float: The throttle value.
         """
-    return self.get_throttle(False, target_speed, current_speed)
+    return self.get_throttle_and_brake(False, target_speed, current_speed)
 
   def save(self):
     """

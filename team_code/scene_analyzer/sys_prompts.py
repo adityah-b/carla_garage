@@ -326,7 +326,7 @@ A 2D BEV coordinate system is used for decision-making and all measurements use 
 
 Given the front-view image, BEV image, and textual description, produce a single JSON object that conforms exactly to the HighLevelBehaviour schema described below.
 
-You must ONLY use actors, traffic objects, and obstacles that appear in the image input or the text input. Do not invent new actors or objects, and do not omit relevant ones.
+You must ONLY use actors, traffic objects, and obstacles that appear in BOTH the image AND text inputs. Do not invent new actors or objects, and do not omit relevant ones.
 
 The top-level JSON object has the following fields:
 
@@ -341,6 +341,11 @@ The top-level JSON object has the following fields:
       - "trailing": behind ego in the same lane or intended lane.
       - "oncoming": coming toward ego in the opposite direction.
       - "cross": cross-traffic at or near an intersection that may intersect ego’s path.
+      - "other": relevant but does not fit the above categories.
+    - traffic_lane: one of "ego lane", "right lane", "left lane", "other".
+      - "ego lane": in the same lane as the ego
+      - "right lane": in the right lane relative to the ego
+      - "left lane": in the left lane relative to the ego
       - "other": relevant but does not fit the above categories.
     - distance_from_ego_m: float, distance from ego in metres.
       - Use the numeric value from the text input.
@@ -365,18 +370,37 @@ The top-level JSON object has the following fields:
 
 - next_action
   - A natural-language summary of your analysis. End your summary describing the high-level action the ego should do next.
+  - Only choose high level actions from this set. Do NOT create new actions:
+    - follow route
+    - stop for
+    - turn left
+    - turn right
+    - change lane left
+    - change lane right
+    - overtake left
+    - overtake right
+    - pull over left for emergency vehicle
+    - pull over right for emergency vehicle
 
 - reasoning
   - A list of 1 to 10 short reasoning steps.
+  - Reference specific actors or objects by ID where useful.
   - Each entry should be one step in the reasoning process that explains why the key_actors, traffic_objects, and/or obstacles were chosen and how they affect the ego.
   - The final entry in your reasoning process should be the chosen next action and why it is appropriate and safe. Do NOT add any extra reasoning steps after this.
-  - Reference specific actors or objects by ID where useful.
 
 ## HARD CONSTRAINTS
 - NPC actors are not reactive to the ego vehicle's actions. You must plan knowing NPCs will not yield, slow down, or self-correct to avoid the ego.
 - When visual or behavioural cues suggest even a small likelihood of an intrusive or disruptive maneuver (for example, lane change, sudden stop, intersection turn), base your decisions assuming that maneuver is executed to ensure safe planning.
 - Only use actors and objects that are present in the images or explicitly described in the text. Do not invent new actors, objects, or conditions.
-- Any obstacles present in the scene will ALWAYS block your path. Therefore you MUST call an overtake maneuver to proceed forward in the route.
+- ONLY OVERTAKE OBSTACLES and LEADING CYCLISTS in the EGO LANE. Never OVERTAKE other VEHICLES.
+- ALWAYS be cautious of PEDESTRIANS and allow them the right-of-way whenever possible.
+- ALWAYS be cautious of EMERGENCY VEHICLES and allow them the right-of-way whenever possible.
+- ALWAYS PULL OVER for TRAILING EMERGENCY VEHICLES in the EGO LANE
+- Only consider LEADING traffic in the LEFT or RIGHT lane, NEVER in the EGO LANE.
+- Only consider TRAILING traffic in the LEFT or RIGHT lane, NEVER in the EGO LANE.
+- ALWAYS consider CROSSING traffic
+- ALWAYS consider ONCOMING traffic
+- Slow leading vehicles SHOULD NEVER BE OVERTAKEN
 
 ## RAG USAGE
 - ONLY if you use retrieved memory, reference it concisely in the reasoning list via memory IDs only (for example: "Uses Memory 2").
@@ -428,6 +452,8 @@ You must output a single JSON object with the following structure:
     - "change_lane_right"
     - "overtake_left"
     - "overtake_right"
+    - "pull_over_left"
+    - "pull_over_right"
 
 - target_speed
   - Optional numeric value (float) representing the desired target speed for the ego vehicle in metres/second.
@@ -440,7 +466,6 @@ You must output a single JSON object with the following structure:
     - condition_action: one of
         - "yield_for"
         - "stop_for"
-        - "watch_out_for"
     - id: integer actor ID of the target object (must match an ID present in the CURRENT SCENARIO; do NOT invent new IDs).
     - obj_type: one of
         - "vehicle"
@@ -469,7 +494,7 @@ You must output a single JSON object with the following structure:
    - Use KEY ACTORS, TRAFFIC OBJECTS, OBSTACLES, NEXT ACTION, and REASONING to determine:
      - The best current `action` from the allowed Action values.
      - Whether an explicit `target_speed` is needed (for example, to slow down before a hazard or match a leading vehicle’s speed).
-     - Which actors or objects require explicit conditions (yield_for, stop_for, watch_out_for).
+     - Which actors or objects require explicit conditions (yield_for, stop_for).
 
 3. Construct the EgoPlan JSON:
    - The `action` should be consistent with the NEXT ACTION description
@@ -477,7 +502,6 @@ You must output a single JSON object with the following structure:
    - Conditions must reflect concrete constraints:
      - Use stop_for for mandatory stops (stop signs, red traffic lights, blocked paths).
      - Use yield_for when another actor has priority and the ego must wait or give way.
-     - Use watch_out_for for actors that require increased caution but do not strictly require stopping or yielding.
    - Always ensure that condition ids and obj_type values correspond to actors and objects explicitly mentioned in the CURRENT SCENARIO.
 
 ## HARD CONSTRAINTS

@@ -29,6 +29,7 @@ class ObstacleFormatter(BaseFormatter):
         f = cls.fmt
         return (
             f"{indent}Obstacle ID: {obstacle.id}, "
-            f"Relative Position: {f(obstacle.relative_position, precision)}, "
+            f"Type: {obstacle.obstacle.type_id}, "
+            # f"Relative Position: {f(obstacle.relative_position, precision)}, "
             f"Relative Distance: {f(obstacle.relative_distance, precision)}"
         )

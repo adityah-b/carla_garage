@@ -20,7 +20,14 @@ class ModelCatalogue:
     _catalogue : Dict[str, List[str]] = {
         "openai" : ["gpt-4.1-mini-2025-04-14"],
         "openrouter" : ["openai/gpt-4.1-2025-04-14", "qwen/qwen2.5-vl-72b-instruct:free", "google/gemini-2.5-flash", "anthropic/claude-3-7-sonnet-20250219"],
-        "vllm" : ["Qwen/Qwen2.5-VL-72B-Instruct-AWQ", "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"],
+        "vllm" : [
+            "Qwen/Qwen2.5-VL-72B-Instruct-AWQ",
+            "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+            "Qwen/Qwen3-VL-30B-A3B-Instruct",
+            "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ",
+            "nvidia/Cosmos-Reason1-7B",
+            "nvidia/Cosmos-Reason2-8B"
+        ],
     }
 
     @staticmethod

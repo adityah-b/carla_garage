@@ -13,6 +13,7 @@ class STGridSpec:
 class STAlgoSpec:
     # Kinematic constraints
     A_max: float
+    A_min: float
     J_max: float
 
     # Kinematic costs

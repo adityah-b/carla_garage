@@ -6,6 +6,8 @@ import os
 import carla
 import numpy as np
 
+from local_planner.lateral.config_specs import *
+from local_planner.longitudinal.config_specs import *
 
 class GlobalConfig:
   """
@@ -111,7 +113,8 @@ class GlobalConfig:
     # Forecast length in seconds when near a lane change
     self.forecast_length_lane_change = 1.1
     # Forecast length in seconds when not near a lane change
-    self.default_forecast_length = 2.0
+    # self.default_forecast_length = 2.0
+    self.default_forecast_length = 8.0
     # Factor to increase the ego vehicles bbs during forecasting when speed < extent_ego_bbs_speed_threshold
     self.slow_speed_extent_factor_ego = 1.0
     # Speed threshold to select which factor is used during other vehicle bbs forecasting
@@ -202,19 +205,6 @@ class GlobalConfig:
     self.default_overtake_speed = 50. / 3.6
     # Distance in meters at which two ways scenarios are considered finished
     self.distance_to_delete_scenario_in_two_ways = int(2 * self.points_per_meter)
-
-
-
-    # LLM GUIDED NEW CODE (WIP)
-    self.traffic_light_distance_threshold = 100.0
-    self.stop_sign_distance_threshold = 100.0
-
-    self.sampling_resolution = 2.0
-    self.prediction_horizon = 3.0
-
-    self.max_front_cam_draw_distance = 50.0
-
-    # LLM GUIDED NEW CODE (WIP)
 
     # -----------------------------------------------------------------------------
     # Longitudinal Linear Regression controller
@@ -329,9 +319,10 @@ class GlobalConfig:
     self.leading_vehicles_max_route_angle_distance = 35.
 
     # NEW CODE
+    # TODO: CHECK IF NEW ANGLE BREAKS OTHER THINGS
     # Max angle difference for detecting leading vehicles in ongoing direction in degrees.
-    self.leading_vehicles_max_route_angle_ongoing = 35
-    self.trailing_vehicles_max_route_angle_ongoing = 35
+    self.leading_vehicles_max_route_angle_ongoing = 45
+    self.trailing_vehicles_max_route_angle_ongoing = 45
 
     # Max angle difference for detecting leading vehicles in oncoming direction in degrees.
     self.leading_vehicles_max_route_angle_oncoming = 145
@@ -897,6 +888,106 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
     # Probability 0 - 1. If the confidence in the brake action is higher than this
     # value brake is chosen as the action.
     self.brake_uncertainty_threshold = 0.9  # 1 means that it is not used at all
+
+    # LLM GUIDED NEW CODE (WIP)
+    # self.scene_analyzer_config = {
+    #     "provider" : "vllm",
+    #     "model_name" : "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+    #     "temperature" : 0.7,
+    #     "max_output_tokens" : 8192
+    # }
+    # self.scene_analyzer_config = {
+    #     "provider" : "vllm",
+    #     "model_name" : "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ",
+    #     "temperature" : 0.25,
+    #     "max_output_tokens" : 8192
+    # }
+    # self.scene_analyzer_config = {
+    #     "provider" : "vllm",
+    #     "model_name" : "Qwen/Qwen3-VL-30B-A3B-Instruct",
+    #     "temperature" : 0.7,
+    #     "max_output_tokens" : 4096
+    # }
+    self.scene_analyzer_config = {
+        "provider" : "vllm",
+        "model_name" : "Qwen/Qwen2.5-VL-72B-Instruct-AWQ",
+        "temperature" : 0.45,
+        "max_output_tokens" : 8192
+    }
+    # self.scene_analyzer_config = {
+    #     "provider" : "vllm",
+    #     "model_name" : "nvidia/Cosmos-Reason1-7B",
+    #     "temperature" : 1e-3,
+    #     "max_output_tokens" : 4096
+    # }
+    # self.scene_analyzer_config = {
+    #     "provider" : "vllm",
+    #     "model_name" : "nvidia/Cosmos-Reason2-8B",
+    #     "temperature" : 0.7,
+    #     "max_output_tokens" : 32768
+    # }
+
+    # -----------------------------------------------------------------------------
+    # Local planner parameters
+    # -----------------------------------------------------------------------------
+
+    # Longitudinal
+    self.st_grid_spec = STGridSpec(
+      S_max=80.0,
+      ds=0.25,
+      T_max=8.0,
+      dt=0.1
+    )
+    self.st_algo_spec = STAlgoSpec(
+      A_max=self.idm_maximum_acceleration,
+      A_min=self.idm_comfortable_braking_deceleration_low_speed,
+      J_max=50.0,
+      W_vel=1.0,
+      W_acc=1.0,
+      W_jerk=1.0,
+      ds_grid=self.st_grid_spec.ds,
+      dt_grid=self.st_grid_spec.dt,
+      ds_algo=4 * self.st_grid_spec.ds
+    )
+
+    # Lateral
+    self.lat_grid_spec = LatGridSpec(
+      x_min=-5.0,
+      x_max=50.0,
+      y_min=-30.0,
+      y_max=30.0,
+      resolution=0.25
+    )
+    self.lat_algo_spec = LatAlgoSpec(
+      grid_res=self.lat_grid_spec.resolution,
+      veh_half_len=self.ego_extent_x,
+      veh_half_width=self.ego_extent_y,
+      goal_tol_m=0.5,
+      w_cost=1.0
+    )
+
+    self.traffic_light_distance_threshold = 30.0
+    self.stop_sign_distance_threshold = 30.0
+
+    self.sampling_resolution = 2.0
+    self.prediction_horizon = 3.0
+
+    self.max_front_cam_draw_distance = 50.0
+
+    # Pull over behaviour
+    self.pull_over_route_lookahead = 40 * self.points_per_meter
+    # Extra distance added before shifting lanes during a pull-over, scaled by emergency vehicle speed (m/s * s)
+    self.pull_over_preparation_time = 2.0
+    self.emergency_vehicle_clear_distance = 20.0
+
+    self.stopped_speed_threshold = 0.1
+    self.stop_sign_min_wait_ticks = 25
+    self.obstacle_min_wait_ticks = 25
+    self.ped_min_wait_ticks = 25
+
+    self.clearing_distance_to_traffic_light = 15.0
+    self.clearing_distance_to_obstacle = 20.0
+    # LLM GUIDED NEW CODE (WIP)
 
     # -----------------------------------------------------------------------------
     # PlanT

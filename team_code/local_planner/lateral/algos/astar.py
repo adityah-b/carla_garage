@@ -15,51 +15,42 @@ class AStar:
     ):
         self.algo_spec = algo_spec
 
-    # ---------- NEW: polygon helpers ----------
+        # Vehicle 3-circle footprint
+        L = self.algo_spec.veh_half_len_grid * 2
+        W = self.algo_spec.veh_half_width_grid * 2
 
-    def rect_polygon_grid(
+        self.circle_radius = sqrt(
+            (L / 3) ** 2 + (W / 2) ** 2
+        )
+
+        D = 2 * sqrt(
+            self.circle_radius ** 2 - (W / 2) ** 2
+        )
+        self.circle_offsets = np.array([-D, 0.0, D], dtype=np.float32)
+
+    def _circle_centers_grid(
         self,
         r: float,
         c: float,
         theta_img: float
     ) -> np.ndarray:
         """
-        Rotated rectangle polygon in image coords (x=col, y=row) in **cells**.
-        Returns float32 array of shape (4,2): [ [x,y], ... ] in order:
-        front-left, front-right, rear-right, rear-left.
+        Compute the 3 circle centers in grid coordinates (r=row, c=col)
+        for a vehicle pose (r, c, theta_img), where theta_img is the
+        heading in image/grid coordinates (+x right, +y down).
+        Returns array of shape (3, 2): [[r1, c1], [r2, c2], [r3, c3]].
         """
-        x_half = self.algo_spec.veh_half_len_grid
-        y_half = self.algo_spec.veh_half_width_grid
+        s = self.circle_offsets  # longitudinal offsets in grid cells
+        cth = np.cos(theta_img)
+        sth = np.sin(theta_img)
 
-        # Local rectangle in (x=cols, y=rows)
-        poly_local = np.array([
-            [x_half, y_half],
-            [x_half, -y_half],
-            [-x_half, -y_half],
-            [-x_half, y_half],
-        ], dtype=np.float32)
+        # Along heading: dc = cos(theta), dr = sin(theta)
+        centers_r = r + s * sth
+        centers_c = c + s * cth
 
-        cth, sth = np.cos(theta_img), np.sin(theta_img)
-        R = np.array([[cth, -sth],
-                      [sth,  cth]], dtype=np.float32)  # standard 2D rotation
+        return np.stack([centers_r, centers_c], axis=-1)  # (3, 2)
 
-        poly_rc = (poly_local @ R.T)
-        # Translate to center (c, r): x=col, y=row
-        poly_rc[:, 0] += c
-        poly_rc[:, 1] += r
-        return poly_rc  # float32, shape (4,2)
-
-    def poly_oob(
-        self,
-        poly_rc: np.ndarray,
-        H: int,
-        W: int
-    ) -> bool:
-        """Return True if polygon’s bounding box goes out-of-bounds."""
-        xs = poly_rc[:, 0]; ys = poly_rc[:, 1]
-        minx, maxx = xs.min(), xs.max()
-        miny, maxy = ys.min(), ys.max()
-        return (minx < 0) or (miny < 0) or (maxx >= (W - 1)) or (maxy >= (H - 1))
+    # ---------- NEW: polygon helpers ----------
 
     def footprint_clear_at_index(
         self,
@@ -69,34 +60,51 @@ class AStar:
         occupancy_map: np.ndarray
     ) -> bool:
         """
-        Rasterize ego footprint directly on the grid (cells) and check overlap.
-        occupancy_map: uint8 (1=obstacle, 0=free)
+        Check collision at pose (r, c, theta_img) using 3-circle footprint
+        in grid cells.
+
+        occupancy_map: uint8, where 1 = obstacle, 0 = free
+        (you are currently passing in obstacle_mask).
         """
         H, W = occupancy_map.shape
-        poly = self.rect_polygon_grid(r, c, theta_img)
 
-        # Treat any out-of-bounds polygon as collision (conservative).
-        # if self.poly_oob(poly, H, W):
-        #     return False
+        centers = self._circle_centers_grid(r, c, theta_img)
+        rad = self.circle_radius
+        rad2 = rad * rad
 
-        # cv2 wants int32 points shaped (N,1,2) with (x=col, y=row)
-        pts = poly.astype(np.int32).reshape(-1, 1, 2)
+        for center_r, center_c in centers:
+            # Bounding box of the circle in grid indices
+            row_min = int(np.floor(center_r - rad))
+            row_max = int(np.ceil(center_r + rad))
+            col_min = int(np.floor(center_c - rad))
+            col_max = int(np.ceil(center_c + rad))
 
-        fp_mask = np.zeros((H, W), dtype=np.uint8)
-        cv2.fillPoly(fp_mask, [pts], 1)
+            # Clamp to map bounds
+            row_min = max(0, row_min)
+            row_max = min(H - 1, row_max)
+            col_min = max(0, col_min)
+            col_max = min(W - 1, col_max)
 
-        # occ_img = (occupancy_map * 255).astype(np.uint8)
-        # occ_bgr = cv2.cvtColor(occ_img, cv2.COLOR_GRAY2BGR)
+            # If completely outside the map, skip this circle
+            if row_min > row_max or col_min > col_max:
+                continue
 
-        # fp_img = (fp_mask * 255).astype(np.uint8)
-        # fp_bgr = cv2.cvtColor(fp_img | occ_img, cv2.COLOR_GRAY2BGR)
+            for rr in range(row_min, row_max + 1):
+                for cc in range(col_min, col_max + 1):
+                    if occupancy_map[rr, cc] == 0:
+                        # 0 here would mean "no obstacle" if you passed obstacle_mask,
+                        # but you currently pass obstacle_mask where 1=obstacle, 0=free.
+                        # So we only care about cells == 1.
+                        continue
 
-        # maps_img = np.hstack([occ_bgr, fp_bgr])
-        # cv2.namedWindow("BirdView Maps", cv2.WINDOW_NORMAL)
-        # cv2.imshow('BirdView Maps', maps_img)
-        # cv2.waitKey(1)
+                    # Distance from cell center to circle center (in grid units)
+                    dy = (rr + 0.5) - center_r
+                    dx = (cc + 0.5) - center_c
+                    if dx * dx + dy * dy <= rad2:
+                        # Collision with this circle
+                        return False
 
-        return not np.any((fp_mask & occupancy_map) != 0)
+        return True
 
     def segment_is_free_grid(
         self,
@@ -148,14 +156,21 @@ class AStar:
         def in_bounds(grid_x : int, grid_y : int) -> bool:
             return (0 <= grid_x < H) and (0 <= grid_y < W)
 
+        def clip_to_bounds(r: int, c: int) -> Tuple[int, int]:
+            return int(np.clip(r, 0, H - 1)), int(np.clip(c, 0, W - 1))
+
         # Heuristic cost
         def h_octile(r, c, gr, gc):
             dr, dc = abs(gr - r), abs(gc - c)
             D, D2 = 1.0, np.sqrt(2.0)
             return D * (dr + dc) + (D2 - 2 * D) * min(dr, dc)
 
-        if not (in_bounds(sr, sc) and in_bounds(gr, gc)):
-            return [], np.inf
+        # Clip start and goal nodes
+        sr, sc = clip_to_bounds(sr, sc)
+        gr, gc = clip_to_bounds(gr, gc)
+
+        # if not (in_bounds(sr, sc) and in_bounds(gr, gc)):
+        #     return [], np.inf
 
         # TODO: FLIP OCCUPANCY VALUES
         obstacle_mask = (occupancy_map <= 0).astype(np.uint8)

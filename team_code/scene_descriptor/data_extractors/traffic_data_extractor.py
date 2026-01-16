@@ -1,7 +1,7 @@
 import numpy as np
 import carla
 
-from typing import List, Dict, Any, Optional
+from typing import Optional, Set
 from dataclasses import dataclass
 
 from privileged_route_planner import PlannerState
@@ -19,6 +19,7 @@ class StopSignData:
     """Stop sign information."""
     id : int
     distance_to_stop_sign: float
+    cleared : bool
 
 @dataclass(frozen=True, slots=True)
 class TrafficData:
@@ -48,6 +49,7 @@ class TrafficDataExtractor:
 
     def extract_traffic_data(
         self,
+        ego_transform : carla.Transform,
         planner_state: PlannerState
     ) -> TrafficData:
         """
@@ -63,6 +65,10 @@ class TrafficDataExtractor:
         next_ss = planner_state.next_stop_signs[route_index]
         dist_to_next_ss = planner_state.dist_to_next_stop_signs[route_index]
         speed_limit = round(planner_state.speed_limits[route_index], 2)
+        cleared_stop_sign_ids = planner_state.cleared_stop_sign_ids
+
+        # Get ego location
+        ego_loc = ego_transform.location
 
         return TrafficData(
             next_traffic_light=self._extract_traffic_light_data(
@@ -71,7 +77,8 @@ class TrafficDataExtractor:
             ),
             next_stop_sign=self._extract_stop_sign_data(
                 stop_sign=next_ss,
-                distance_to_stop_sign=dist_to_next_ss
+                ego_loc=ego_loc,
+                cleared_stop_sign_ids=cleared_stop_sign_ids
             ),
             speed_limit=speed_limit
         )
@@ -115,7 +122,8 @@ class TrafficDataExtractor:
     def _extract_stop_sign_data(
         self,
         stop_sign,
-        distance_to_stop_sign: float
+        ego_loc: carla.Location,
+        cleared_stop_sign_ids : Set[int],
     ) -> Optional[StopSignData]:
         """
         Extract stop sign data if within relevant distance.
@@ -127,7 +135,17 @@ class TrafficDataExtractor:
         Returns:
             StopSignData object or None if not relevant
         """
-        if not stop_sign or distance_to_stop_sign >= self.config.stop_sign_distance_threshold:
+        if not stop_sign:
             return None
 
-        return StopSignData(id=stop_sign.id, distance_to_stop_sign=distance_to_stop_sign)
+        distance_to_stop_sign = stop_sign.get_transform().transform(stop_sign.trigger_volume.location).distance(ego_loc)
+        if distance_to_stop_sign >= self.config.stop_sign_distance_threshold:
+            return None
+
+        ss_cleared = stop_sign.id in cleared_stop_sign_ids
+
+        return StopSignData(
+            id=stop_sign.id,
+            distance_to_stop_sign=distance_to_stop_sign,
+            cleared=ss_cleared
+        )

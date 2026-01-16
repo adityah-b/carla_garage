@@ -35,8 +35,9 @@ class RouteGuidance(BaseModel):
 class KeyActor(BaseModel):
     # ([traffic_type]) [actor_type] [id] is [distance_from_ego_m] m away (going [speed_mps] m/s)
     id: int
-    actor_type: Literal["vehicle", "pedestrian", "cyclist", "emergency"]
+    actor_type: Literal["vehicle", "pedestrian", "cyclist", "emergency vehicle"]
     traffic_type: Literal["leading", "trailing", "oncoming", "cross", "other"]
+    traffic_lane: Literal["ego lane", "right lane", "left lane", "other"]
     distance_from_ego_m: float
     speed_mps: float
 
@@ -87,33 +88,17 @@ class HighLevelBehaviour(BaseModel):
     def to_string(self) -> str:
         lines: List[str] = []
 
-        # # === ROUTE GUIDANCE ===
-        # lines.append("ROUTE GUIDANCE:")
-        # rg = self.route_guidance
-
-        # intersection_part = ""
-        # if rg.intersection_type != "none":
-        #     intersection_part = f" at {rg.intersection_type} intersection"
-
-        # distance_part = ""
-        # # Only mention distance if it's meaningfully non-zero
-        # if rg.distance_to_route_point_m > 0.05:
-        #     distance_part = f" in {rg.distance_to_route_point_m:.2f} meters"
-
-        # lines.append(
-        #     f"{rg.maneuver}{intersection_part}{distance_part}."
-        # )
-        # lines.append("")
-
-        # === KEY ACTORS ===
-        # template: ([traffic_type]) [actor_type] [id] is [distance] (going [speed])
         lines.append("KEY ACTORS:")
         if not self.key_actors:
             lines.append("None.")
         else:
             for a in self.key_actors:
+                traffic_lane_info = ""
+                if a.traffic_lane != 'other':
+                    traffic_lane_info = f' in {a.traffic_lane}'
+
                 base = (
-                    f"- {a.traffic_type} {a.actor_type} {a.id} is "
+                    f"- {a.traffic_type} {a.actor_type} {a.id} {traffic_lane_info} is "
                     f"{a.distance_from_ego_m:.2f} meters away"
                 )
 

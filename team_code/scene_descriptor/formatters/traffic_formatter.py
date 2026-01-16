@@ -50,7 +50,9 @@ class TrafficFormatter(BaseFormatter):
         precision : int = 2
     ) -> str:
         f = cls.fmt
+        # TODO: UPDATE THE FORMATTING, MAKE IT MORE EXPRESSIVE
         return (
             f"{indent}Stop Sign ID: {ss_data.id}, "
-            f"Relative Distance: {f(ss_data.distance_to_stop_sign, precision)}"
+            f"Relative Distance: {f(ss_data.distance_to_stop_sign, precision)}, "
+            f"Cleared: {ss_data.cleared}"
         )

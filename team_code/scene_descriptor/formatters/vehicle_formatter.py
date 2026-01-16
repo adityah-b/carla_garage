@@ -34,12 +34,14 @@ class VehicleFormatter(BaseFormatter):
                 for lv in lv_list:
                     for v in lv.vehicle_data:
                         # Ignore stationary trailing/oncoming/crossing vehicles
-                        if title in ["Cross Traffic", "Oncoming Traffic", "Trailing Traffic"] and v.speed <= 0.1:
-                            continue
+                        # TODO: FIX THIS SHIT
+                        # if title in ["Cross Traffic", "Oncoming Traffic", "Trailing Traffic"] and v.speed <= 0.1:
+                        #     continue
 
                         # Ignore trailing vehicles in ego lane (except cyclists)
                         is_cyclist = ("base_type" in v.vehicle.attributes and v.vehicle.attributes["base_type"] == "bicycle")
-                        if title == 'Trailing Traffic' and lane_name == 'ego' and not is_cyclist:
+                        is_emergency = ("special_type" in v.vehicle.attributes and v.vehicle.attributes["special_type"] == "emergency")
+                        if title == 'Trailing Traffic' and lane_name == 'ego' and not is_cyclist and not is_emergency:
                             continue
 
                         group_text.append(cls._format_vehicle_data(v, indent="\t\t\t", precision=precision))
@@ -83,10 +85,22 @@ class VehicleFormatter(BaseFormatter):
         if "base_type" in vehicle_data.vehicle.attributes and vehicle_data.vehicle.attributes["base_type"] == "bicycle":
             actor_type = "Cylist"
 
-        return (
-            f"{indent}{actor_type} ID: {vehicle_data.id}, "
-            f"Speed: {f(vehicle_data.speed, precision)}, "
-            # f"Relative Position: {f(vehicle_data.relative_position, precision)}, "
-            # f"Relative Orientation: {f(vehicle_data.relative_orientation, precision)}, "
-            f"Distance: {f(vehicle_data.relative_distance, precision)}"
-        )
+        if "special_type" in vehicle_data.vehicle.attributes and vehicle_data.vehicle.attributes["special_type"] == "emergency":
+            actor_type = "Emergency Vehicle"
+
+        # Threshold below which we don't display speed
+        SPEED_DISPLAY_THRESHOLD = 0.5
+
+        parts = [f"{indent}{actor_type} ID: {vehicle_data.id}"]
+
+        # Only include speed if above threshold
+        if vehicle_data.speed >= SPEED_DISPLAY_THRESHOLD:
+            parts.append(f"Speed: {f(vehicle_data.speed, precision)}")
+
+        # f"Relative Position: {f(vehicle_data.relative_position, precision)}, "
+        # f"Relative Orientation: {f(vehicle_data.relative_orientation, precision)}, "
+        parts.append(f"Distance: {f(vehicle_data.relative_distance, precision)}")
+        # f"Distance: {f(vehicle_data.relative_distance, precision)}, "
+        # f"Intruding Ego Lane: {vehicle_data.is_intruding}"
+
+        return ", ".join(parts)

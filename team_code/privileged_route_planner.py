@@ -28,6 +28,7 @@ class PlannerState:
     next_stop_signs : List[carla.TrafficSign]
     dist_to_next_stop_signs : np.ndarray
     speed_limits : np.ndarray
+    cleared_stop_sign_ids : Set[int]
 
 class PrivilegedRoutePlanner(object):
   """
@@ -79,6 +80,9 @@ class PrivilegedRoutePlanner(object):
 
     self.speed_limits = np.array([])
 
+    # NOTE: Cleared stop sign state tracker for trajectory_planner
+    self.cleared_stop_sign_ids = set()
+
     self.route_index = 0
     self.last_route_index = 0
 
@@ -103,8 +107,12 @@ class PrivilegedRoutePlanner(object):
          dist_to_next_traffic_lights = self.distances_to_next_traffic_lights,
          next_stop_signs = self.next_stop_signs,
          dist_to_next_stop_signs = self.distances_to_next_stop_signs,
-         speed_limits = self.speed_limits
+         speed_limits = self.speed_limits,
+         cleared_stop_sign_ids = self.cleared_stop_sign_ids
       )
+
+  def update_cleared_stop_signs(self, stop_sign_id : int):
+     self.cleared_stop_sign_ids.add(stop_sign_id)
 
   def save(self):
     """
@@ -448,7 +456,7 @@ class PrivilegedRoutePlanner(object):
       self.last_route_index = 0
 
       # cmds.insert(0, RoadOption.CHANGELANELEFT)
-      # route_waypoints.insert(0, carla_map.get_waypoint(vehicle_loc))
+      # route_waypoints.insert(0, carla_map.get_waypoint(vehicle_loc, lane_type=carla.LaneType.Any))
       cmds[0] = RoadOption.CHANGELANELEFT
     else:
       # Add extra waypoints at the beginning of the route

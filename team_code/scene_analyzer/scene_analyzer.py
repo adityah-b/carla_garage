@@ -25,12 +25,14 @@ class SceneAnalyzer(VLMAgent):
     def get_high_level_behaviour(
         self,
         text : str,
-        image: Union[Path, np.ndarray]
+        image: Union[Path, np.ndarray] = None,
     ) -> HighLevelBehaviour:
         system_instruction = self.sys_prompts.get_high_level_behaviour_prompt()
         system_message = self.create_system_message(text=system_instruction)
 
         # TODO: Incorporate scenario memory
+        print(f'\n\nHigh Level Planning Prompt\n\n')
+        print(f'{text}')
         user_message = self.create_user_message(text=text, image=image)
         messages = [system_message, user_message]
 
