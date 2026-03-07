@@ -34,7 +34,8 @@ QUALIFIER_SENSORS_LIMITS = {
     'sensor.opendrive_map': 1,
     'sensor.speedometer': 1,
     'sensor.camera.depth': 8, # for data generation
-    'sensor.camera.semantic_segmentation': 4 # for data generation
+    'sensor.camera.semantic_segmentation': 4, # for data generation
+    'sensor.other.collision' : 1
 }
 SENSORS_LIMITS = {
     'sensor.camera.rgb': 8,
@@ -47,11 +48,11 @@ SENSORS_LIMITS = {
     'sensor.speedometer': 1,
     'sensor.camera.depth': 8, # for data generation
     'sensor.camera.semantic_segmentation': 4, # for data generation
-    'sensor.camera.instance_segmentation': 8 # for data generation
+    'sensor.camera.instance_segmentation': 8, # for data generation
+    'sensor.other.collision' : 1
 }
 
 ALLOWED_SENSORS = SENSORS_LIMITS.keys()
-
 
 class AgentError(Exception):
     """
@@ -162,6 +163,10 @@ class AgentWrapper(object):
         elif type_ == 'sensor.speedometer':
             delta_time = CarlaDataProvider.get_world().get_settings().fixed_delta_seconds
             attributes['reading_frequency'] = 1 / delta_time
+            sensor_location = carla.Location()
+            sensor_rotation = carla.Rotation()
+
+        elif type_ == 'sensor.other.collision':
             sensor_location = carla.Location()
             sensor_rotation = carla.Rotation()
 

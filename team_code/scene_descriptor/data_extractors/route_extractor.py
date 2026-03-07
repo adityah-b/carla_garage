@@ -196,6 +196,11 @@ class RouteDataExtractor:
         # Unpack lane change information
         lane_change_cmd, lc_start_idx, lc_end_idx = lane_change_data_raw
 
+        # TODO: PUT THIS IN CONFIG
+        # Make sure lane changes are at least 5.0m
+        if (lc_end_idx - lc_start_idx) / self.config.points_per_meter < 5.0:
+            lc_end_idx = lc_start_idx + 5.0 * self.config.points_per_meter
+
         start_wp = planner_state.route_waypoints[lc_start_idx]
         end_wp = planner_state.route_waypoints[lc_end_idx]
         passed_start_wp = self._has_passed_waypoint(ego_tf, start_wp)
@@ -237,7 +242,7 @@ class RouteDataExtractor:
         for i in range(route_index, to_index):
             cmd = route_cmds[i]
             wp = route_wps[i]
-            if (wp.is_junction) and (cmd in (RoadOption.LEFT, RoadOption.STRAIGHT, RoadOption.LANEFOLLOW, RoadOption.RIGHT)):
+            if (wp.is_junction) and (cmd in (RoadOption.LEFT, RoadOption.STRAIGHT, RoadOption.RIGHT)):
                 intersection_start_idx = i
                 intersection_cmd = cmd
                 break

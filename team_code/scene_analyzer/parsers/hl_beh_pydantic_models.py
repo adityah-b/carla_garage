@@ -35,9 +35,9 @@ class RouteGuidance(BaseModel):
 class KeyActor(BaseModel):
     # ([traffic_type]) [actor_type] [id] is [distance_from_ego_m] m away (going [speed_mps] m/s)
     id: int
-    actor_type: Literal["vehicle", "pedestrian", "cyclist", "emergency vehicle"]
+    actor_type: Literal["vehicle", "pedestrian", "cyclist", "emergency_vehicle"]
     traffic_type: Literal["leading", "trailing", "oncoming", "cross", "other"]
-    traffic_lane: Literal["ego lane", "right lane", "left lane", "other"]
+    traffic_lane: Literal["ego", "right", "left", "other"]
     distance_from_ego_m: float
     speed_mps: float
 

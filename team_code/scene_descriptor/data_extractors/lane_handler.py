@@ -1,5 +1,7 @@
-import numpy as np
 import carla
+import hashlib
+import struct
+import numpy as np
 
 from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
@@ -8,15 +10,22 @@ from collections import OrderedDict
 from .junction_handler import JunctionHandler
 from agents.navigation.global_route_planner import GlobalRoutePlanner
 
+SparseKey = Tuple[int, int, int]
+
+def wp_key(wp : carla.Waypoint) -> SparseKey:
+    return (int(wp.road_id), int(wp.section_id), int(wp.lane_id))
+
 class Lanelet:
     def __init__(
         self,
-        sparse_points : OrderedDict[tuple[int, int, int], carla.Waypoint],
+        sparse_points : OrderedDict[SparseKey, carla.Waypoint],
         dense_points : np.ndarray,
-        dense_waypoints : List[carla.Waypoint] = []
+        lanelet_id : int,
+        dense_waypoints : List[carla.Waypoint] = [],
     ):
         self.sparse_points = sparse_points
         self.dense_points = dense_points
+        self.lanelet_id = lanelet_id
         # NOTE, TODO: TEMPORARY FOR DEBUGGING
         self.dense_waypoints = dense_waypoints
 
@@ -61,7 +70,8 @@ class Lanelet:
         return len(self.sparse_points)
 
     def __contains__(self, wp: carla.Waypoint) -> bool:
-        key = (wp.road_id, wp.section_id, wp.lane_id)
+        key = wp_key(wp)
+        # TODO: ADD A WAYPOINT.S VALUE COMPARISON WITH FIRST AND LAST LANELET WPS TO AVOID SCENARIOS WHERE VEHICLES BEYOND THE LANELET EDGES ARE ASSIGNED DUE TO SAME KEY
         return key in self.sparse_points
 
     def contains_wp(
@@ -81,6 +91,8 @@ class Lanelet:
         diff = self.dense_points - p
         d2 = np.square(diff).sum(axis=1)
         min_d2 = d2.min()
+
+        # print(f'MIN DIST: {np.sqrt(min_d2)}, MAX_DIST: {max_distance}')
 
         if min_d2 > max_distance * max_distance:
             return False
@@ -220,6 +232,27 @@ class LaneHandler:
     Identifies all ongoing and oncoming lanes
     """
 
+    # @staticmethod
+    # def _to_lanelet(
+    #     dense_waypoints : List[carla.Waypoint]
+    # ) -> Lanelet:
+    #     """
+    #     Generate lanelet given waypoint list
+    #     """
+    #     sparse_lanelet_points = OrderedDict()
+    #     for wp in dense_waypoints:
+    #         key = (wp.road_id, wp.section_id, wp.lane_id)
+    #         sparse_lanelet_points.setdefault(key, wp)
+
+    #     dense_points = np.array(
+    #         [
+    #             [wp.transform.location.x, wp.transform.location.y, wp.transform.location.z]
+    #             for wp in dense_waypoints
+    #         ],
+    #         dtype=np.float32
+    #     )
+    #     return Lanelet(sparse_points=sparse_lanelet_points, dense_points=dense_points, dense_waypoints=dense_waypoints)
+
     @staticmethod
     def _to_lanelet(
         dense_waypoints : List[carla.Waypoint]
@@ -228,18 +261,46 @@ class LaneHandler:
         Generate lanelet given waypoint list
         """
         sparse_lanelet_points = OrderedDict()
-        for wp in dense_waypoints:
-            key = (wp.road_id, wp.section_id, wp.lane_id)
-            sparse_lanelet_points.setdefault(key, wp)
+        dense_xyz = []
 
-        dense_points = np.array(
-            [
-                [wp.transform.location.x, wp.transform.location.y, wp.transform.location.z]
-                for wp in dense_waypoints
-            ],
-            dtype=np.float32
+        # Lanelet hash id
+        h = hashlib.blake2b(digest_size=8)
+        h.update(b"LL64v1")
+
+        first_wp = None
+        last_wp = None
+
+        for wp in dense_waypoints:
+            if first_wp is None:
+                first_wp = wp
+            last_wp = wp
+
+            loc = wp.transform.location
+            dense_xyz.append((loc.x, loc.y, loc.z))
+
+            key = wp_key(wp)
+            if key not in sparse_lanelet_points:
+                sparse_lanelet_points[key] = wp
+                h.update(struct.pack("<iii", *key))
+
+
+        # Update hash id with lane endpoints
+        s0 = first_wp.s
+        s1 = last_wp.s
+
+        h.update(struct.pack("<ii", int(round(s0)), int(round(s1))))
+
+        # Generate integer lane id from hash
+        lanelet_id = int.from_bytes(h.digest(), byteorder='little', signed=False)
+
+        dense_points = np.asarray(dense_xyz, dtype=np.float32)
+
+        return Lanelet(
+            sparse_points=sparse_lanelet_points,
+            dense_points=dense_points,
+            lanelet_id=lanelet_id,
+            dense_waypoints=dense_waypoints
         )
-        return Lanelet(sparse_points=sparse_lanelet_points, dense_points=dense_points, dense_waypoints=dense_waypoints)
 
     @staticmethod
     def _gen_wps(
@@ -526,10 +587,6 @@ class LaneHandler:
     #     return same_dir_wps
 
     @staticmethod
-    def _wp_key(wp: carla.Waypoint) -> Tuple[int, int, int]:
-        return (wp.road_id, wp.section_id, wp.lane_id)
-
-    @staticmethod
     def _lr_group(wp: carla.Waypoint) -> List[carla.Waypoint]:
         """
         Build [left?, center, right?] around wp
@@ -634,13 +691,13 @@ class LaneHandler:
         seeds: List[carla.Waypoint] = []
         seen = set()
         for wp in entry_corridor:
-            k = LaneHandler._wp_key(wp)
+            k = wp_key(wp)
             if k not in seen:
                 seen.add(k)
                 seeds.append(wp)
         if exit_corridor:
             for wp in exit_corridor:
-                k = LaneHandler._wp_key(wp)
+                k = wp_key(wp)
                 if k not in seen:
                     seen.add(k)
                     seeds.append(wp)
@@ -694,23 +751,18 @@ class LaneHandler:
         for junction_connections in junction_map.values():
             for j_conn in junction_connections:
                 junc_entry_vec = j_conn.entry_junction.transform.get_forward_vector()
-                junc_exit_vec = j_conn.exit_junction.transform.get_forward_vector()
 
-                # oncoming_wrt_entry = (junc_entry_vec.dot(target_junction_entry_vec) <= -dot_threshold) and (junc_exit_vec.dot(target_junction_entry_vec) <= -dot_threshold)
-                oncoming_wrt_entry = (junc_entry_vec.dot(target_junction_entry_vec) <= -dot_threshold)
-                # oncoming_wrt_exit  = (junc_entry_vec.dot(target_junction_exit_vec)  <= -dot_threshold) and (junc_exit_vec.dot(target_junction_exit_vec)  <= -dot_threshold)
-                oncoming_wrt_exit  = (junc_entry_vec.dot(target_junction_exit_vec)  <= -dot_threshold)
+                entry_oncoming_wrt_target_entry = (junc_entry_vec.dot(target_junction_entry_vec) <= -dot_threshold)
+                entry_oncoming_wrt_target_exit  = (junc_entry_vec.dot(target_junction_exit_vec)  <= -dot_threshold)
 
-                if not (oncoming_wrt_entry or oncoming_wrt_exit):
+                if not (entry_oncoming_wrt_target_entry or entry_oncoming_wrt_target_exit):
                     continue
 
                 # Unique lanelet generation points
-                # k = LaneHandler._wp_key(j_conn.exit_junction)
-                k = LaneHandler._wp_key(j_conn.entry_connection)
+                k = wp_key(j_conn.exit_junction)
                 if k not in seen:
                     seen.add(k)
-                    # oncoming_wps.append(j_conn.exit_junction)
-                    oncoming_wps.append(j_conn.entry_connection)
+                    oncoming_wps.append(j_conn.exit_junction)
 
         return oncoming_wps
 
@@ -756,7 +808,7 @@ class LaneHandler:
                 #     continue
 
                 # Unique lanelet generation points
-                k = LaneHandler._wp_key(j_conn.exit_junction)
+                k = wp_key(j_conn.exit_junction)
                 if k not in seen:
                     seen.add(k)
                     cross_wps.append(j_conn.exit_junction)

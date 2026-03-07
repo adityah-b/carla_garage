@@ -123,6 +123,55 @@ class LateralPIDController(LateralController):
 
     return steering
 
+  def step_pure_pursuit(self, route_points, current_speed, vehicle_position, vehicle_heading):
+    """
+    Geometric Pure Pursuit using specific wheelbase geometry.
+    """
+    L_f = self.config.front_wheel_base
+    L_r = self.config.rear_wheel_base
+    L = L_f + L_r
+
+    # 1. Dynamic Lookahead (Higher speed = Look further)
+    lookahead_dist = self.lateral_pid_speed_scale * (current_speed * 3.6) + self.lateral_pid_speed_offset
+    lookahead_dist *= 0.5 # 1 point per 2m
+    # print(f'\n\nLATERAL CONTROLLER')
+    # print(f'\tLOOKAHEAD DIST: {lookahead_dist}')
+    # print(f'\tROUTE LEN: {route_points.shape[0]}')
+    lookahead_dist = np.clip(lookahead_dist,
+                             4.0 * 0.5, # 1 point per 2m
+                             12.0 * 0.5)
+
+    lookahead_idx = int(min(lookahead_dist, route_points.shape[0] - 1))
+    target_pt = route_points[lookahead_idx]
+
+    # 2. Local Coordinates (Translate and Rotate)
+    dx = target_pt[0] - vehicle_position[0]
+    dy = target_pt[1] - vehicle_position[1]
+
+    # Vehicle heading 0 is often East/X-axis in CARLA
+    # We want local_y (lateral error)
+    cos_h = np.cos(vehicle_heading)
+    sin_h = np.sin(vehicle_heading)
+    local_y = -dx * sin_h + dy * cos_h
+
+    # 3. Calculate the curvature (kappa)
+    # The radius of the circle R = L_fw^2 / (2 * local_y)
+    # Therefore kappa (1/R) = 2 * local_y / L_fw^2
+    L_fw_sq = dx**2 + dy**2
+    if L_fw_sq < 0.1:
+        return 0.0
+
+    kappa = (2.0 * local_y) / L_fw_sq
+
+    # 4. Compute Steering Angle (delta)
+    # delta = atan(L * kappa)
+    steering_angle = np.arctan(L * kappa)
+
+    print(f'\n\nSTEERING ANGEL: {steering_angle}')
+
+    # 5. Normalize for CARLA [-1, 1]
+    return np.clip(steering_angle, -1.0, 1.0)
+
   def save_state(self):
     """
         Saves the current state of the controller by copying the error history.

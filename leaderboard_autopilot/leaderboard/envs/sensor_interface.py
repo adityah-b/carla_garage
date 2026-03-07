@@ -1,5 +1,7 @@
 import copy
 import logging
+import carla.libcarla
+import math
 import numpy as np
 import os
 import time
@@ -150,6 +152,8 @@ class CallBack(object):
             self._parse_gnss_cb(data, self._tag)
         elif isinstance(data, carla.libcarla.IMUMeasurement):
             self._parse_imu_cb(data, self._tag)
+        elif isinstance(data, carla.libcarla.CollisionEvent):
+            self._parse_collision_cb(data, self._tag)
         elif isinstance(data, GenericMeasurement):
             self._parse_pseudosensor(data, self._tag)
         else:
@@ -191,6 +195,15 @@ class CallBack(object):
         }
         self._data_provider.update_sensor(tag, out, semantic_lidar_data.frame)
 
+    def _parse_collision_cb(self, collision_data, tag):
+        impulse = collision_data.normal_impulse
+        out = {
+            'timestamp' : collision_data.timestamp,
+            'actor' : collision_data.other_actor,
+            'intensity' : math.sqrt(impulse.x ** 2 + impulse.y ** 2 + impulse.z ** 2)
+        }
+        self._data_provider.update_sensor(tag, out, collision_data.frame)
+
     def _parse_radar_cb(self, radar_data, tag):
         # [depth, azimuth, altitute, velocity]
         points = np.frombuffer(radar_data.raw_data, dtype=np.dtype('f4'))
@@ -225,9 +238,11 @@ class SensorInterface(object):
         self._sensors_objects = {}
         self._data_buffers = Queue()
         self._queue_timeout = 10
+        self._special_sensors = set(['sensor.opendrive_map', 'sensor.other.collision'])
 
-        # Only sensor that doesn't get the data on tick, needs special treatment
-        self._opendrive_tag = None
+        # Only opendrive and collisions sensors don't get the data on tick, need special treatment
+        self._non_special_tags = set()
+        self._special_tags = set()
 
     def register_sensor(self, tag, sensor_type, sensor):
         if tag in self._sensors_objects:
@@ -235,8 +250,10 @@ class SensorInterface(object):
 
         self._sensors_objects[tag] = sensor
 
-        if sensor_type == 'sensor.opendrive_map':
-            self._opendrive_tag = tag
+        if sensor_type in self._special_sensors:
+            self._special_tags.add(tag)
+        else:
+            self._non_special_tags.add(tag)
 
     def update_sensor(self, tag, data, frame):
         if tag not in self._sensors_objects:
@@ -248,10 +265,10 @@ class SensorInterface(object):
         """Read the queue to get the sensors data"""
         try:
             data_dict = {}
+
             while len(data_dict.keys()) < len(self._sensors_objects.keys()):
-                # Don't wait for the opendrive sensor
-                if self._opendrive_tag and self._opendrive_tag not in data_dict.keys() \
-                        and len(self._sensors_objects.keys()) == len(data_dict.keys()) + 1:
+                # Don't wait for the special sensors
+                if self._non_special_tags.issubset(data_dict):
                     break
 
                 sensor_data = self._data_buffers.get(True, self._queue_timeout)

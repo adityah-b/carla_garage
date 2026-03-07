@@ -59,16 +59,16 @@ class OpenAIClient(APIClient):
             response = self.client.responses.parse(
                 model="gpt-4.1-mini-2025-04-14",
                 input=formatted_messages,
-                temperature=0.0,
-                max_output_tokens=1024,
+                temperature=kwargs.get("temperature", 0.0),
+                max_output_tokens=kwargs.get("max_output_tokens", 4096),
                 text_format=text_format
             )
         else:
             response = self.client.responses.create(
                 model="gpt-4.1-mini-2025-04-14",
                 input=formatted_messages,
-                temperature=0.0,
-                max_output_tokens=512,
+                temperature=kwargs.get("temperature", 0.0),
+                max_output_tokens=kwargs.get("max_output_tokens", 4096),
             )
 
         print(f'\n\nUSAGE\n\n')
@@ -133,7 +133,7 @@ class VLLMClient(APIClient):
         # self.base_url = "http://localhost:8000/v1"
         # self.base_url = "http://127.0.0.1:8000/v1"
         self.base_url = "http://192.168.42.200:8000/v1"
-        # self.base_url = "http://192.168.42.135:8000/v1"
+        # self.base_url = "http://192.168.42.135:8001/v1"
 
         self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
         self.model_name = model_name

@@ -3,7 +3,8 @@ import matplotlib.pyplot as plt
 
 from typing import Dict, List, Tuple, Optional
 
-from actor_prediction.collision_checker import CollisionInterval
+from config import GlobalConfig
+from actor_prediction.collision_checker import CollisionInterval, LaneOverlapInterval
 
 from .config_specs import *
 from .planner_algo import PlannerAlgo
@@ -12,20 +13,25 @@ from .st_occupancy import STOccupancyGrid
 class LongPlanner:
     def __init__(
         self,
-        st_grid_spec : STGridSpec,
-        st_algo_spec : STAlgoSpec,
+        config : GlobalConfig,
         algo_name : str = 'dijkstra',
-        sim_freq : float = 20.0,
-        plan_freq : float = 10.0,
     ):
-        self.st_grid_spec = st_grid_spec
-        self.st_algo_spec = st_algo_spec
+        self.config = config
+
+        self.st_grid_spec : STGridSpec = self.config.st_grid_spec
+        self.st_algo_spec : STAlgoSpec = self.config.st_algo_spec
+
+        sim_freq = self.config.fps
+        plan_freq = self.config.long_planning_frequency
 
         self.dt_sim = 1 / sim_freq
         self.sim_ticks_per_plan = max(1, int(round(sim_freq / plan_freq)))
 
-        self.grid_mapper = STOccupancyGrid(st_grid_spec=st_grid_spec)
-        self.planner = PlannerAlgo(algo_name=algo_name, st_algo_spec=st_algo_spec)
+        self.grid_mapper = STOccupancyGrid(
+            config=self.config,
+            st_grid_spec=self.st_grid_spec
+        )
+        self.planner = PlannerAlgo(algo_name=algo_name, st_algo_spec=self.st_algo_spec)
 
         # Planner state
         self.current_vel_profile: np.ndarray = np.array([])
@@ -33,11 +39,25 @@ class LongPlanner:
         self.current_s_profile: np.ndarray = np.array([])
         self.current_plan_indices: np.ndarray = np.empty((0, 2), dtype=int)
         self.profile_step_idx: int = 0
+        self.ego_idx : int = 0
         self.cur_path = None
+        self.current_plan_cost: float = float("inf")   # NEW
+        # TODO: PROPERLY IMPLEMENT THE EGO STATION CHECK, MAYBE PRECOMPUTE ROUTE DURING INITIALIZATION OR AFTER ROUTE CHANGES
+        self.plan_route_start_idx: int = -1
 
     @property
     def has_active_plan(self) -> bool:
         return self.current_vel_profile.size > 0 and self.profile_step_idx < len(self.current_vel_profile)
+
+    def reset_plan(self) -> None:
+        self.current_vel_profile = np.array([])
+        self.current_time_profile = np.array([])
+        self.current_s_profile = np.array([])
+        self.current_plan_indices = np.empty((0, 2), dtype=int)
+        self.profile_step_idx = 0
+        self.current_plan_cost = float("inf")
+        self.cur_path = None
+        self.plan_route_start_idx = -1
 
     def remaining_plan_samples(self) -> np.ndarray:
         """Return remaining (s, t) samples of the current plan from now onward."""
@@ -49,9 +69,13 @@ class LongPlanner:
 
         current_time = self.current_time_profile[self.profile_step_idx]
         future_times = self.current_time_profile[self.profile_step_idx :]
-        future_s = self.current_s_profile[self.profile_step_idx :]
+        future_times -= current_time
+        future_times = np.maximum(future_times, 0.0)
 
-        remaining_time = future_times - current_time
+        future_s = self.current_s_profile[self.profile_step_idx :]
+        future_s -= self.current_s_profile[self.profile_step_idx]
+        future_s = np.maximum(future_s, 0.0)
+
         # return np.stack([future_s, remaining_time], axis=1)
         return np.stack([future_s, future_times], axis=1)
 
@@ -60,11 +84,16 @@ class LongPlanner:
         occupancy_map: np.ndarray,
         ego_speed: float,
         ego_max_speed: float,
+        plan_route_start_idx: int,
+        plan_s_goal_m: Optional[float] = None,
+        *,
+        force_replace: bool = False,               # NEW
     ) -> None:
-        """Plan a new profile and reset state tracking."""
+        """Plan a new profile and (optionally) replace existing one if better/required."""
         start_idx = 0
-        goal_idx = self.grid_mapper.S_len - 1
-        path = self.planner.run(
+        goal_idx = self._goal_idx_from_distance(plan_s_goal_m)
+
+        path, total_cost = self.planner.run(
             occupancy_map,
             start_idx,
             goal_idx,
@@ -72,32 +101,86 @@ class LongPlanner:
             v_max=ego_max_speed,
         )
 
+        # No path found
         if len(path) <= 0:
-            self.current_vel_profile = np.array([])
-            self.current_time_profile = np.array([])
-            self.current_s_profile = np.array([])
-            self.current_plan_indices = np.empty((0, 2), dtype=int)
-            self.profile_step_idx = 0
+            # If we *must* replace (no plan or unsafe), clear the current plan
+            if force_replace or not self.has_active_plan:
+                self.reset_plan()
+            # Otherwise: keep the existing (safe) plan
             return
 
-        # NOTE: DEBUG
-        self.cur_path = path
+        # If we already have a plan and are not forced to replace,
+        # only adopt the new plan if it has lower total cost.
+        # --- thresholds ---
+        TIME_IMPROVEMENT_FRAC = 0.10   # 10% faster
+        COST_IMPROVEMENT_FRAC = 0.20   # 10% lower cost
+        MAX_COST_INCREASE_IF_FASTER = 0.10  # allow up to +10% cost if >=10% faster
 
-        profiles = self.extract_profiles_from_path(
+        # Decide whether to replace the current plan
+        profiles_new = self.extract_profiles_from_path(
             path,
             self.grid_mapper.T_arr,
             self.grid_mapper.S_arr,
-            self.st_algo_spec.dt_algo_res,
+            self.st_algo_spec.dt_algo,
         )
+
+        if not force_replace and self.has_active_plan and np.isfinite(self.current_plan_cost):
+            old_cost = float(self.current_plan_cost)
+            new_cost = float(total_cost)
+
+            new_time_prof = profiles_new["t"]
+            new_duration = float(new_time_prof[-1] - new_time_prof[0])
+
+            if self.current_time_profile is not None and len(self.current_time_profile) > 0:
+                old_duration = float(self.current_time_profile[-1] - self.current_time_profile[0])
+            else:
+                old_duration = float("inf")
+
+            # Protect against degenerate old_duration
+            if not np.isfinite(old_duration) or old_duration <= 1e-6:
+                old_duration = float("inf")
+
+            # Time priority rule:
+            # 1) Replace if >=10% faster AND not more than +10% cost worse.
+            faster_10pct = (new_duration <= (1.0 - TIME_IMPROVEMENT_FRAC) * old_duration)
+            cost_not_too_much_worse = (new_cost <= (1.0 + MAX_COST_INCREASE_IF_FASTER) * old_cost)
+
+            if faster_10pct and cost_not_too_much_worse:
+                pass  # keep going -> replace
+            else:
+                # 2) Otherwise replace if >=10% lower cost.
+                cheaper_10pct = (new_cost <= (1.0 - COST_IMPROVEMENT_FRAC) * old_cost)
+                if not cheaper_10pct:
+                    return
+        # At this point we either:
+        # - had no plan, or
+        # - were forced to replace (unsafe), or
+        # - found a cheaper plan.
+        self.cur_path = path
+        print(f'new cost: {total_cost}, old cost: {self.current_plan_cost}')
+        self.current_plan_cost = float(total_cost)
+
+        # TODO: PROPERLY IMPLEMENT THE EGO STATION CHECK, MAYBE PRECOMPUTE ROUTE DURING INITIALIZATION OR AFTER ROUTE CHANGES
+        self.plan_route_start_idx = plan_route_start_idx
+
+        # profiles = self.extract_profiles_from_path(
+        #     path,
+        #     self.grid_mapper.T_arr,
+        #     self.grid_mapper.S_arr,
+        #     self.st_algo_spec.dt_algo,
+        # )
+        profiles = profiles_new
+        self.profiles = profiles
+        # self.plot_st_profiles(profiles)
 
         time_prof = profiles["t"]
         vel_prof = profiles["v"]
-        s_prof = profiles["s"]
-        indices = profiles["idx"]
+        s_prof   = profiles["s"]
+        indices  = profiles["idx"]
 
         t0 = time_prof[0]
         t1 = time_prof[-1]
-        t_sim = np.arange(t0, t1 + 1e-9, self.dt_sim)
+        t_sim = np.arange(t0, t1 + self.dt_sim, self.dt_sim)
 
         vel_interp = np.interp(t_sim, time_prof, vel_prof)
         s_interp = np.interp(t_sim, time_prof, s_prof)
@@ -146,7 +229,8 @@ class LongPlanner:
 
             # TODO: RENAME OCCUPANCY TO COST BASED CHECKS OR ACTUALLY PASS IN OCCUPANCY MAP
             # NOTE: TESTING VALIDITY CHECK (NOTE OCCUPANCY HERE IS CURRENTLY THE COSTMAP)
-            if occupancy_map[i_t, i_s] > 0.5:
+            if occupancy_map[i_t, i_s] > 1.0:
+                print(f'FOUND COLLISION: (time: {t_j}, s: {s_j}), (time_idx: {i_t}, s_idx: {i_s})')
                 t_collision = t_j
                 break
 
@@ -155,67 +239,255 @@ class LongPlanner:
 
         return is_safe, ttc_min
 
+    # def run_step(
+    #     self,
+    #     ego_route_points_3d : np.ndarray,
+    #     ego_speed : float,
+    #     ego_max_speed : float,
+    #     actor_collisions : Dict[int, List[CollisionInterval]], # K=actor id, V=collision intervals
+    #     plan_tick_counter : int,
+    #     plan_route_start_idx: int,
+    #     all_conditions : Dict = {},
+    #     plan_s_goal_m: Optional[float] = None,
+    #     s_ego_m: float = 0.0,
+    # ) -> np.ndarray:
+    #     """Run the longitudinal planner at simulation rate."""
+
+    #     should_plan_now = (plan_tick_counter % self.sim_ticks_per_plan) == 1 or not self.has_active_plan
+
+    #     if should_plan_now:
+    #         occupancy_map = self.grid_mapper.build_st_occupancy(
+    #             route_points_3d=ego_route_points_3d,
+    #             max_speed=ego_max_speed,
+    #             actor_collisions=actor_collisions,
+    #             all_conditions=all_conditions
+    #         )
+
+    #         plan_safe = False
+    #         if self.has_active_plan:
+    #             # NOTE: VERY EXPERIMENTAL, TRYING TO GENERATE A BETTER PLAN EVEN WHEN SAFE
+    #             # self.compute_new_plan(
+    #             #     occupancy_map=occupancy_map,
+    #             #     ego_speed=ego_speed,
+    #             #     ego_max_speed=ego_max_speed,
+    #             #     plan_s_goal_m=plan_s_goal_m,
+    #             #     plan_route_start_idx=plan_route_start_idx,
+    #             #     force_replace=False,
+    #             # )
+
+    #             print(f'Velocity profile exists, checking safety')
+    #             remaining_samples = self.remaining_plan_samples()
+    #             is_safe, ttc_min = self.validate_plan_against_occupancy(
+    #                 occupancy_map=occupancy_map,
+    #                 plan_samples=remaining_samples,
+    #             )
+
+    #             print(f'remaining samples shape: {remaining_samples.shape}')
+    #             print(f'ttc_min: {ttc_min}')
+    #             # if ttc_min > 1.25 * remaining_samples[1][-1]:
+    #             # if ttc_min > 1.25 * (2 * plan_s_goal_m / ego_max_speed):
+    #             if is_safe:
+    #                 plan_safe = True
+    #                 print(f'Safe plan, proceed')
+    #             else:
+    #                 plan_safe = False
+    #                 print(f'Unsafe, replanning')
+    #                 self.compute_new_plan(
+    #                     occupancy_map=occupancy_map,
+    #                     ego_speed=ego_speed,
+    #                     ego_max_speed=ego_max_speed,
+    #                     plan_s_goal_m=plan_s_goal_m,
+    #                     plan_route_start_idx=plan_route_start_idx,
+    #                     force_replace=(not plan_safe),
+    #                 )
+    #         else:
+    #             # OPTIONAL: if you ever want to *opportunistically* search for a cheaper
+    #             # plan even when safe, you can call compute_new_plan here with
+    #             # force_replace=False and let cost decide:
+    #             #
+    #             self.compute_new_plan(
+    #                 occupancy_map=occupancy_map,
+    #                 ego_speed=ego_speed,
+    #                 ego_max_speed=ego_max_speed,
+    #                 plan_s_goal_m=plan_s_goal_m,
+    #                 plan_route_start_idx=plan_route_start_idx,
+    #                 force_replace=False,
+    #             )
+
+    #         # self.plot_st_map(self.grid_mapper, occupancy_map, ego_max_speed, self.cur_path)
+
+    #     vel_cmd = 0.0
+    #     # TODO: CONFIGURABLE PREDICTION AND DISTANCE HORIZONS
+    #     # TODO: PROPERLY IMPLEMENT THE EGO STATION CHECK, MAYBE PRECOMPUTE ROUTE DURING INITIALIZATION OR AFTER ROUTE CHANGES
+    #     if self.has_active_plan:
+    #         print(f'Velocity profile exists, no 10Hz match yet')
+    #         ego_idx = np.searchsorted(self.current_s_profile, s_ego_m, side="left")
+    #         print(f'ego_idx: {ego_idx}, profile step idx: {self.profile_step_idx}, max_idx: {len(self.current_s_profile) - 1}')
+
+    #         if ego_idx > len(self.current_s_profile) - 1:
+    #             print(f'EGO IDX BEYOND PLAN HORIZON, REPLANNING')
+    #             vel_cmd = self.current_vel_profile[-1]
+    #             self.reset_plan()
+    #             return vel_cmd
+
+    #         ego_idx = max(ego_idx, self.profile_step_idx)
+    #         vel_cmd = self.current_vel_profile[ego_idx]
+
+    #         self.profile_step_idx += 1
+    #         self.profile_step_idx = max(ego_idx, self.profile_step_idx)
+
+    #         # NOTE: TEMPORARY, CHECKING IF THIS FIXES FORECASTING IN TRAJECTORYPLANNER
+    #         self.ego_idx = ego_idx
+
+    #         # self.plot_st_profiles(self.profiles, self.current_time_profile[ego_idx], ego_speed, vel_cmd)
+    #     # plt.show()
+
+    #     return vel_cmd
+
     def run_step(
         self,
         ego_route_points_3d : np.ndarray,
         ego_speed : float,
         ego_max_speed : float,
         actor_collisions : Dict[int, List[CollisionInterval]], # K=actor id, V=collision intervals
+        actor_overlaps : Dict[int, List[LaneOverlapInterval]], # K=actor id, V=overlap intervals
         plan_tick_counter : int,
-        all_conditions : Dict = {}
+        plan_route_start_idx: int,
+        route_index : int,
+        all_conditions : Dict = {},
+        plan_s_goal_m: Optional[float] = None,
+        s_ego_m: float = 0.0,
     ) -> np.ndarray:
-        """Run the longitudinal planner at simulation rate.
+        """Run the longitudinal planner at simulation rate."""
+        def bbox_to_vec7(bb) -> np.ndarray:
+            return np.array([
+                bb.location.x, bb.location.y, bb.location.z,
+                bb.extent.x,   bb.extent.y,   bb.extent.z,
+                bb.rotation.yaw
+            ], dtype=np.float32)
 
-        The planner runs collision checks and replanning at `plan_freq` (10 Hz by
-        default). At intermediate simulation ticks (20 Hz by default) it advances
-        along the stored velocity profile.
-        """
         should_plan_now = (plan_tick_counter % self.sim_ticks_per_plan) == 1 or not self.has_active_plan
 
         if should_plan_now:
             occupancy_map = self.grid_mapper.build_st_occupancy(
                 route_points_3d=ego_route_points_3d,
                 max_speed=ego_max_speed,
-                actor_collisions=actor_collisions,
-                all_conditions=all_conditions
+                actor_overlaps=actor_overlaps,
+                all_conditions=all_conditions,
             )
 
-            # self.plot_st_map(self.grid_mapper, occupancy_map, ego_max_speed, self.cur_path)
-            # plt.show()
-
-            plan_safe = False
+            plan_safe = True
             if self.has_active_plan:
-                print(f'Velocity profile exists, checking safety')
-                remaining_samples = self.remaining_plan_samples()
-                _, ttc_min = self.validate_plan_against_occupancy(
-                    occupancy_map=occupancy_map,
-                    plan_samples=remaining_samples,
-                )
-
-                # TODO: SET ACTUAL TTC VALUE
-                if ttc_min > 2.0:
-                    plan_safe = True
-                    print(f'Safe plan, proceed')
-                else:
-                    plan_safe = False
-                    print(f'Unsafe, replanning')
-
-            if (not self.has_active_plan) or (not plan_safe):
-                print(f'Generating new plan')
+                # TODO VERY EXPERIMENTAL
                 self.compute_new_plan(
                     occupancy_map=occupancy_map,
                     ego_speed=ego_speed,
                     ego_max_speed=ego_max_speed,
+                    plan_s_goal_m=plan_s_goal_m,
+                    plan_route_start_idx=route_index,
+                    force_replace=False,
                 )
 
+                route_geometry = self.grid_mapper.precompute_route_geometry(ego_route_points_3d)
+                print(f'Velocity profile exists, checking safety')
+                remaining_samples = self.remaining_plan_samples()
+
+                # Rollout ego trajectory and check for collisions
+                for actor_id, collisions in actor_collisions.items():
+                    if not collisions:
+                        continue
+
+                    collision_interval = collisions[0]
+                    start_idx = collision_interval.start_idx
+                    ttc_min = start_idx * self.st_grid_spec.dt
+
+                    # Check when the collision happens
+                    # if ttc_min > 6.0:
+                    #     print(f'Ignoring collision with actor: {actor_id}, ttc_min: {ttc_min}, plan_time_end: {remaining_samples[-1, -1]}')
+                    #     continue
+                    if ttc_min > 1.0 + remaining_samples[-1, -1]:
+                        print(f'Ignoring collision with actor: {actor_id}, ttc_min: {ttc_min}, plan_time_end: {remaining_samples[-1, -1]}')
+                        continue
+
+                    # Check where the collision happens
+                    ego_collision_bb = np.array([bbox_to_vec7(collision_interval.collision_bboxes_a[start_idx])])
+                    corners_collision = self.grid_mapper.obb_corners_world_xy(ego_collision_bb)  # expected (T_collision, 4, 2)
+                    ego_s_collision = self.grid_mapper.project_points_to_route_s(
+                        corners_collision.reshape(-1, 2),
+                        route_geometry,
+                    ).reshape(1, 4)
+
+                    # Reduce collision band to min and max s per timestep
+                    s_min = np.min(ego_s_collision, axis=1)[0]
+                    s_max = np.max(ego_s_collision, axis=1)[0]
+
+                    s_min_idx = np.clip(np.floor(s_min / self.st_grid_spec.ds), 0, occupancy_map.shape[1] - 1).astype(np.int32)
+                    s_max_idx = np.clip(np.floor(s_max / self.st_grid_spec.ds), 0, occupancy_map.shape[1] - 1).astype(np.int32)
+                    t_idx = int(np.clip(start_idx, 0, occupancy_map.shape[0] - 1))
+
+                    print(f'\n\nEGO ROLLOUT COLLISION')
+                    print(f'\t\tactor_id: {actor_id}, s_min: {s_min}, s_max: {s_max}, s_min_idx: {s_min_idx}, s_max_idx: {s_max_idx}, t_idx: {t_idx}, ttc_min: {ttc_min}, plan_time_end: {remaining_samples[-1, -1]}')
+                    occupancy_map[t_idx, s_min_idx : s_max_idx] = 255.0
+                    plan_safe = False
+                    # break
+
+                print(f'remaining samples shape: {remaining_samples.shape}')
+                if plan_safe:
+                    print(f'Safe plan, proceed')
+                else:
+                    print(f'Unsafe, replanning')
+                    self.compute_new_plan(
+                        occupancy_map=occupancy_map,
+                        ego_speed=ego_speed,
+                        ego_max_speed=ego_max_speed,
+                        plan_s_goal_m=plan_s_goal_m,
+                        plan_route_start_idx=route_index,
+                        force_replace=(not plan_safe),
+                    )
+            else:
+                # OPTIONAL: if you ever want to *opportunistically* search for a cheaper
+                # plan even when safe, you can call compute_new_plan here with
+                # force_replace=False and let cost decide:
+                #
+                self.compute_new_plan(
+                    occupancy_map=occupancy_map,
+                    ego_speed=ego_speed,
+                    ego_max_speed=ego_max_speed,
+                    plan_s_goal_m=plan_s_goal_m,
+                    plan_route_start_idx=route_index,
+                    force_replace=False,
+                )
+
+            # self.plot_st_map(self.grid_mapper, occupancy_map, ego_max_speed, self.cur_path)
+
         vel_cmd = 0.0
+        # TODO: CONFIGURABLE PREDICTION AND DISTANCE HORIZONS
+        # TODO: PROPERLY IMPLEMENT THE EGO STATION CHECK, MAYBE PRECOMPUTE ROUTE DURING INITIALIZATION OR AFTER ROUTE CHANGES
         if self.has_active_plan:
             print(f'Velocity profile exists, no 10Hz match yet')
-            idx = min(self.profile_step_idx, len(self.current_vel_profile) - 1)
-            vel_cmd = float(self.current_vel_profile[idx])
-            self.profile_step_idx = min(
-                self.profile_step_idx + 1, len(self.current_vel_profile)
-            )
+            ego_idx = np.searchsorted(self.current_s_profile, s_ego_m, side="left")
+            print(f'ego_idx: {ego_idx}, profile step idx: {self.profile_step_idx}, max_idx: {len(self.current_s_profile) - 1}')
+
+            # if ego_idx > len(self.current_s_profile) - 1:
+            #     print(f'EGO IDX BEYOND PLAN HORIZON, REPLANNING')
+            #     vel_cmd = self.current_vel_profile[-1]
+            #     self.reset_plan()
+            #     return vel_cmd
+
+            ego_idx = max(ego_idx, self.profile_step_idx)
+            # vel_cmd = self.current_vel_profile[ego_idx]
+            vel_cmd = self.current_vel_profile[self.profile_step_idx]
+
+            self.profile_step_idx += 1
+            # self.profile_step_idx = max(ego_idx, self.profile_step_idx)
+
+            # NOTE: TEMPORARY, CHECKING IF THIS FIXES FORECASTING IN TRAJECTORYPLANNER
+            self.ego_idx = ego_idx
+
+            # self.plot_st_profiles(self.profiles, self.current_time_profile[self.profile_step_idx], ego_speed, vel_cmd)
+        else:
+            self.reset_plan()
+        # plt.show()
 
         return vel_cmd
 
@@ -268,6 +540,16 @@ class LongPlanner:
             "idx": np.stack([t_idx, s_idx], axis=1),
         }
 
+    def _goal_idx_from_distance(self, plan_s_goal_m: Optional[float]) -> int:
+        """Convert a goal distance in meters to the closest valid s-index."""
+        if plan_s_goal_m is None:
+            return self.grid_mapper.S_len - 1
+
+        ds = self.st_grid_spec.ds
+        goal_idx = int(np.floor(plan_s_goal_m / ds))
+        goal_idx = int(np.clip(goal_idx, 0, self.grid_mapper.S_len - 1))
+        return goal_idx
+
     ########################################
     # Visualization methods for debugging
     ########################################
@@ -313,7 +595,7 @@ class LongPlanner:
 
         ax.set_xlabel("time t (s)")
         ax.set_ylabel("arc length s (m)")
-        ax.set_ylim(0.0, 40.0 + 1e-3)
+        ax.set_ylim(0.0, self.st_grid_spec.S_max + 1e-3)
         ax.set_title("s–T costmap")
         ax.legend(loc="best", frameon=True)
         ax.grid(True, lw=0.6, alpha=0.5)
@@ -322,6 +604,9 @@ class LongPlanner:
     def plot_st_profiles(
         self,
         profiles : Dict[str, np.ndarray],
+        cur_time : float,
+        ego_speed : float,
+        target_speed : float,
         title: str = "Speed profile (s, v, a, j)"
     ):
         """
@@ -340,6 +625,8 @@ class LongPlanner:
         axs[0].grid(True, lw=0.6, alpha=0.5)
 
         axs[1].plot(tt, vv, marker="o")
+        axs[1].scatter([cur_time], [ego_speed], s=40, color="red", zorder=5, label="ego current")
+        axs[1].scatter([cur_time], [target_speed], s=40, color="green", zorder=5, label="vel target")
         axs[1].set_ylabel("v (m/s)")
         axs[1].grid(True, lw=0.6, alpha=0.5)
 
@@ -351,6 +638,9 @@ class LongPlanner:
         axs[3].set_ylabel("j (m/s³)")
         axs[3].set_xlabel("time t (s)")
         axs[3].grid(True, lw=0.6, alpha=0.5)
+
+        for ax in axs:
+            ax.axvline(cur_time, linestyle="--", linewidth=1.0, color="red", alpha=0.7)
 
         return fig, axs
 

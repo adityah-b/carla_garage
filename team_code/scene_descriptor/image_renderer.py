@@ -81,18 +81,10 @@ class ImageRenderer:
         all_peds = [] if scene_data.ped_data is None else scene_data.ped_data
 
         # Get all obstacles
-        all_obstacles = [] if scene_data.obstacle_data is None else scene_data.obstacle_data
+        all_obstacles = scene_data.obstacle_data.all_obstacles
 
         # Get all vehicles (cyclists included)
-        all_vehicles = []
-        if scene_data.vehicle_data:
-            all_vehicles = [
-                v_data
-                for lanes in scene_data.vehicle_data.values()
-                for lv_list in lanes.values()
-                for lv in lv_list
-                for v_data in lv.vehicle_data
-            ]
+        all_vehicles = scene_data.vehicle_data.all_vehicles_flat
 
         rendered_images = {}
 
@@ -125,7 +117,7 @@ class ImageRenderer:
                 if self._should_render_actor(
                     vehicle, ego_location, ego_forward_vec, tag
                 ):
-                    is_cyclist = ("base_type" in vehicle.attributes and vehicle.attributes["base_type"] == "bicycle")
+                    is_cyclist = vehicle_entry.vehicle_type == "cyclist"
                     if is_cyclist:
                         self._render_single_actor(
                             rendered_image,

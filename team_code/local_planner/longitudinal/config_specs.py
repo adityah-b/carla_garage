@@ -31,4 +31,14 @@ class STAlgoSpec:
     @property
     def dt_algo(self) -> float:
         # TODO: CHOOSE HOW MUCH TIME BUFFER WE"RE ADDING
-        return 1.25 * np.sqrt((2 * self.ds_algo) / self.A_max).round(2)
+        # dt_acc = 1.25 * np.sqrt((2 * self.ds_algo) / self.A_max)
+        dt_max_acc = 1.1 * np.sqrt((2 * self.ds_algo) / self.A_max)
+        dt_min_acc = 1.1 * np.sqrt((2 * self.ds_algo) / self.A_min)
+
+        # Time required by Jerk limit (s = 1/6 * j * t^3)
+        # We need enough time to ramp up acceleration to move 1 ds
+        # Derived from: ds = 1/6 * J_max * t^3  ->  t = (6 * ds / J)^(1/3)
+        # dt_jerk = 1.25 * np.cbrt((6 * self.ds_algo) / self.J_max)
+        dt_jerk = 1.1 * np.cbrt((6 * self.ds_algo) / self.J_max)
+
+        return float(max(dt_max_acc, dt_min_acc, dt_jerk))

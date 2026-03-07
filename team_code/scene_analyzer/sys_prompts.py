@@ -145,7 +145,8 @@ All NPC actors only execute a set of discrete actions that are listed below:
 3. `change_lane_right`
 4. `turn_left`
 5. `turn_right`
-6. `stop`
+6. `turn_straight`
+7. `stop`
 
 ###PEDESTRIANS###
 1. `cross_street`
@@ -370,17 +371,19 @@ The top-level JSON object has the following fields:
 
 - next_action
   - A natural-language summary of your analysis. End your summary describing the high-level action the ego should do next.
-  - Only choose high level actions from this set. Do NOT create new actions:
+  - ONLY choose actions from this set. Do NOT create new ones:
     - follow route
     - stop for
-    - turn left
-    - turn right
+    - turn left at intersection
+    - turn right at intersection
+    - turn straight at intersection
     - change lane left
     - change lane right
     - overtake left
     - overtake right
     - pull over left for emergency vehicle
     - pull over right for emergency vehicle
+    - share lane
 
 - reasoning
   - A list of 1 to 10 short reasoning steps.
@@ -394,13 +397,15 @@ The top-level JSON object has the following fields:
 - Only use actors and objects that are present in the images or explicitly described in the text. Do not invent new actors, objects, or conditions.
 - ONLY OVERTAKE OBSTACLES and LEADING CYCLISTS in the EGO LANE. Never OVERTAKE other VEHICLES.
 - ALWAYS be cautious of PEDESTRIANS and allow them the right-of-way whenever possible.
-- ALWAYS be cautious of EMERGENCY VEHICLES and allow them the right-of-way whenever possible.
 - ALWAYS PULL OVER for TRAILING EMERGENCY VEHICLES in the EGO LANE
+- ALWAYS YIELD to CROSSING EMERGENCY VEHICLES
 - Only consider LEADING traffic in the LEFT or RIGHT lane, NEVER in the EGO LANE.
 - Only consider TRAILING traffic in the LEFT or RIGHT lane, NEVER in the EGO LANE.
 - ALWAYS consider CROSSING traffic
 - ALWAYS consider ONCOMING traffic
 - Slow leading vehicles SHOULD NEVER BE OVERTAKEN
+- SHARE THE LANE with vehicles that are INTRUDING into your lane
+- DO NOT INVENT NEW ACTIONS
 
 ## RAG USAGE
 - ONLY if you use retrieved memory, reference it concisely in the reasoning list via memory IDs only (for example: "Uses Memory 2").
@@ -448,12 +453,14 @@ You must output a single JSON object with the following structure:
     - "follow_route"
     - "turn_left"
     - "turn_right"
+    - "turn_straight"
     - "change_lane_left"
     - "change_lane_right"
     - "overtake_left"
     - "overtake_right"
     - "pull_over_left"
     - "pull_over_right"
+    - "share_lane"
 
 - target_speed
   - Optional numeric value (float) representing the desired target speed for the ego vehicle in metres/second.

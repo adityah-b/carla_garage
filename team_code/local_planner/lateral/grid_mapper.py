@@ -8,6 +8,12 @@ from math import sqrt
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence, Tuple, Set, Dict, List, Any
 
+from privileged_route_planner import PlannerState
+from scene_descriptor.scene_descriptor import SceneData
+from actor_prediction.motion_prediction import PredictionData
+from actor_prediction.collision_checker import CollisionInterval
+from team_code.scene_analyzer.parsers.ego_plan_pydantic_models import *
+
 from .sensor_data_processor import WorldMappingProcessor, BEVGrid
 from scene_descriptor.camera_interface import CameraInterface
 
@@ -79,16 +85,27 @@ class GridMapper:
 
     def update_maps(
         self,
+        planner_state : PlannerState,
+        start_idx : int,
+        goal_idx : int,
+        scene_data : SceneData,
+        prediction_data : PredictionData,
         lidar_data: Dict,
-        route_points_world: np.ndarray
+        ego_plan : EgoPlan,
+        all_conditions : Dict = {},
     ) -> Maps:
+        route_points_world = planner_state.original_route_points[start_idx : goal_idx + 1]
         ego_tf = self.ego_vehicle.get_transform()
 
         # Get base cost maps
         road_cost_map, static_cost_map, dynamic_cost_map = self.processor.get_base_cost_maps(
-            lidar_data,
-            ego_tf,
-            self.lat_grid_spec
+            planner_state=planner_state,
+            scene_data=scene_data,
+            prediction_data=prediction_data,
+            lidar_data=lidar_data,
+            ego_tf=ego_tf,
+            grid=self.lat_grid_spec,
+            ego_plan=ego_plan,
         )
         occupancy_map = np.ones_like(road_cost_map, dtype=np.uint8)
         occupancy_map[road_cost_map > 0] = 0
@@ -96,13 +113,25 @@ class GridMapper:
         # occupancy_map[dynamic_cost_map > 0] = 0
 
         # Augment static cost map with route information
+        # static_cost_map_route = self.processor.augment_static_cost_map(
+        #     road_cost_map,
+        #     static_cost_map,
+        #     self.ego_vehicle,
+        #     route_points_world,
+        #     self.lat_grid_spec
+        # )
+        # TODO: TESTING FOR INVADING LANE CHANGE
+        combined_cost_map = np.maximum(static_cost_map, dynamic_cost_map)
+        # combined_cost_map = static_cost_map
         static_cost_map_route = self.processor.augment_static_cost_map(
             road_cost_map,
-            static_cost_map,
+            combined_cost_map,
             self.ego_vehicle,
             route_points_world,
             self.lat_grid_spec
         )
+
+        static_cost_map_route = np.maximum(dynamic_cost_map, static_cost_map_route)
 
         # cost_map = self.processor.get_cost_map(
         #     occupancy_map

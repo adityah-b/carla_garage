@@ -14,11 +14,12 @@ import os
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Dict, Set
+from typing import List, Dict, Set, Optional
 
 @dataclass(frozen=True, slots=True)
 class PlannerState:
     route_index : int
+    route_len : int
     route_waypoints : List[carla.Waypoint]
     route_points : np.ndarray
     route_commands : np.ndarray
@@ -29,6 +30,11 @@ class PlannerState:
     dist_to_next_stop_signs : np.ndarray
     speed_limits : np.ndarray
     cleared_stop_sign_ids : Set[int]
+    route_bbs : List[carla.BoundingBox]
+    s_route : np.ndarray
+    original_route_points : np.ndarray
+    original_route_waypoints : List[carla.Waypoint]
+    original_route_bbs : List[carla.BoundingBox]
 
 class PrivilegedRoutePlanner(object):
   """
@@ -99,6 +105,7 @@ class PrivilegedRoutePlanner(object):
   def get_planner_state(self) -> PlannerState:
       return PlannerState(
          route_index = self.route_index,
+         route_len=self.route_points.shape[0],
          route_waypoints = self.route_waypoints,
          route_points = self.route_points,
          route_commands = self.commands,
@@ -108,7 +115,12 @@ class PrivilegedRoutePlanner(object):
          next_stop_signs = self.next_stop_signs,
          dist_to_next_stop_signs = self.distances_to_next_stop_signs,
          speed_limits = self.speed_limits,
-         cleared_stop_sign_ids = self.cleared_stop_sign_ids
+         cleared_stop_sign_ids = self.cleared_stop_sign_ids,
+         route_bbs = self.route_bbs,
+         s_route = self.s_route,
+         original_route_points=self.original_route_points,
+         original_route_waypoints=self.original_route_waypoints,
+         original_route_bbs=self.original_route_bbs,
       )
 
   def update_cleared_stop_signs(self, stop_sign_id : int):
@@ -585,6 +597,66 @@ class PrivilegedRoutePlanner(object):
     self.compute_distances_to_stop_signs(carla_world, carla_map)
     self.compute_speed_limits(carla_map)
     self.prevent_too_early_lane_changes()
+
+    self.route_bbs = self.generate_route_bbs(
+      route_points = self.route_points,
+      route_yaws=self.rotation_angles,
+      route_waypoints=self.route_waypoints,
+      stride=self.config.points_per_meter
+    )
+    self.original_route_waypoints = self.route_waypoints.copy()
+    self.original_route_bbs = self.route_bbs.copy()
+
+    self.s_route = self.cumulative_arclength(
+      route_points=self.route_points
+    )
+
+  def cumulative_arclength(
+    self,
+    route_points: np.ndarray
+  ) -> np.ndarray:
+    diffs = np.diff(route_points, axis=0)
+    seg_lengths = np.linalg.norm(diffs, axis=1)
+    s = np.concatenate([[0.0], np.cumsum(seg_lengths)])
+    return s
+
+  def generate_route_bbs(
+    self,
+    route_points : np.ndarray,
+    route_yaws : np.ndarray,
+    route_waypoints : List[carla.Waypoint],
+    *,
+    stride : int,
+    from_index : Optional[int] = None,
+    to_index : Optional[int] = None,
+    spacing_m : int = 2,
+    buffer_lat : float = 0.0,
+    buffer_lon : float = 0.25,
+  ) -> List[carla.BoundingBox]:
+    route_bbs : List[carla.BoundingBox] = []
+
+    # TODO: VERIFY IF OFF BY ONE INDEXING PROBLEMS EXIST
+    from_index = 0 if from_index is None else from_index
+    to_index = len(route_waypoints) - 1 if to_index is None else to_index
+
+    half_len = 0.5 * float(spacing_m) + float(buffer_lon)
+    for i in range(from_index, to_index + 1, stride * spacing_m):
+      lane_width = route_waypoints[i].lane_width
+      half_wid = 0.5 * float(lane_width) + float(buffer_lat)
+
+      extent = carla.Vector3D(x=half_len, y=half_wid, z=1.0)
+
+      pt = route_points[i]
+      yaw_deg = route_yaws[i]
+
+      center = carla.Location(x=pt[0], y=pt[1], z=pt[2])
+
+      bb = carla.BoundingBox(center, extent)
+      bb.rotation = carla.Rotation(pitch=0, yaw=yaw_deg, roll=0)
+
+      route_bbs.append(bb)
+
+    return route_bbs
 
   def prevent_too_early_lane_changes(self):
     """

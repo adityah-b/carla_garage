@@ -908,12 +908,19 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
     #     "temperature" : 0.7,
     #     "max_output_tokens" : 4096
     # }
+    # self.scene_analyzer_config = {
+    #     "provider" : "vllm",
+    #     "model_name" : "Qwen/Qwen2.5-VL-72B-Instruct-AWQ",
+    #     "temperature" : 0.75,
+    #     "max_output_tokens" : 8192
+    # }
     self.scene_analyzer_config = {
-        "provider" : "vllm",
-        "model_name" : "Qwen/Qwen2.5-VL-72B-Instruct-AWQ",
-        "temperature" : 0.45,
-        "max_output_tokens" : 8192
+        "provider" : "openai",
+        "model_name" : "gpt-4.1-mini-2025-04-14",
+        "temperature" : 0.25,
+        "max_output_tokens" : 4096
     }
+
     # self.scene_analyzer_config = {
     #     "provider" : "vllm",
     #     "model_name" : "nvidia/Cosmos-Reason1-7B",
@@ -928,34 +935,33 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
     # }
 
     # -----------------------------------------------------------------------------
-    # Local planner parameters
+    # Scene descriptor parameters
     # -----------------------------------------------------------------------------
 
-    # Longitudinal
-    self.st_grid_spec = STGridSpec(
-      S_max=80.0,
-      ds=0.25,
-      T_max=8.0,
-      dt=0.1
-    )
-    self.st_algo_spec = STAlgoSpec(
-      A_max=self.idm_maximum_acceleration,
-      A_min=self.idm_comfortable_braking_deceleration_low_speed,
-      J_max=50.0,
-      W_vel=1.0,
-      W_acc=1.0,
-      W_jerk=1.0,
-      ds_grid=self.st_grid_spec.ds,
-      dt_grid=self.st_grid_spec.dt,
-      ds_algo=4 * self.st_grid_spec.ds
-    )
+    # Lanelet handling
+    self.max_distance_to_lanelet = 2.0
+    self.max_distance_to_lanelet_bicycle = 3.0
 
-    # Lateral
+    self.obstacle_detection_radius = 50.0
+
+    self.collision_data_max_entries : int = 3
+
+    # -----------------------------------------------------------------------------
+    # Scene analyzer parameters
+    # -----------------------------------------------------------------------------
+    self.obstacle_processing_distance = 15.0
+
+    # -----------------------------------------------------------------------------
+    # Lateral planner parameters
+    # -----------------------------------------------------------------------------
+    self.lat_planning_frequency = 1.0
+    self.lat_planning_frequency_high = 5.0
+
     self.lat_grid_spec = LatGridSpec(
       x_min=-5.0,
-      x_max=50.0,
-      y_min=-30.0,
-      y_max=30.0,
+      x_max=55.0,
+      y_min=-40.0,
+      y_max=40.0,
       resolution=0.25
     )
     self.lat_algo_spec = LatAlgoSpec(
@@ -964,6 +970,40 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
       veh_half_width=self.ego_extent_y,
       goal_tol_m=0.5,
       w_cost=1.0
+    )
+
+    self.lat_planner_max_distance = 40.0
+
+    # -----------------------------------------------------------------------------
+    # Longitudinal planner parameters
+    # -----------------------------------------------------------------------------
+    self.prediction_frequency = 10.0
+    self.long_planning_time_resolution = 1 / self.prediction_frequency
+
+    self.long_planning_frequency = 5.0
+
+    self.long_planning_turn_buffer_m = 5.0
+
+    # Longitudinal
+    self.st_grid_spec = STGridSpec(
+      S_max=80.0,
+      ds=0.25,
+      T_max=8.0,
+      dt=self.long_planning_time_resolution
+    )
+    self.st_algo_spec = STAlgoSpec(
+      # A_max=self.idm_maximum_acceleration,
+      A_max=8.0,
+      # A_min=self.idm_comfortable_braking_deceleration_low_speed,
+      A_min=20.0,
+      # J_max=self.idm_maximum_acceleration,
+      J_max=50.0,
+      W_vel=1.0,
+      W_acc=1.0,
+      W_jerk=1.0,
+      ds_grid=self.st_grid_spec.ds,
+      dt_grid=self.st_grid_spec.dt,
+      ds_algo=4 * self.st_grid_spec.ds
     )
 
     self.traffic_light_distance_threshold = 30.0

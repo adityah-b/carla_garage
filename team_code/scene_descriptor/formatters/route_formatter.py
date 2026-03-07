@@ -128,7 +128,7 @@ class RouteFormatter(BaseFormatter):
         elif i_data.target_maneuver == RoadOption.RIGHT:
             turn = "Turn RIGHT"
         else:
-            turn = "Go STRAIGHT"
+            turn = "Turn STRAIGHT"
 
         if i_data.signalized == IntersectionType.SIGNALIZED:
             i_type = "SIGNALIZED"
@@ -138,7 +138,7 @@ class RouteFormatter(BaseFormatter):
             i_type = "JUNCTION"
 
         if i_data.inside_intersection:
-            return f"{indent}Ego driving through {i_type} intersection. Executing {turn} maneuver"
+            return f"{indent}Driving through {i_type} intersection. Executing {turn} maneuver"
 
         if i_data.distance_to_intersection < 10.0:
             # return f"{indent}{turn} after arriving at {i_type} intersection in next {f(i_data.distance_to_intersection, precision)} metres"

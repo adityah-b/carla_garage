@@ -50,6 +50,7 @@ sensors_to_icons = {
     'sensor.camera.semantic_segmentation': 'carla_camera', # for datagen
     'sensor.camera.instance_segmentation': 'carla_camera', # for datagen
     'sensor.camera.depth':      'carla_camera', # for datagen
+    'sensor.other.collision': 'carla_collision',
 }
 
 class LeaderboardEvaluator(object):
@@ -375,9 +376,8 @@ class LeaderboardEvaluator(object):
         # Run the scenario
         try:
             # Load scenario and run it
-            # print(f'ARGS.RECORD: {args.record}')
-            # if args.record:
-            #     self.client.start_recorder("{}/{}_rep{}.log".format(args.record, config.name, config.repetition_index), False) # changed to False, otherwise the log file become too large
+            if args.record:
+                self.client.start_recorder("{}/{}_rep{}.log".format(args.record, config.name, config.repetition_index), False) # changed to False, otherwise the log file become too large
             self.manager.load_scenario(self.route_scenario, self.agent_instance, config.index, config.repetition_index)
             self.manager.run_scenario()
 

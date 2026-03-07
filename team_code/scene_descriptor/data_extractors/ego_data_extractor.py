@@ -4,7 +4,6 @@ import carla
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 
-from .road_handler import RoadHandler, LaneVehicles, Lanelet
 from privileged_route_planner import PlannerState
 
 @dataclass(frozen=True, slots=True)

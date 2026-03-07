@@ -2,8 +2,6 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import List, Optional, Set, Tuple
 
-from transitions import Machine
-
 from team_code.scene_analyzer.parsers.ego_plan_pydantic_models import ConditionCommand, Action
 
 class ActionPhase(Enum):

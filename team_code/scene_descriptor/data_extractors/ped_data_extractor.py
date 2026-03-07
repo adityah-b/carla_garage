@@ -20,7 +20,7 @@ class PedestrianData:
 
 class PedestrianDataExtractor(BaseActorExtractor):
     def __init__(self, config : GlobalConfig, carla_map : carla.Map):
-        self.config = config
+        super().__init__(config)
         self.carla_map = carla_map
 
     def extract_ped_data(

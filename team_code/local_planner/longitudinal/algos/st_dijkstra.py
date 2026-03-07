@@ -19,6 +19,7 @@ class STDijkstra:
         ds_algo: float,
         dt_algo: float,
         v_max: float,
+        a_min: float,
         a_max: float,
         j_max: float
     ) -> List[Tuple[int, int, float, float]]:
@@ -31,7 +32,9 @@ class STDijkstra:
         """
         neighbours: List[Tuple[int, int, float, float]] = []
 
-        occ = occupancy_grid
+        # occ = occupancy_grid
+        # TODO: HARD CODING COST THRESHOLD
+        occ = np.where(occupancy_grid >= 200.0, occupancy_grid, 0)
         T_grid, S_grid = occ.shape
 
         # Resolutions
@@ -56,17 +59,17 @@ class STDijkstra:
 
         # --- kinematic bounds in terms of di (jump on ds_algo lattice) ---
         # Speed bound
-        di_max_speed = int(np.floor((v_max * dt) / ds + 1e-12))
+        di_max_speed = int(np.floor(((v_cur + max(v_max, v_cur)) / 2.0 * dt) / ds + 1e-12))
 
         # Acceleration bound
-        di_min_acc = int(np.ceil(((v_cur * dt) - (a_max * dt * dt)) / ds - 1e-12))
-        di_max_acc = int(np.floor(((v_cur * dt) + (a_max * dt * dt)) / ds + 1e-12))
+        di_min_acc = int(np.ceil(((v_cur * dt) - (0.5 * a_min * dt ** 2)) / ds - 1e-12))
+        di_max_acc = int(np.floor(((v_cur * dt) + (0.5 * a_max * dt ** 2)) / ds + 1e-12))
 
         # Jerk bound
         a_lo = a_cur - j_max * dt
         a_hi = a_cur + j_max * dt
-        di_min_jerk = int(np.ceil(((v_cur * dt) + (a_lo * dt * dt)) / ds - 1e-12))
-        di_max_jerk = int(np.floor(((v_cur * dt) + (a_hi * dt * dt)) / ds + 1e-12))
+        di_min_jerk = int(np.ceil(((v_cur * dt) + (0.5 * a_lo * dt * dt)) / ds - 1e-12))
+        di_max_jerk = int(np.floor(((v_cur * dt) + (0.5 * a_hi * dt * dt)) / ds + 1e-12))
 
         # Intersect ranges + monotonicity + world bound
         di_min = max(0, di_min_acc, di_min_jerk)
@@ -78,17 +81,36 @@ class STDijkstra:
         # Candidate jumps on the planner lattice
         di_vec = np.arange(di_min, di_max + 1, dtype=np.int32)   # (N,)
         next_s_algo_vec = s_idx_algo + di_vec                    # (N,)
-        next_v_vec = (di_vec.astype(np.float32) * ds) / dt       # (N,) m/s
+        v_avg_vec = (di_vec.astype(np.float32) * ds) / dt
+        next_v_vec = 2.0 * v_avg_vec - v_cur
 
-        # --- Collision sampling along each candidate edge ---
-        # Time samples: 0, dt_grid, 2*dt_grid, ..., dt (approx)
-        dt_grid_steps = (np.arange(time_stride + 1, dtype=np.float32) * dt_grid)[:, None]  # (R,1)
+        # Filter out negative velocities (reversing not allowed in this lattice)
+        valid_v = next_v_vec >= 0.0
+        if not np.any(valid_v):
+            return neighbours
 
-        # World s at start of edge
-        s0_world = s_idx_algo * ds                               # meters
+        # Apply filter
+        di_vec = di_vec[valid_v]
+        next_s_algo_vec = next_s_algo_vec[valid_v]
+        next_v_vec = next_v_vec[valid_v]
+        v_avg_vec = v_avg_vec[valid_v] # Keep for collision interp
 
-        # World s along diagonals: s(t) = s0 + v_edge * Δt_k
-        s_diag_world = s0_world + dt_grid_steps * next_v_vec[None, :]  # (R, N)
+        # Recalculate acceleration for the collision interpolation
+        # s(t) = s0 + v0*t + 0.5*a*t^2
+        next_a_vec = (next_v_vec - v_cur) / dt
+
+
+        # --- FIXED COLLISION SAMPLING (Parabolic Interpolation) ---
+        dt_grid_steps = (np.arange(time_stride + 1, dtype=np.float32) * dt_grid)[:, None] # (R, 1)
+        s0_world = s_idx_algo * ds
+
+        # Use parabolic interpolation instead of linear
+        # s(t) = s0 + v_cur * t + 0.5 * a * t^2
+        # We broadcast (R, 1) time steps against (1, N) accelerations
+        term_v = v_cur * dt_grid_steps
+        term_a = 0.5 * next_a_vec[None, :] * (dt_grid_steps ** 2)
+
+        s_diag_world = s0_world + term_v + term_a
 
         # Convert to occupancy columns
         i_diag = np.floor(s_diag_world / ds_grid).astype(np.int32)
@@ -147,7 +169,8 @@ class STDijkstra:
             Total accumulated cost of this path. If no path is found,
             returns ([], np.inf).
         """
-        occ = occupancy_grid.astype(bool)
+        # occ = occupancy_grid.astype(bool)
+        occ = occupancy_grid.astype(float)
         K_grid, S_grid = occ.shape
 
         ds_grid = self.st_algo_spec.ds_grid
@@ -164,10 +187,12 @@ class STDijkstra:
         s_goal_idx_algo  = int(round(s_goal_world  / ds_algo))
 
         # Guard: start cell must be free in the occupancy grid
-        if not (0 <= s_start_idx < S_grid) or occ[0, s_start_idx]:
+        # TODO: REPLACE HARD CODED VALUES
+        if not (0 <= s_start_idx < S_grid) or occ[0, s_start_idx] >= 200.0:
             return [], float("inf")
 
         A_max = self.st_algo_spec.A_max
+        A_min = self.st_algo_spec.A_min
         J_max = self.st_algo_spec.J_max
 
         w_vel  = self.st_algo_spec.W_vel
@@ -190,12 +215,14 @@ class STDijkstra:
         pq: List[Tuple[float, int, Tuple[int, int, int, int]]] = []
         tie = 0
 
-        start_key = (0, s_start_idx_algo, di_prev0, ai_prev0)
+        start_key = (0, s_start_idx_algo, di_prev0)
         heapq.heappush(pq, (0.0, tie, start_key))
         tie += 1
 
-        dist: Dict[Tuple[int, int, int, int], float] = {start_key: 0.0}
-        parent: Dict[Tuple[int, int, int, int], Optional[Tuple[int, int, int, int]]] = {start_key: None}
+        dist: Dict[Tuple[int, int, int], float] = {start_key: 0.0}
+        parent: Dict[Tuple, Any] = {start_key: None}
+
+        accel_map: Dict[Tuple, float] = {start_key: a0}
 
         # Optional caches, kept here if you want them later
         v_cache: Dict[Tuple[int, int, int, int], float] = {start_key: v_from_di(di_prev0)}
@@ -208,34 +235,44 @@ class STDijkstra:
             if cost_u != dist.get(key_u, np.inf):
                 continue
 
-            t_idx_grid, s_idx_algo, di_prev, ai_prev = key_u
+            t_idx_grid, s_idx_algo, di_prev = key_u
+
+            v_cur = (di_prev * ds_algo) / dt_algo
+            a_cur = accel_map[key_u]
 
             # Goal test in world s via planner index
             if s_idx_algo * ds_algo >= s_goal_world:
                 # reconstruct path, mapping s_idx_algo back to s_grid indices
-                path: List[Tuple[int, int, float, float]] = []
-                cur = key_u
-                while cur is not None:
-                    t_c, s_c_algo, di_c, ai_c = cur
-                    s_c_world = s_c_algo * ds_algo
-                    s_c_grid  = int(round(s_c_world / ds_grid))
-                    s_c_grid  = max(0, min(S_grid - 1, s_c_grid))
-                    path.append((t_c, s_c_grid, v_from_di(di_c), a_from_ai(ai_c)))
-                    cur = parent[cur]
-                path.reverse()
+                path = []
+                curr_k = key_u
+                while curr_k is not None:
+                    # Reconstruct from Parent info
+                    # We need to look up the v/a we stored
+                    # Since parent[start] is None, handle carefully
+                    p_data = parent[curr_k]
 
-                total_cost = cost_u  # accumulated cost for this goal state
-                return path, total_cost
+                    # Convert algo s to grid s
+                    t_c, s_c_algo, _ = curr_k
+                    s_c_world = s_c_algo * ds_algo
+                    s_c_grid = int(round(s_c_world / ds_grid))
+
+                    # If it's the start node, use v0/a0
+                    if p_data is None:
+                         path.append((t_c, s_c_grid, v0, a0))
+                         break
+
+                    prev_k, v_node, a_node = p_data
+                    path.append((t_c, s_c_grid, v_node, a_node))
+                    curr_k = prev_k
+
+                path.reverse()
+                return path, cost_u
 
             # No more time rows to expand
             if t_idx_grid + 1 >= K_grid:
                 continue
 
             # Current continuous kinematics
-            v_cur = v_from_di(di_prev)
-            a_cur = a_from_ai(ai_prev)
-
-            # Build neighbours
             nbrs = self.find_neighbours(
                 occupancy_grid=occ,
                 s_idx_algo=s_idx_algo,
@@ -245,34 +282,49 @@ class STDijkstra:
                 ds_algo=ds_algo,
                 dt_algo=dt_algo,
                 v_max=v_max,
+                a_min=A_min,
                 a_max=A_max,
                 j_max=J_max,
             )
 
             # Expand
             for next_s_algo, next_t_idx_grid, v_next, a_next in nbrs:
-                next_s_idx_grid = np.floor((next_s_algo * ds_algo) / ds_grid).astype(np.int32)
-                di_next = next_s_algo - s_idx_algo
-                ai_next = di_next - di_prev
-                j_next  = (a_next - a_cur) / dt_algo
+                # 1. Calculate Costs
+                # jerk = change in acceleration / dt
+                j_curr = (a_next - a_cur) / dt_algo
+
+                # Simple progress reward (negative cost) is often more stable than velocity penalty
+                progress_reward = -1.0 * v_next
+
+                # Check collision cost from grid (should be 0 or high)
+                # Map next_s_algo to grid
+                next_s_grid_local = int(np.floor((next_s_algo * ds_algo) / ds_grid))
+                next_s_grid_local = min(next_s_grid_local, S_grid - 1)
+
+                obs_cost = occ[next_t_idx_grid, next_s_grid_local]
 
                 step_cost = (
-                    w_vel * (v_next - v_max) ** 2 +
-                    w_acc * (a_next ** 2) +
-                    w_jerk * (j_next ** 2) +
-                    255.0 * float(occ[next_t_idx_grid, next_s_idx_grid])  # zero for hard-occupied grids (already filtered)
+                    1.0 * (v_next - v_max)**2 +  # Use sparingly
+                    10.0 * dt_algo +             # Time penalty
+                    w_acc * (a_next**2) +
+                    w_jerk * (j_curr**2) +
+                    obs_cost
                 )
 
-                key_v = (next_t_idx_grid, next_s_algo, di_next, ai_next)
                 new_cost = cost_u + step_cost
+
+                # 2. Form New Key
+                # We represent the new velocity by its integer jump 'di'
+                di_next = next_s_algo - s_idx_algo
+                key_v = (next_t_idx_grid, next_s_algo, di_next)
 
                 if new_cost < dist.get(key_v, np.inf):
                     dist[key_v] = new_cost
-                    parent[key_v] = key_u
-                    v_cache[key_v] = v_next
-                    a_cache[key_v] = a_next
+                    # Store (Parent Key, Actual Float V, Actual Float A)
+                    parent[key_v] = (key_u, v_next, a_next)
+                    accel_map[key_v] = a_next # Store exact a for next step
+
                     heapq.heappush(pq, (new_cost, tie, key_v))
                     tie += 1
 
-        # No path found
         return [], float("inf")

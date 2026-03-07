@@ -96,6 +96,7 @@ class SceneDescriptor:
         actors : carla.ActorList,
         planner_state : PlannerState,
         lidar_data : Dict,
+        collision_sensor_data : Dict,
     ) -> SceneData:
         """
         Convert privileged simulator data into structured format.
@@ -112,7 +113,8 @@ class SceneDescriptor:
             ego_vehicle=ego_vehicle,
             actors=actors,
             planner_state=planner_state,
-            lidar_data=lidar_data
+            lidar_data=lidar_data,
+            collision_sensor_data=collision_sensor_data,
         )
 
     def format_scene_as_text(
@@ -139,6 +141,7 @@ class SceneDescriptor:
         actors : carla.ActorList,
         planner_state : PlannerState,
         lidar_data : Dict,
+        collision_sensor_data : Dict,
         format_as_text: bool = True,
     ) -> SceneContext:
         """
@@ -156,7 +159,7 @@ class SceneDescriptor:
         """
         # Get structured data
         scene_data = self.get_structured_scene_data(
-            ego_vehicle, actors, planner_state, lidar_data=lidar_data
+            ego_vehicle, actors, planner_state, lidar_data=lidar_data, collision_sensor_data=collision_sensor_data
         )
 
         # Add formatted text if requested

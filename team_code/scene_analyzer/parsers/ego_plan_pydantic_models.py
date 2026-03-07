@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional, Tuple
+from typing import List, Literal, Optional, Tuple, Deque
 from enum import Enum
 
 from dataclasses import dataclass
@@ -18,6 +18,7 @@ class Action(str, Enum):
     # Turns
     TURN_LEFT = "turn_left"
     TURN_RIGHT = "turn_right"
+    TURN_STRAIGHT = "turn_straight"
 
     # Lane changes
     CHANGE_LANE_LEFT = "change_lane_left"
@@ -30,6 +31,9 @@ class Action(str, Enum):
     # Pull over for emergency vehicles
     PULL_OVER_LEFT = "pull_over_left"
     PULL_OVER_RIGHT = "pull_over_right"
+
+    # Lane share
+    SHARE_LANE = "share_lane"
 
 class ConditionAction(str, Enum):
     YIELD_FOR = "yield_for"
@@ -57,6 +61,30 @@ class EgoPlan(BaseModel):
         description="Step by step reasoning on why each step and parameter choice is valid"
     )
 
+    def to_string(self) -> str:
+        lines: List[str] = []
+
+        lines.append("DRIVING ACTION:")
+        lines.append(self.action.value)
+        lines.append("")
+
+        lines.append("CONDITIONS:")
+        if self.conditions:
+            for condition in self.conditions:
+                cond_desc = (
+                    f"- {condition.condition_action.value} {condition.obj_type} "
+                    f"id={condition.id}"
+                )
+                lines.append(cond_desc)
+        else:
+            lines.append("- none")
+
+        lines.append("REASONING:")
+        for idx, reason in enumerate(self.reasoning, start=1):
+            lines.append(f"{idx}. {reason}")
+
+        return "\n".join(lines)
+
 class PlanStatus(str, Enum):
     EXECUTING = "executing"
     FINISHED = "finished"
@@ -67,6 +95,7 @@ class PlanExecution:
     plan: EgoPlan
     status: PlanStatus
     reason: Optional[str] = None
+    collision_events: Optional[Deque] = None
 
     def to_string(self) -> str:
         lines = []
@@ -95,5 +124,12 @@ class PlanExecution:
         if self.reason:
             status_line = f"{status_line} (reason: {self.reason})"
         lines.append(status_line)
+
+        # TODO: TEMPORARY DEBUGGING
+        # NOTE: THIS IS ONLY FOR DEBUGGING
+        if self.collision_events:
+            lines.append("HAS COLLISIONS")
+            for event in self.collision_events:
+                lines.append(f"- Actor ID: {event.id}, time: {event.timestamp}")
 
         return "\n".join(lines)

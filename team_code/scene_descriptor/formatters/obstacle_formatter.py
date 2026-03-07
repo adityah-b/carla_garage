@@ -1,20 +1,21 @@
 from typing import List
 
 from .base_formatter import BaseFormatter
-from scene_descriptor.data_extractors.obstacle_data_extractor import ObstacleData
+from scene_descriptor.data_extractors.obstacle_data_extractor import ObstacleData, ObstacleDataEntry
 
 
 class ObstacleFormatter(BaseFormatter):
     @classmethod
     def format_obstacles(
         cls,
-        obstacles: List[ObstacleData],
+        obstacle_data: ObstacleData,
         precision: int = 2,
     ) -> str:
         lines: List[str] = []
-        if obstacles:
+        ego_obstacles = obstacle_data.ego_obstacles
+        if ego_obstacles:
             lines.append("Obstacle Data:")
-            for obs in obstacles:
+            for obs in ego_obstacles:
                 lines.append(cls._format_obstacle(obs, indent="\t", precision=precision))
 
         return "\n".join(lines)
@@ -22,14 +23,18 @@ class ObstacleFormatter(BaseFormatter):
     @classmethod
     def _format_obstacle(
         cls,
-        obstacle: ObstacleData,
+        obstacle: ObstacleDataEntry,
         indent: str = "",
         precision: int = 2,
     ) -> str:
         f = cls.fmt
-        return (
-            f"{indent}Obstacle ID: {obstacle.id}, "
-            f"Type: {obstacle.obstacle.type_id}, "
-            # f"Relative Position: {f(obstacle.relative_position, precision)}, "
-            f"Relative Distance: {f(obstacle.relative_distance, precision)}"
-        )
+
+        parts = [f"{indent}Obstacle ID: {obstacle.id}"]
+
+        # parts.append(f"Type: {obstacle.obstacle.type_id}")
+        parts.append(f"Distance: {f(obstacle.relative_distance, precision)}")
+
+        if obstacle.is_near_junction:
+            parts.append(f"Blocking Intersection. Wait Until Cleared")
+
+        return ", ".join(parts)
