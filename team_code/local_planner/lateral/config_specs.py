@@ -69,3 +69,69 @@ class LatAlgoSpec:
     @property
     def goal_tol_grid(self) -> float:
         return self.goal_tol_m / self.grid_res
+
+
+@dataclass
+class SLGridSpec:
+    L_max : float
+    L_min : float
+    dl : float
+
+    S_max : float
+    ds : float
+
+    lane_width_buffer_m : float
+
+    # Costs
+    collision_cost : float
+    source_lane_cost : float
+    target_lane_cost : float
+
+
+@dataclass
+class SLAlgoSpec:
+    L_min : float
+    L_max : float
+
+    dL_max : float
+
+    ddL_max : float
+
+    # Kinematic costs
+    W_ref_offset: float
+    W_heading: float
+    W_curvature : float
+    W_obstacle: float
+
+    # Grid resolution
+    ds_grid : float
+    dl_grid : float
+
+    # Algorithm resolution
+    ds_algo : float
+    dl_algo : float
+
+    @property
+    def dl_quant_factor(self) -> float:
+        """
+        Multiplier for quantizing continuous velocity in the search state key.
+        Derived from the max allowable velocity difference that would keep
+        kinematic drift bounded within a single occupancy cell (ds_grid)
+        over one planner step (dt_algo).
+        """
+        return self.dl_algo / self.ds_grid
+
+@dataclass
+class SLQPSpec:
+    num_vars : int
+    num_samples : int
+
+    # Heading and curvature limits
+    dL_max : float
+    ddL_max : float
+
+    # Kinematic costs
+    W_L: float
+    W_dL: float
+    W_ddL : float
+    W_dddL : float

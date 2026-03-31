@@ -1,12 +1,16 @@
 import cv2
 import carla
+import time
 import numpy as np
+
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 
 from config import GlobalConfig
+from agents.navigation.local_planner import RoadOption
 
 # Perception modules
 from privileged_route_planner import PlannerState
@@ -15,47 +19,72 @@ from scene_descriptor.scene_descriptor import SceneData
 # Prediction modules
 from actor_prediction.motion_prediction import PredictionData
 from actor_prediction.collision_checker import CollisionInterval
+from actor_prediction.geometric_utils import GeometricUtils
 
 # Behavioural planner modules
 from team_code.scene_analyzer.parsers.ego_plan_pydantic_models import *
 
-from .config_specs import *
-from .planner_algo import PlannerAlgo
-from .grid_mapper import GridMapper
+# Lateral planner modules
+from team_code.local_planner.lateral.config_specs import *
+from team_code.local_planner.lateral.sl_occupancy import SLOccupancyGrid, SLMaps
+from team_code.local_planner.lateral.planner_algo import PlannerAlgo
+from team_code.local_planner.lateral.sl_optimizer import SLSplineQPOptimizer
 
 @dataclass
 class LatPlannerResult:
-    start_idx : int = 0
-    goal_idx : int = 0
+    start_idx : int = -1
+    goal_idx : int = -1
 
-    start_point_world : np.ndarray = field(default_factory=lambda : np.array([]))
-    goal_point_world : np.ndarray = field(default_factory=lambda : np.array([]))
+    s_distance : float = 0.0
 
-    planned_path : np.ndarray = field(default_factory=lambda : np.array([]))
+    route_points : np.ndarray = field(default_factory=lambda : np.array([]))
+    route_yaws : np.ndarray = field(default_factory=lambda : np.array([]))
+    route_commands : np.ndarray = field(default_factory=lambda : np.array([]))
 
     is_new_plan : bool = False
 
+    # SL plan data — populated on every replanning tick
+    sl_maps  : Optional[object]    = None   # SLMaps (S_arr, L_arr, L_ref, cost_map)
+    dp_path  : Optional[np.ndarray] = None  # (N, 2)  [s, l]  Dijkstra seed path
+    corridor : Optional[np.ndarray] = None  # (N, 2)  [lb, ub] convex corridor bounds
+    qp_path  : Optional[np.ndarray] = None  # (M, 2)  [s, l]  QP-optimised spline
+
+    # Lane-change segment boundaries — local indices into the route slice
+    # (i.e. relative to start_idx).  Populated whenever the QP path has a
+    # meaningful lateral excursion (|L|_max >= 0.5 m), None otherwise.
+    lc_out_end_local    : Optional[int] = None  # outbound LC complete, ego in target lane
+    follow_end_local    : Optional[int] = None  # IDM-follow phase ends, return LC begins
+    lc_return_end_local : Optional[int] = None  # return LC complete, ego back in source lane
+
     @property
     def is_empty_plan(self) -> bool:
-        return self.planned_path.size == 0
+        return self.route_points.size == 0
 
     def clear(self):
-        self.start_idx = 0
-        self.goal_idx = 0
-        self.start_point_world = np.array([])
-        self.goal_point_world = np.array([])
-        self.planned_path = np.array([])
+        self.start_idx = -1
+        self.goal_idx = -1
+        self.s_distance = 0.0
+        self.route_points = np.array([])
+        self.route_yaws = np.array([])
+        self.route_commands = np.array([])
         self.is_new_plan = False
+        self.sl_maps  = None
+        self.dp_path  = None
+        self.corridor = None
+        self.qp_path  = None
+        self.lc_out_end_local    = None
+        self.follow_end_local    = None
+        self.lc_return_end_local = None
 
 class LatPlanner:
     def __init__(
         self,
         config : GlobalConfig,
-        ego_vehicle : carla.Vehicle,
-        algo_name : str = 'astar',
+        algo_name : str = 'sl_dijkstra',
     ):
         self.config = config
-        self.ego_vehicle = ego_vehicle
+
+        self.sl_grid_spec : SLGridSpec = self.config.sl_grid_spec
 
         self.lat_grid_spec : LatGridSpec = self.config.lat_grid_spec
         self.lat_algo_spec : LatAlgoSpec = self.config.lat_algo_spec
@@ -68,8 +97,9 @@ class LatPlanner:
         self.sim_ticks_per_plan_lo = max(1, int(round(sim_freq / plan_freq_lo)))
         self.sim_ticks_per_plan_hi = max(1, int(round(sim_freq / plan_freq_hi)))
 
-        self.grid_mapper = GridMapper(ego_vehicle, lat_grid_spec=self.lat_grid_spec)
-        self.planner = PlannerAlgo(algo_name=algo_name, lat_algo_spec=self.lat_algo_spec)
+        self.grid_mapper = SLOccupancyGrid(config)
+        self.planner_algo = PlannerAlgo(algo_name=algo_name, config=config)
+        self.optimizer = SLSplineQPOptimizer(config)
 
         # Planner state
         self.current_plan = LatPlannerResult()
@@ -81,6 +111,45 @@ class LatPlanner:
     def reset_plan(self) -> None:
         self.current_plan.clear()
 
+    def compute_ego_frenet_state(
+        self,
+        planner_state: PlannerState,
+        scene_data: SceneData,
+    ) -> Tuple[float, float, float]:
+        """
+        Compute the ego's initial Frenet state (l0, dl0/ds, d²l0/ds²) relative
+        to the original route centerline at the current route index.
+
+        Convention: L > 0 = left of route, L < 0 = right of route.
+
+        Returns (l0, dl0, ddl0).
+        """
+        if scene_data is None or scene_data.ego_data is None:
+            return 0.0, 0.0, 0.0
+
+        route_index = planner_state.route_index
+        ref_xy    = planner_state.original_route_points[route_index, :2]
+        # rotation_angles stored in degrees; convert to radians for trig.
+        ref_theta = np.deg2rad(planner_state.original_rotation_angles[route_index])
+
+        ego_xy    = scene_data.ego_data.position   # [x, y] metres
+        ego_theta = scene_data.ego_data.orientation # radians
+
+        dx = ego_xy[0] - ref_xy[0]
+        dy = ego_xy[1] - ref_xy[1]
+
+        # Left normal: n = (sinθ, -cosθ) → positive L is to the left of the route.
+        l0 = float(dx * np.sin(ref_theta) + dy * (-np.cos(ref_theta)))
+
+        # Heading error normalised to [-π, π].
+        heading_error = (ego_theta - ref_theta + np.pi) % (2 * np.pi) - np.pi
+
+        # dL/dS ≈ tan(heading_error); clamp to ±45° to keep the QP well-posed.
+        dl0  = float(np.tan(np.clip(heading_error, -np.pi / 4, np.pi / 4)))
+        ddl0 = 0.0  # no curvature-rate estimate available
+
+        return l0, dl0, ddl0
+
     def validate_plan_against_occupancy(
         self,
         occupancy_map: np.ndarray,
@@ -88,133 +157,85 @@ class LatPlanner:
     ) -> Tuple[bool, float]:
         pass
 
-    # def run_step(
-    #     self,
-    #     route_points_world_3d : np.ndarray,
-    #     lidar_data : Dict,
-    #     start_point_world_3d : np.ndarray,
-    #     goal_point_world_3d : np.ndarray,
-    #     actor_collisions : Dict[int, List[CollisionInterval]] = {}, # K=actor id, V=collision intervals,
-    #     all_conditions : Dict = {},
-    #     actor_predictions : Dict[int, List[carla.BoundingBox]] = {}, # K=actor id, V=predicted BBs
-    # ) -> np.ndarray:
-    #     # Get occupancy and cost maps
-    #     maps = self.grid_mapper.update_maps(
-    #         lidar_data=lidar_data,
-    #         route_points_world=route_points_world_3d,
-    #         actor_collisions=actor_collisions,
-    #         all_conditions=all_conditions,
-    #         actor_predictions=actor_predictions
-    #     )
+    def s_idx_from_distance(self, distance: float, S_max : float) -> int:
+        """Convert a distance in meters to the closest valid s-index."""
+        ds = self.sl_grid_spec.ds
+        S_max_idx = int(np.floor(S_max / ds))
 
-    #     occupancy_map = maps.occupancy_map
-    #     static_cost_map = maps.total_cost_map
+        s_idx = int(np.floor(distance / ds))
+        s_idx = int(np.clip(s_idx, 0, S_max_idx))
 
-    #     # Get ego transformation matrices
-    #     ego_tf = self.ego_vehicle.get_transform()
-    #     T_world_wrt_ego = np.array(ego_tf.get_inverse_matrix(), dtype=np.float32) # [4x4]
-    #     T_ego_wrt_world = np.array(ego_tf.get_matrix(), dtype=np.float32) # [4x4]
+        return s_idx
 
-    #     # Convert world points to ego frame
-    #     world_pts_3d = np.vstack([start_point_world_3d, goal_point_world_3d])
+    def l_idx_from_distance(self, distance : float, L_min : float, L_max : float) -> int:
+        """Convert a distance in meters to the closest valid l-index."""
+        dl = self.sl_grid_spec.dl
+        L_min_idx = 0.0
+        L_max_idx = int(np.floor((L_max - L_min) / dl))
 
-    #     # print(f'world_pts_3d: {world_pts_3d}')
-    #     # print(f'world_pts_3d shape: {world_pts_3d.shape}')
+        l_idx = int(np.floor((distance - L_min)/ dl))
+        l_idx = int(np.clip(l_idx, L_min_idx, L_max_idx))
 
-    #     ones = np.ones((world_pts_3d.shape[0], 1), dtype=np.float32)
-    #     world_pts_4d = np.hstack([world_pts_3d, ones])
+        return l_idx
 
-    #     # print(f'world_pts_4d: {world_pts_4d}')
-    #     # print(f'world_pts_4d shape: {world_pts_4d.shape}')
+    def extract_path_corridor(
+        self,
+        sl_maps: SLMaps,
+        dp_path: np.ndarray,
+    ) -> np.ndarray:
+        cost_map = sl_maps.cost_map
+        s_arr    = sl_maps.S_arr
+        l_arr    = sl_maps.L_arr
 
-    #     # Convert ego points to grid frame
-    #     ego_pts_2d = (world_pts_4d @ T_world_wrt_ego.T)[:, :2]
+        dp_s_vals = dp_path[:, 0]
+        dp_l_vals = dp_path[:, 1]
 
-    #     start_point_grid = ego_pts_2d[0, :]
-    #     goal_point_grid = ego_pts_2d[1, :]
+        # ── 1. Nearest-neighbour lookup (fix: outer subtract for correct broadcast) ──
+        s_indices = np.argmin(np.abs(s_arr[:, None] - dp_s_vals[None, :]), axis=0)  # (N,)
+        l_indices = np.argmin(np.abs(l_arr[:, None] - dp_l_vals[None, :]), axis=0)  # (N,)
 
-    #     # Convert to grid indices
-    #     # TODO: CLEAN UP CODE
-    #     start_node = self.lat_grid_spec.world_to_grid(start_point_grid[0], start_point_grid[1])
-    #     goal_node = self.lat_grid_spec.world_to_grid(goal_point_grid[0], goal_point_grid[1])
+        S, L  = cost_map.shape
+        blocked   = cost_map >= 0.8 * self.sl_grid_spec.collision_cost          # (S, L)  bool mask
+        idx_grid  = np.arange(L)              # (L,)
 
-    #     # NOTE: DEBUG
-    #     self.start_node = start_node
-    #     self.goal_node = goal_node
+        # ── 2. Left barrier map ──────────────────────────────────────────────────────
+        # left_barrier[s, l] = rightmost j ≤ l where cost[s,j] ≥ 50  (or 0 if none)
+        left_idx_map = np.where(blocked, idx_grid[None, :], -1)           # (S, L)
+        left_barrier = np.maximum.accumulate(left_idx_map, axis=1)        # (S, L)
+        left_barrier = np.where(left_barrier < 0, 0, left_barrier)        # clamp to boundary
 
-    #     # Run planner
-    #     path_grid_list, cost = self.planner.run(
-    #         occupancy_map=occupancy_map,
-    #         cost_map=static_cost_map,
-    #         start_node=start_node,
-    #         goal_node=goal_node
-    #     )
+        # ── 3. Right barrier map ─────────────────────────────────────────────────────
+        # right_barrier[s, l] = leftmost j ≥ l where cost[s,j] ≥ 50  (or L-1 if none)
+        right_idx_map = np.where(blocked, idx_grid[None, :], L)           # (S, L)
+        right_barrier = np.minimum.accumulate(
+            right_idx_map[:, ::-1], axis=1)[:, ::-1]                      # (S, L)
+        right_barrier = np.where(right_barrier >= L, L - 1, right_barrier)
 
-    #     # NOTE: Visualization
-    #     occupancy_map = maps.occupancy_map
-    #     occ_img = (occupancy_map * 255).astype(np.uint8)
-    #     occ_bgr = cv2.cvtColor(occ_img, cv2.COLOR_GRAY2BGR)
+        # ── 4. Gather bounds for each dp point ──────────────────────────────────────
+        lb = l_arr[left_barrier [s_indices, l_indices]]   # (N,)
+        ub = l_arr[right_barrier[s_indices, l_indices]]   # (N,)
 
-    #     dynamic_cost_map = maps.dynamic_cost_map
-    #     cost_map = maps.total_cost_map
-    #     heat_map = cv2.applyColorMap(cost_map, cv2.COLORMAP_TURBO)
-    #     dynamic_heat_map = cv2.applyColorMap(dynamic_cost_map, cv2.COLORMAP_TURBO)
+        # ── 5. Degenerate-interval fix (vectorized) ──────────────────────────────────
+        invalid = lb > ub
+        mid     = (lb + ub) / 2.0
+        lb      = np.where(invalid, mid - 0.01, lb)
+        ub      = np.where(invalid, mid + 0.01, ub)
 
-    #     # # Draw on occupancy image
-    #     H, W = occupancy_map.shape
+        return np.stack([lb, ub], axis=1)   # (N, 2)
 
-    #     pts = np.asarray([(c_, r_) for (r_, c_) in path_grid_list], dtype=np.int32)  # (x=col, y=row)
+    def extract_path_knots(
+        self,
+        planner_state : PlannerState,
+        scene_data : SceneData,
+        ego_plan : EgoPlan,
+        s_path : np.ndarray,
+    ) -> np.ndarray:
+        # TODO: DYNAMICALLY CHOOSE KNOTS
+        return s_path
 
-    #     if pts.size != 0:
-    #         # Line thickness
-    #         thickness = max(1, int(round((0.4 / 0.5) * 1.0)))
-
-    #         # --- Draw on copies ---
-    #         heat_with_path = heat_map.copy()
-    #         occ_with_path  = occ_bgr.copy()
-
-    #         # Path polyline (green), start (red), goal (blue)
-    #         for img in (heat_with_path, occ_with_path):
-    #             cv2.polylines(img, [pts], isClosed=False, color=(0,255,0),
-    #                         thickness=thickness, lineType=cv2.LINE_AA)
-    #             cv2.circle(img, tuple(pts[0]),  radius=thickness*2, color=(0,0,255), thickness=-1)  # start
-    #             cv2.circle(img, tuple(pts[-1]), radius=thickness*2, color=(255,0,0), thickness=-1)  # goal
-
-    #         # cv2.namedWindow("BirdView Occupancy", cv2.WINDOW_NORMAL)
-    #         # # cv2.imshow('BirdView Occupancy', occ_img)
-    #         # cv2.imshow('BirdView Occupancy', occ_with_path)
-    #         # cv2.waitKey(1)
-
-    #         # cv2.namedWindow("BirdView Cost Map", cv2.WINDOW_NORMAL)
-    #         # cv2.imshow('BirdView Cost Map', heat_map)
-    #         # cv2.waitKey(1)
-
-    #         map_with_path = np.hstack([occ_with_path, heat_with_path, dynamic_heat_map])
-    #         cv2.namedWindow("BirdView Maps", cv2.WINDOW_NORMAL)
-    #         cv2.imshow('BirdView Maps', map_with_path)
-    #         cv2.waitKey(1)
-
-    #     # NOTE: Visualization
-
-    #     if len(path_grid_list) > 0:
-    #         path_grid = np.array(path_grid_list, dtype=np.float32)
-    #         x, y = self.lat_grid_spec.grid_to_world(path_grid[:, 0], path_grid[:, 1])
-    #         ones = np.ones(x.shape[0], dtype=np.float32)
-    #         path_ego_4d = np.stack([x, y, ones, ones], axis=-1)
-    #         # print(f'path_ego_4d shape: {path_ego_4d.shape}')
-
-    #         # Convert ego points to world frame
-    #         path_world_3d = (path_ego_4d @ T_ego_wrt_world.T)[:, :3]
-
-    #         # print(f'path_world_3d shape: {path_world_3d.shape}')
-
-    #         return path_world_3d
-
-    #     return np.array([])
-
+    # TODO: DETERMINE IF LAT PLANNER NEEDS STATE MACHINE TO BE PASSED IN
     def run_step(
         self,
-        state_machine,
         plan_tick_counter : int,
         planner_state : PlannerState,
         lidar_data : Dict,
@@ -222,171 +243,210 @@ class LatPlanner:
         prediction_data : PredictionData,
         ego_plan : EgoPlan,
         *,
-        key_actor_registry : Dict = {},
-        buffer_distance : float = 10,
+        s_ego_m : float = 0.0,
+        plan_s_goal_m : Optional[float] = None,
         all_conditions : Dict = {},
+        s_bounds : Optional[Tuple[float, float]] = None,
+        profile_time : bool = False,
     ) -> LatPlannerResult:
         self.current_plan.is_new_plan = False
 
-        print(f'\n\nLAT PLANNER')
-
         plan_lo = (plan_tick_counter % self.sim_ticks_per_plan_lo) == 1
-        plan_hi = state_machine.needs_route_adjustment and (plan_tick_counter % self.sim_ticks_per_plan_hi) == 1
+        plan_hi = (plan_tick_counter % self.sim_ticks_per_plan_hi) == 1
         should_plan_now = plan_lo or plan_hi
 
-        print(f'\n\nNEEDS ROUTE ADJUSTMENT: {state_machine.needs_route_adjustment}')
         if should_plan_now:
+            # Extract planner state data
+            max_route_len = planner_state.route_len
             route_index = planner_state.route_index
-            route_points = planner_state.route_points
+            route_pts = planner_state.original_route_points
+            route_yaws = planner_state.original_rotation_angles
+            route_cmds = planner_state.route_commands
+            s_route = planner_state.original_route_s
+            s_route_max = s_route[-1] - s_route[route_index]
 
-            start_idx = route_index
-            # TODO: NEED TO FIX HOW WE CHOOSE GOAL POINT (IDEALLY SHOULD BE PROVIDED BY LLM)
-            # NOTE FEB 26: USING LLM SELECTED ACTOR REGISTRY TO SELECT TARGET DISTANCES
-            goal_idx = state_machine.get_target_end_idx(
-                config=self.config,
-                planner_state=planner_state,
-                scene_data=scene_data,
-                prediction_data=prediction_data,
-                actor_registry=key_actor_registry,
-                target_distance_initial=self.config.lat_planner_max_distance,
-                buffer_distance=buffer_distance,
-            )
+            plan_s_goal_m = plan_s_goal_m if plan_s_goal_m else min(s_route_max, self.sl_grid_spec.S_max)
 
-            print(f'\tstart_idx: {route_index}, goal_idx: {goal_idx}')
-            print(f'\tSTATE MACHINE')
-            print(f'\t\ttarget_end_idx: {state_machine.target_end_idx}, cur_route_changes: {state_machine.cur_route_changes}')
-
-            start_point_world_3d = route_points[start_idx]
-            goal_point_world_3d = route_points[goal_idx]
-
-            print(f'\n\nLAT PLANNER POINT CONVERSIONS')
-            print(f'\t\tWORLD FRAME GOAL PRIOR TO CONVERSION: {goal_point_world_3d}')
             # Get occupancy and cost maps
-            maps = self.grid_mapper.update_maps(
+            t_occ_start = time.perf_counter()
+            sl_maps = self.grid_mapper.build_maps(
                 planner_state=planner_state,
-                start_idx=start_idx,
-                goal_idx=goal_idx,
                 scene_data=scene_data,
-                lidar_data=lidar_data,
                 prediction_data=prediction_data,
                 ego_plan=ego_plan,
                 all_conditions=all_conditions,
+                s_bounds=s_bounds,
             )
+            t_occ_end = time.perf_counter()
 
-            occupancy_map = maps.occupancy_map
-            static_cost_map = maps.total_cost_map
+            # Prepare planner indices
+            S_max = sl_maps.S_arr[-1]
 
-            # Get ego transformation matrices
-            ego_tf = self.ego_vehicle.get_transform()
-            T_world_wrt_ego = np.array(ego_tf.get_inverse_matrix(), dtype=np.float32) # [4x4]
-            T_ego_wrt_world = np.array(ego_tf.get_matrix(), dtype=np.float32) # [4x4]
+            s_start_idx = 0
+            s_goal_idx = self.s_idx_from_distance(plan_s_goal_m, S_max)
 
-            # Convert world points to ego frame
-            world_pts_3d = np.vstack([start_point_world_3d, goal_point_world_3d])
+            L_min = sl_maps.L_arr[0]
+            L_max = sl_maps.L_arr[-1]
 
-            # print(f'world_pts_3d: {world_pts_3d}')
-            # print(f'world_pts_3d shape: {world_pts_3d.shape}')
+            # Compute the ego's actual Frenet state relative to the original route.
+            # ego_l0, ego_dl0, ego_ddl0 = self.compute_ego_frenet_state(planner_state, scene_data)
+            ego_l0, ego_dl0, ego_ddl0 = 0.0, 0.0, 0.0
 
-            ones = np.ones((world_pts_3d.shape[0], 1), dtype=np.float32)
-            world_pts_4d = np.hstack([world_pts_3d, ones])
+            l_start_idx = self.l_idx_from_distance(ego_l0, L_min=L_min, L_max=L_max)
 
-            # print(f'world_pts_4d: {world_pts_4d}')
-            # print(f'world_pts_4d shape: {world_pts_4d.shape}')
+            print(f'\n\nEGO INITIAL STATE')
+            print(f'\tL0: {ego_l0}, DL0: {ego_dl0}, DDL0: {ego_ddl0}')
 
-            # Convert ego points to grid frame
-            ego_pts_2d = (world_pts_4d @ T_world_wrt_ego.T)[:, :2]
-
-            start_point_grid = ego_pts_2d[0, :]
-            goal_point_grid = ego_pts_2d[1, :]
-
-            print(f'\t\tEGO FRAME GOAL PRIOR TO CONVERSION: {goal_point_grid}')
-
-            # Convert to grid indices
-            # TODO: CLEAN UP CODE
-            start_node = self.lat_grid_spec.world_to_grid(start_point_grid[0], start_point_grid[1])
-            goal_node = self.lat_grid_spec.world_to_grid(goal_point_grid[0], goal_point_grid[1])
-
-            print(f'\t\tEGO GRID GOAL PRIOR TO CONVERSION: {goal_node}')
-
-            # NOTE: DEBUG
-            self.start_node = start_node
-            self.goal_node = goal_node
-
-            # Run planner
-            path_grid_list, cost = self.planner.run(
-                occupancy_map=occupancy_map,
-                cost_map=static_cost_map,
-                start_node=start_node,
-                goal_node=goal_node
+            # Get rough Dijkstra SL plan
+            t_dijk_start = time.perf_counter()
+            dp_path, cost = self.planner_algo.run(
+                occupancy_map=sl_maps.occupancy_map,
+                cost_map=sl_maps.cost_map,
+                start_idx=s_start_idx,
+                goal_idx=s_goal_idx,
+                L_min=L_min,
+                l_start_idx=l_start_idx,
+                l_ref_m=sl_maps.L_ref,
             )
+            t_dijk_end = time.perf_counter()
 
-            # NOTE: Visualization
-            occupancy_map = maps.occupancy_map
-            occ_img = (occupancy_map * 255).astype(np.uint8)
-            occ_bgr = cv2.cvtColor(occ_img, cv2.COLOR_GRAY2BGR)
+            if dp_path.size > 0:
+                # Extract traversible corridor from DP path
+                t_corr_start = time.perf_counter()
+                corridor = self.extract_path_corridor(sl_maps=sl_maps, dp_path=dp_path)
+                t_corr_end = time.perf_counter()
 
-            dynamic_cost_map = maps.dynamic_cost_map
-            cost_map = maps.total_cost_map
-            heat_map = cv2.applyColorMap(cost_map, cv2.COLORMAP_TURBO)
-            dynamic_heat_map = cv2.applyColorMap(dynamic_cost_map, cv2.COLORMAP_TURBO)
-
-            # # Draw on occupancy image
-            H, W = occupancy_map.shape
-
-            pts = np.asarray([(c_, r_) for (r_, c_) in path_grid_list], dtype=np.int32)  # (x=col, y=row)
-
-            # Line thickness
-            thickness = max(1, int(round((0.4 / 0.5) * 1.0)))
-
-            # --- Draw on copies ---
-            heat_with_path = heat_map.copy()
-            occ_with_path  = occ_bgr.copy()
-
-            # Path polyline (green), start (red), goal (blue)
-            for img in (heat_with_path, occ_with_path):
-                if pts.size != 0:
-                    cv2.polylines(img, [pts], isClosed=False, color=(0,255,0),
-                                thickness=thickness, lineType=cv2.LINE_AA)
-
-                cv2.circle(img, tuple(start_node[::-1]),  radius=thickness*2, color=(0,0,255), thickness=-1)  # start
-                cv2.circle(img, tuple(goal_node[::-1]), radius=thickness*2, color=(255,0,0), thickness=-1)  # goal
-
-            map_with_path = np.hstack([occ_with_path, heat_with_path, dynamic_heat_map])
-            cv2.namedWindow("BirdView Maps", cv2.WINDOW_NORMAL)
-            cv2.imshow('BirdView Maps', map_with_path)
-            cv2.waitKey(1)
-
-            if len(path_grid_list) > 0:
-                path_grid = np.array(path_grid_list, dtype=np.float32)
-                print(f'\t\tASTAR EGO GRID GOAL: {path_grid[-1, :]}')
-                x, y = self.lat_grid_spec.grid_to_world(path_grid[:, 0], path_grid[:, 1])
-                ones = np.ones(x.shape[0], dtype=np.float32)
-                path_ego_4d = np.stack([x, y, ones * 0.0, ones], axis=-1)
-                print(f'\t\tASTAR EGO FRAME GOAL AFTER CONVERSION: {path_ego_4d[-1, :3]}')
-                # print(f'path_ego_4d shape: {path_ego_4d.shape}')
-
-                # Convert ego points to world frame
-                path_world_3d = (path_ego_4d @ T_ego_wrt_world.T)[:, :3]
-                print(f'\t\tASTAR WORLD FRAME GOAL AFTER CONVERSION: {path_world_3d[-1, :]}')
-
-                # TODO: TEMPORARY CHECKING TO SEE IF UNCHANGED START AND GOAL POINTS FIX ANYTHING
-                # REWRITE START AND END POINTS WITH ORIGINAL POINTS
-                path_world_3d[0, :] = start_point_world_3d
-                path_world_3d[-1, :] = goal_point_world_3d
-
-                self.current_plan = LatPlannerResult(
-                    start_idx=start_idx,
-                    goal_idx=goal_idx,
-                    start_point_world=start_point_world_3d,
-                    goal_point_world=goal_point_world_3d,
-                    planned_path=path_world_3d,
-                    is_new_plan=True,
+                # Extract path knots
+                knots = self.extract_path_knots(
+                    planner_state=planner_state,
+                    scene_data=scene_data,
+                    ego_plan=ego_plan,
+                    s_path=dp_path[:, 0],
                 )
+                self.optimizer.set_knots(knots)
 
-                # print(f'path_world_3d shape: {path_world_3d.shape}')
+                init_state = (ego_l0, ego_dl0, ego_ddl0)
+                # Solve spline QP optimization
+                t_qp_start = time.perf_counter()
+                qp_path = self.optimizer.solve(
+                    dp_path=dp_path,
+                    dp_bounds=corridor,
+                    init_state=init_state,
+                )
+                t_qp_end = time.perf_counter()
 
+                # self.plot_path_and_profiles(
+                #     sl_maps=sl_maps,
+                #     dp_path=dp_path,
+                #     corridor=corridor,
+                #     qp_path=qp_path
+                # )
+
+                if qp_path.size > 0:
+                    # Revert from Frenet to Cartesian coordinates
+                    lookahead_dist = plan_s_goal_m
+                    lookahead_pts = self.config.meters_to_dense_route_idx(lookahead_dist)
+                    to_index = min(max_route_len, route_index + lookahead_pts + 1)
+                    route_slice = slice(route_index, to_index)
+
+                    route_pts = route_pts[route_slice].copy()
+                    route_yaws = route_yaws[route_slice].copy()
+                    route_cmds = route_cmds[route_slice].copy()
+                    s_route = s_route[route_slice] - s_route[route_index]
+
+                    qp_s = qp_path[:, 0]
+                    qp_l = qp_path[:, 1]
+
+                    # 2. Interpolate the lateral shift (L) at the exact S-values of the route slice.
+                    # This guarantees the new Frenet path has exactly the same length as route_pts.
+                    # Convention: L > 0 = left shift (overtake left), L < 0 = right shift.
+                    matched_l = np.interp(s_route, qp_s, qp_l)
+
+                    # 3. Detect LC segment boundaries.
+                    # matched_l is 1-to-1 with the route slice, so local index i maps to
+                    # global route index (route_index + i).
+                    lc_out_end_local    = None
+                    follow_end_local    = None
+                    lc_return_end_local = None
+
+                    l_abs = np.abs(matched_l)
+                    l_max = float(l_abs.max())
+
+                    cur_wp = planner_state.original_route_waypoints[route_index]
+                    L_src_edge = 0.5 * cur_wp.lane_width + self.config.lateral_buffer_m
+                    L_ref_center = 0.5 * cur_wp.lane_width + 0.5 * sl_maps.target_lane_width
+
+                    above = l_abs >= L_src_edge
+                    if np.any(above):
+                        lc_complete = l_abs >= L_ref_center - (L_src_edge / 2.0)
+                        if np.any(lc_complete):
+                            lc_out_end_local = int(np.argmax(lc_complete))
+                        else:
+                            lc_out_end_local = int(np.argmax(l_abs))
+
+                        follow_end_local = int(np.argmax(l_abs))
+
+                        # A return LC is present only when the end of the path has
+                        # come back close to the source lane
+                        back_return = l_abs[follow_end_local:] < L_src_edge
+                        if np.any(back_return):
+                            # lc_return_end_local = first index after follow_end where
+                            # |L| drops below threshold (source lane restored).
+                            return_lc_complete = l_abs[follow_end_local:] <= (L_src_edge / 2.0)
+                            if np.any(return_lc_complete):
+                                lc_return_end_local = follow_end_local + int(np.argmax(return_lc_complete))
+                            else:
+                                lc_return_end_local = len(matched_l) - 1
+
+                        # Annotate route_commands. Sign of peak L determines direction.
+                        l_peak  = matched_l[np.argmax(l_abs)]
+                        out_cmd = RoadOption.CHANGELANELEFT  if l_peak > 0 else RoadOption.CHANGELANERIGHT
+
+                        route_cmds[ : lc_out_end_local] = out_cmd
+                        route_cmds[lc_out_end_local : follow_end_local] = RoadOption.LANEFOLLOW
+                        if np.any(back_return):
+                            ret_cmd = RoadOption.CHANGELANERIGHT if l_peak > 0 else RoadOption.CHANGELANELEFT
+                            route_cmds[follow_end_local : lc_return_end_local] = ret_cmd
+
+                    # 4. Stack into the matched (M, 2) shape expected by your converter
+                    matched_frenet_path = np.column_stack((s_route, matched_l))
+
+                    # 5. Convert back to Cartesian
+                    route_xy, route_yaws = GeometricUtils.frenet_to_cartesian(
+                        frenet_path=matched_frenet_path,
+                        route_xy=route_pts[:, :2],
+                        route_yaws=route_yaws,
+                        s_route=s_route,
+                    )
+                    route_pts[:, :2] = route_xy
+
+                    self.current_plan = LatPlannerResult(
+                        start_idx=route_index,
+                        goal_idx=to_index,
+                        s_distance=plan_s_goal_m,
+                        route_points=route_pts,
+                        route_yaws=route_yaws,
+                        route_commands=route_cmds,
+                        is_new_plan=True,
+                        sl_maps=sl_maps,
+                        dp_path=dp_path,
+                        corridor=corridor,
+                        qp_path=qp_path,
+                        lc_out_end_local=lc_out_end_local,
+                        follow_end_local=follow_end_local,
+                        lc_return_end_local=lc_return_end_local,
+                    )
+                else:
+                    self.current_plan = LatPlannerResult()
             else:
                 self.current_plan = LatPlannerResult()
+
+        if profile_time:
+            print("--- LatPlanner runtime ---")
+            print(f"SL costmap construction time: {(t_occ_end - t_occ_start)*1000:.2f} ms")
+            print(f"SL Dijkstra planning time: {(t_dijk_end - t_dijk_start)*1000:.2f} ms")
+            print(f"Corridor construction time: {(t_corr_end - t_corr_start)*1000:.2f} ms")
+            print(f"SL QP planning time: {(t_qp_end - t_qp_start)*1000:.2f} ms")
 
         return self.current_plan
 
@@ -394,4 +454,79 @@ class LatPlanner:
     # Visualization methods for debugging
     ########################################
 
-# TODO: Add plotting/visualization methods for debugging
+    def plot_path_and_profiles(
+        self,
+        sl_maps : SLMaps,
+        dp_path : np.ndarray,
+        corridor : np.ndarray,
+        qp_path : np.ndarray,
+    ):
+        s_arr = sl_maps.S_arr
+        l_arr = sl_maps.L_arr
+        cost_map = sl_maps.cost_map
+
+        fig = plt.figure(figsize=(16, 10))
+        gs = gridspec.GridSpec(4, 2, width_ratios=[1.2, 1])
+
+        ax_map = fig.add_subplot(gs[:, 0])
+        Sgrid, Lgrid = np.meshgrid(s_arr, l_arr, indexing="ij")
+        im = ax_map.pcolormesh(Sgrid, Lgrid, cost_map, shading="nearest", cmap="inferno", vmin=0, vmax=255)
+        fig.colorbar(im, ax=ax_map, label="Cost", fraction=0.046, pad=0.04)
+
+        s_dp = dp_path[:, 0]
+        l_dp = dp_path[:, 1]
+
+        lb_vals = corridor[:, 0]
+        ub_vals = corridor[:, 1]
+        ax_map.fill_between(s_dp, lb_vals, ub_vals, color='white', alpha=0.15, label="Convex Corridor")
+        ax_map.plot(s_dp, lb_vals, 'w--', lw=0.8)
+        ax_map.plot(s_dp, ub_vals, 'w--', lw=0.8)
+
+        ax_map.plot(s_dp, l_dp, color="cyan", lw=1.5, ls="--", marker='.', ms=6, label="Dijkstra Seed")
+
+        if qp_path is not None:
+            s_qp = qp_path[:, 0]
+            l_qp = qp_path[:, 1]
+            ax_map.plot(s_qp, l_qp, color="#00FF00", lw=3.0, zorder=10, label="Cubic Spline QP")
+
+        ax_map.set_xlabel("Arc length S (m)")
+        ax_map.set_ylabel("Lateral offset L (m)")
+        ax_map.set_title("SL Costmap & Planned Paths")
+        ax_map.legend(loc="upper left", frameon=True)
+        ax_map.grid(True, lw=0.5, alpha=0.3, color='white')
+
+        if qp_path is None:
+            plt.show()
+            return
+
+        s = np.array(s_qp)
+        l = np.array(l_qp)
+        ds = s[1] - s[0]
+        dl = np.gradient(l, ds)
+        ddl = np.gradient(dl, ds)
+        dddl = np.gradient(ddl, ds)
+
+        axes = [fig.add_subplot(gs[i, 1]) for i in range(4)]
+
+        axes[0].plot(s, l, color="#00FF00", lw=2)
+        axes[0].set_ylabel("L (m)\nOffset")
+        axes[0].set_title("Path Kinematic Profiles (Spline Model)")
+
+        axes[1].plot(s, dl, color="dodgerblue", lw=2)
+        axes[1].set_ylabel("L'\nHeading")
+
+        axes[2].plot(s, ddl, color="orange", lw=2)
+        axes[2].set_ylabel("L''\nCurvature")
+
+        axes[3].plot(s, dddl, color="red", lw=2)
+        axes[3].set_ylabel("L'''\nJerk")
+        axes[3].set_xlabel("Arc length S (m)")
+
+        for ax in axes:
+            ax.grid(True, alpha=0.5, linestyle='--')
+            ax.set_xlim(s[0], s[-1])
+            if ax != axes[-1]:
+                ax.set_xticklabels([])
+
+        plt.tight_layout()
+        plt.show()
