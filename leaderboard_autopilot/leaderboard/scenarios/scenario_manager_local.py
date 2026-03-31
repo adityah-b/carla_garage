@@ -150,6 +150,10 @@ class ScenarioManager(object):
 
         self._running = True
 
+        # TODO: REVISIT THIS
+        # Set vehicle to gear 1 to avoid throttle delay
+        self.ego_vehicles[0].apply_control(carla.VehicleControl(manual_gear_shift=True, gear=1))
+
         # Thread for build_scenarios
         t = threading.Thread(target=self.build_scenarios_loop, args=(self._debug_mode > 0, ))
         t.start()
@@ -225,11 +229,11 @@ class ScenarioManager(object):
             # TODO: here we can change the spectator
             # self._spectator.set_transform(carla.Transform(ego_trans.location + carla.Location(z=70),
                                                         #   carla.Rotation(pitch=-90)))
-            
+
             # For third-person view
             # location = ego_trans.transform(carla.Location(x=-4.5, z=2.3))
             # self._spectator.set_transform(carla.Transform(location, carla.Rotation(pitch=-15.0, yaw=ego_trans.rotation.yaw)))
-            
+
             # For bird's eye view
             self._spectator.set_transform(carla.Transform(ego_trans.location + carla.Location(z=30), carla.Rotation(pitch=-90)))
 

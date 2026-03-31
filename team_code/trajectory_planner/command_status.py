@@ -8,7 +8,23 @@ class ActionPhase(Enum):
     IDLE = "idle"
     EXECUTING = "executing"
     CLEARED = "cleared"
+    FAILED = "failed"
 
+class LateralPlanStatus(Enum):
+    NONE = auto()
+    VALID = auto()
+    INVALID_TRANSIENT = auto()
+    INVALID_FATAL = auto()
+
+class OvertakeType(Enum):
+    LANE_CHANGE = auto()  # overtake via an available parallel driving lane
+    ONCOMING    = auto()  # overtake by invading the oncoming traffic lane
+
+class OvertakeSubPhase(Enum):
+    PENDING_PLAN   = auto()  # waiting for first valid LatPlanner result
+    LC_OUTBOUND    = auto()  # transitioning to the target lane
+    IN_TARGET_LANE = auto()  # in target lane, IDM-following until clear to return
+    LC_RETURN      = auto()  # transitioning back to the source lane
 
 class ConditionStatus:
     def __init__(
@@ -54,11 +70,11 @@ class CommandStatus:
         lines.append("conditions:")
         if self.conditions_status:
             for cond_status in self.conditions_status:
+                t = cond_status.condition.target
                 cond_desc = (
                     f"- {cond_status.condition.condition_action.value} "
-                    f"{cond_status.condition.traffic_type} "
-                    f"{cond_status.condition.obj_type} "
-                    f"{cond_status.condition.id}"
+                    f"{t.actor_type} [{t.region}] "
+                    f"traffic={t.traffic_type}"
                     f"\n\t- phase: {cond_status.phase.value}"
                     f"\n\t- is_blocking: {cond_status.is_blocking}"
                 )

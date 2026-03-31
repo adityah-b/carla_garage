@@ -908,18 +908,20 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
     #     "temperature" : 0.7,
     #     "max_output_tokens" : 4096
     # }
-    # self.scene_analyzer_config = {
-    #     "provider" : "vllm",
-    #     "model_name" : "Qwen/Qwen2.5-VL-72B-Instruct-AWQ",
-    #     "temperature" : 0.75,
-    #     "max_output_tokens" : 8192
-    # }
     self.scene_analyzer_config = {
-        "provider" : "openai",
-        "model_name" : "gpt-4.1-mini-2025-04-14",
+        "provider" : "vllm",
+        "model_name" : "Qwen/Qwen2.5-VL-72B-Instruct-AWQ",
         "temperature" : 0.25,
-        "max_output_tokens" : 4096
+        "max_output_tokens" : 2048,
+        "pipeline_mode" : "single_stage",
     }
+    # self.scene_analyzer_config = {
+    #     "provider" : "openai",
+    #     "model_name" : "gpt-4.1-mini-2025-04-14",
+    #     "temperature" : 0.25,
+    #     "max_output_tokens" : 2048,
+    #     "pipeline_mode" : "single_stage",
+    # }
 
     # self.scene_analyzer_config = {
     #     "provider" : "vllm",
@@ -935,27 +937,97 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
     # }
 
     # -----------------------------------------------------------------------------
+    # Privileged route planner parameters
+    # -----------------------------------------------------------------------------
+
+    # Route bbox generation
+    self.route_bbox_m_per_point = 2.0
+    self.long_buffer_m = 0.25
+    self.lat_buffer_m = 0.15
+
+    # -----------------------------------------------------------------------------
     # Scene descriptor parameters
     # -----------------------------------------------------------------------------
+
+    # Object detection radius
+    self.traffic_light_detection_radius_m = 50.0
+    self.stop_sign_detection_radius_m = 50.0
+    self.vehicle_detection_radius_m = 80.0
+    self.obstacle_detection_radius_m = 50.0
 
     # Lanelet handling
     self.max_distance_to_lanelet = 2.0
     self.max_distance_to_lanelet_bicycle = 3.0
 
-    self.obstacle_detection_radius = 50.0
 
     self.collision_data_max_entries : int = 3
 
     # -----------------------------------------------------------------------------
     # Scene analyzer parameters
     # -----------------------------------------------------------------------------
-    self.obstacle_processing_distance = 15.0
+    self.stop_sign_processing_distance_m = 25.0
+    self.traffic_light_processing_distance_m = 25.0
+    self.pedestrian_processing_distance_m = 15.0
+    self.cyclist_processing_distance_m = 15.0
+    self.obstacle_processing_distance_m = 15.0
+    self.intersection_processing_distance_m = 25.0
+    self.lane_change_processing_distance_m = 25.0
+
+    # -----------------------------------------------------------------------------
+    # Agent predictor parameters
+    # -----------------------------------------------------------------------------
+    self.rear_buffer_m = 1.0
+    self.front_buffer_m = 1.0
+
+    self.lateral_buffer_m = 0.15
+
+    self.min_agent_reaction_time_s = 2.0
 
     # -----------------------------------------------------------------------------
     # Lateral planner parameters
     # -----------------------------------------------------------------------------
     self.lat_planning_frequency = 1.0
     self.lat_planning_frequency_high = 5.0
+
+
+    # SL Grid
+    self.sl_grid_spec = SLGridSpec(
+      L_max=9.0,
+      L_min=-9.0,
+      dl=0.2,
+      S_max=80.0,
+      ds=0.5,
+      lane_width_buffer_m=0.25,
+      collision_cost=255.0,
+      target_lane_cost=80.0,
+      source_lane_cost=150.0,
+    )
+
+    self.sl_algo_spec = SLAlgoSpec(
+      L_min=-9.0,
+      L_max=9.0,
+      dL_max=0.4,
+      ddL_max=0.25,
+      W_ref_offset=10.0,
+      W_heading=20.0,
+      W_curvature=50.0,
+      W_obstacle=2.0,
+      ds_grid=self.sl_grid_spec.ds,
+      dl_grid=self.sl_grid_spec.dl,
+      ds_algo=0.5,
+      dl_algo=0.2
+    )
+
+    self.sl_qp_spec = SLQPSpec(
+      num_vars=4,
+      num_samples=100,
+      dL_max=1.1,
+      ddL_max=0.5,
+      W_L=10.0,
+      W_dL=50.0,
+      W_ddL=100.0,
+      W_dddL=150.0,
+    )
 
     self.lat_grid_spec = LatGridSpec(
       x_min=-5.0,
@@ -982,23 +1054,23 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
 
     self.long_planning_frequency = 5.0
 
-    self.long_planning_turn_buffer_m = 5.0
-
     # Longitudinal
     self.st_grid_spec = STGridSpec(
       S_max=80.0,
       ds=0.25,
       T_max=8.0,
-      dt=self.long_planning_time_resolution
+      dt=self.long_planning_time_resolution,
+      collision_cost=255.0,
+      envelope_cost=100.0,
     )
     self.st_algo_spec = STAlgoSpec(
-      # A_max=self.idm_maximum_acceleration,
       A_max=8.0,
-      # A_min=self.idm_comfortable_braking_deceleration_low_speed,
-      A_min=20.0,
-      # J_max=self.idm_maximum_acceleration,
-      J_max=50.0,
-      W_vel=1.0,
+      A_min=-23.0,
+      J_max=5.0,
+      J_min=-10.0,
+      W_time=10.0,
+      W_vel=5.0,
+      W_goal_vel=4.0,
       W_acc=1.0,
       W_jerk=1.0,
       ds_grid=self.st_grid_spec.ds,
@@ -1006,8 +1078,16 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
       ds_algo=4 * self.st_grid_spec.ds
     )
 
-    self.traffic_light_distance_threshold = 30.0
-    self.stop_sign_distance_threshold = 30.0
+    # -----------------------------------------------------------------------------
+    # Trajectory planner parameters
+    # -----------------------------------------------------------------------------
+
+    self.lane_change_highway_speeds = 20.0
+    self.lane_change_highway_duration = 1.0
+    self.lane_change_regular_duration = 0.5
+
+    self.long_planning_turn_buffer_m = 1.0
+    self.long_planning_lc_buffer_m = 10.0
 
     self.sampling_resolution = 2.0
     self.prediction_horizon = 3.0
@@ -1045,6 +1125,28 @@ OUTPUT `HighLevelCommand` PARAMETERS (REQUIRED):
     self.plant_pretraining = None
     self.plant_max_speed_pred = 60.0  # Maximum speed we classify when forcasting cars.
     self.forcast_time = 0.5  # Number of seconds we forcast into the future
+
+  def meters_to_dense_route_idx(self, meters : float) -> int:
+    return int(meters * self.points_per_meter)
+
+  def dense_route_idx_to_meters(self, dense_route_idx : int) -> float:
+    return float(dense_route_idx / self.points_per_meter)
+
+  def meters_to_bb_route_idx(self, meters : float) -> int:
+    return int(meters // self.route_bbox_m_per_point)
+
+  def bb_route_idx_to_meters(self, bb_route_idx : int) -> float:
+    return float(bb_route_idx * self.route_bbox_m_per_point)
+
+  def dense_route_idx_to_bb_route_idx(self, dense_route_idx : int) -> int:
+    return self.meters_to_bb_route_idx(
+      self.dense_route_idx_to_meters(dense_route_idx)
+    )
+
+  def bb_route_idx_to_dense_route_idx(self, bb_route_idx : int) -> int:
+    return self.meters_to_dense_route_idx(
+      self.bb_route_idx_to_meters(bb_route_idx)
+    )
 
   def initialize(self, root_dir='', setting='all', **kwargs):
     for k, v in kwargs.items():

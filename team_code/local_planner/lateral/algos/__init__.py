@@ -1,2 +1,3 @@
 from .astar import AStar  # file name kept as given
-__all__ = ["AStar"]
+from .sl_dijkstra import SLDijkstra
+__all__ = ["AStar", "SLDijkstra"]
