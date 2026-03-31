@@ -5,7 +5,7 @@ import numpy as np
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List, Optional, Set, Tuple, Dict, Union
+from typing import List, Optional, Set, Tuple, Dict, Union, Literal
 from collections import deque
 
 from config import GlobalConfig
@@ -13,7 +13,9 @@ from agents.navigation.local_planner import RoadOption
 from privileged_route_planner import PlannerState
 from team_code.scene_descriptor.scene_descriptor import SceneData
 from team_code.actor_prediction.motion_prediction import PredictionData
-from team_code.scene_analyzer.parsers.ego_plan_pydantic_models import ConditionAction
+from team_code.actor_prediction.collision_checker import LaneOverlapInterval
+from team_code.scene_analyzer.parsers.ego_plan_pydantic_models import ConditionAction, ConditionCommand, PlanState, EntityType
+from team_code.local_planner.lateral.lat_planner import LatPlannerResult
 
 from .command_status import *
 
@@ -37,6 +39,10 @@ class BaseSM:
     @property
     def is_cleared(self) -> bool:
         return self.phase is ActionPhase.CLEARED
+
+    @property
+    def is_failed(self) -> bool:
+        return self.phase is ActionPhase.FAILED
 
 class StopForSM(BaseSM):
     def __init__(self, condition : ConditionCommand):
@@ -63,67 +69,26 @@ class StopForSM(BaseSM):
         scene_data : SceneData,
         planner_state : PlannerState,
     ) -> ConditionStatus:
-        condition_status = None
-        if self.condition.obj_type == "stop_sign":
-            is_blocking, reason = self._step_stop_sign(
-                config=config,
-                scene_data=scene_data,
-                planner_state=planner_state,
-            )
-            needs_replan = self.phase == ActionPhase.CLEARED
+        actor_type = self.condition.target.actor_type
 
-            condition_status = ConditionStatus(
-                condition=self.condition,
-                phase=self.phase,
-                is_blocking=is_blocking,
-                reason=reason,
-                needs_replan=needs_replan,
-            )
-        elif self.condition.obj_type == "traffic_light":
-            is_blocking, reason = self._step_traffic_light(
-                config=config,
-                scene_data=scene_data,
-                planner_state=planner_state,
-            )
-            needs_replan = self.phase == ActionPhase.CLEARED
+        if actor_type == EntityType.STOP_SIGN:
+            is_blocking, reason = self._step_stop_sign(config=config, scene_data=scene_data, planner_state=planner_state)
+        elif actor_type == EntityType.STOP_LIGHT:
+            is_blocking, reason = self._step_traffic_light(config=config, scene_data=scene_data, planner_state=planner_state)
+        elif actor_type == EntityType.OBSTACLE:
+            is_blocking, reason = self._step_obstacle(config=config, scene_data=scene_data)
+        elif actor_type == EntityType.PEDESTRIAN:
+            is_blocking, reason = self._step_pedestrian(config=config, scene_data=scene_data)
+        else:
+            return None
 
-            condition_status = ConditionStatus(
-                condition=self.condition,
-                phase=self.phase,
-                is_blocking=is_blocking,
-                reason=reason,
-                needs_replan=needs_replan,
-            )
-        elif self.condition.obj_type == "obstacle":
-            is_blocking, reason = self._step_obstacle(
-                config=config,
-                scene_data=scene_data
-            )
-            needs_replan = self.phase == ActionPhase.CLEARED
-
-            condition_status = ConditionStatus(
-                condition=self.condition,
-                phase=self.phase,
-                is_blocking=is_blocking,
-                reason=reason,
-                needs_replan=needs_replan,
-            )
-        elif self.condition.obj_type == "pedestrian":
-            is_blocking, reason = self._step_pedestrian(
-                config=config,
-                scene_data=scene_data
-            )
-            needs_replan = self.phase == ActionPhase.CLEARED
-
-            condition_status = ConditionStatus(
-                condition=self.condition,
-                phase=self.phase,
-                is_blocking=is_blocking,
-                reason=reason,
-                needs_replan=needs_replan,
-            )
-
-        return condition_status
+        return ConditionStatus(
+            condition=self.condition,
+            phase=self.phase,
+            is_blocking=is_blocking,
+            reason=reason,
+            needs_replan=self.phase == ActionPhase.FAILED,
+        )
 
     def _step_stop_sign(
         self,
@@ -138,15 +103,11 @@ class StopForSM(BaseSM):
         next_ss = scene_data.traffic_data.next_stop_sign
 
         if next_ss is None:
-            self.phase = ActionPhase.CLEARED
+            self.phase = ActionPhase.FAILED
             return False, "No stop sign detected"
 
-        if self.condition.id != next_ss.id:
-            self.phase = ActionPhase.CLEARED
-            return False, f"Stop sign {self.condition.id} does not exist"
-
         if next_ss.id in planner_state.cleared_stop_sign_ids:
-            self.phase = ActionPhase.CLEARED
+            self.phase = ActionPhase.FAILED
             return False, "Stop sign already cleared. Proceed to next command"
 
         reason = ""
@@ -182,12 +143,8 @@ class StopForSM(BaseSM):
         next_tl = scene_data.traffic_data.next_traffic_light
 
         if next_tl is None:
-            self.phase = ActionPhase.CLEARED
+            self.phase = ActionPhase.FAILED
             return False, "No traffic light detected"
-
-        if self.condition.id != next_tl.id:
-            self.phase = ActionPhase.CLEARED
-            return False, f"Traffic light {self.condition.id} does not exist"
 
         # NOTE: Not tracking cleared traffic lights, may not be necessary
 
@@ -225,19 +182,19 @@ class StopForSM(BaseSM):
         ego_speed = scene_data.ego_data.speed
         ego_obstacles = scene_data.obstacle_data.ego_obstacles
 
-        # Get the nearest obstacle
+        lane_info = scene_data.route_data.lane_info if scene_data.route_data else None
+        can_change_lane = lane_info is not None and lane_info.same_direction_lane_change_available
+
+        # No obstacle in scene
         if not ego_obstacles:
-            self.phase = ActionPhase.CLEARED
-            return False, f"No obstacle detected"
+            if not can_change_lane:
+                # No same-direction lane available: obstacle must have cleared itself
+                self.phase = ActionPhase.CLEARED
+                return False, "Obstacle no longer present, maneuver complete"
+            self.phase = ActionPhase.FAILED
+            return False, "No obstacle detected"
 
         next_obstacle = ego_obstacles[0]
-
-        if self.condition.id != next_obstacle.id:
-            self.phase = ActionPhase.CLEARED
-            return False, f"Obstacle {self.condition.id} does not exist"
-
-
-        # NOTE: Not tracking cleared obstacles, may be important
 
         reason = ""
         # Stopped and waiting near obstacle
@@ -254,6 +211,9 @@ class StopForSM(BaseSM):
             reason = f"Approaching obstacle {next_obstacle.id}"
 
         if self.phase == ActionPhase.EXECUTING and self.wait_ticks >= config.obstacle_min_wait_ticks:
+            if next_obstacle.is_near_junction and not can_change_lane:
+                # At intersection with no lane change: timeout does not clear, wait for obstacle to leave
+                return True, f"Waiting near obstacle {next_obstacle.id}, no lane change available at junction"
             self.phase = ActionPhase.CLEARED
             return False, f"Waited for {self.wait_ticks} ticks near obstacle {next_obstacle.id}, obstacle is blocking route"
 
@@ -269,14 +229,10 @@ class StopForSM(BaseSM):
 
         # Get the nearest pedestrian
         if not scene_data.ped_data:
-            self.phase = ActionPhase.CLEARED
+            self.phase = ActionPhase.FAILED
             return False, f"No pedestrian detected"
 
         next_ped = scene_data.ped_data[0]
-
-        if self.condition.id != next_ped.id:
-            self.phase = ActionPhase.CLEARED
-            return False, f"Pedestrian {self.condition.id} does not exist"
 
         # NOTE: Not tracking cleared pedestrians, may be important
 
@@ -300,95 +256,18 @@ class StopForSM(BaseSM):
 
         return True, reason
 
-class YieldForSM(BaseSM):
-    # TODO: IMPLEMENT YIELD_FOR SM
-    def __init__(self, condition : ConditionCommand):
-        super().__init__()
-        self.condition = condition
-        self.wait_ticks = 0
-
-    def update_condition(
-        self,
-        new_condition : ConditionCommand
-    ):
-        self.reset()
-        self.wait_ticks = 0
-        self.condition = new_condition
-
-    def step(
-        self,
-        *,
-        config,
-        scene_data : SceneData,
-        planner_state : PlannerState,
-    ) -> ConditionStatus:
-        condition_status = None
-        if self.condition.obj_type == "stop_sign":
-            is_blocking, reason = self._step_stop_sign(
-                config=config,
-                scene_data=scene_data,
-                planner_state=planner_state,
-            )
-            condition_status = ConditionStatus(
-                condition=self.condition,
-                phase=self.phase,
-                is_blocking=is_blocking,
-                reason=reason,
-            )
-        return condition_status
-
-    def _step_stop_sign(
-        self,
-        *,
-        config,
-        scene_data : SceneData,
-        planner_state : PlannerState,
-    ) -> Tuple[bool, str]:
-        ego_speed = scene_data.ego_data.speed
-
-        # Get the nearest stop sign
-        next_ss = scene_data.traffic_data.next_stop_sign
-
-        if next_ss is None:
-            self.phase = ActionPhase.CLEARED
-            return False, "No stop sign detected"
-
-        if self.condition.id != next_ss.id:
-            self.phase = ActionPhase.CLEARED
-            return False, f"Stop sign {self.condition.id} does not exist"
-
-        if next_ss.id in planner_state.cleared_stop_sign_ids:
-            self.phase = ActionPhase.CLEARED
-            return False, "Stop sign already cleared"
-
-        reason = ""
-        # Stopped and waiting at the stop sign
-        if (
-            ego_speed < config.stopped_speed_threshold
-            and next_ss.distance_to_stop_sign < config.clearing_distance_to_stop_sign
-        ):
-            self.phase = ActionPhase.EXECUTING
-            self.wait_ticks += 1
-            reason = f"Waiting at stop sign {next_ss.id}"
-        else:
-            self.phase = ActionPhase.EXECUTING
-            self.wait_ticks = 0
-            reason = f"Approaching stop sign {next_ss.id}"
-
-        if self.phase == ActionPhase.EXECUTING and self.wait_ticks >= config.stop_sign_min_wait_ticks:
-            self.phase = ActionPhase.CLEARED
-            return False, "Finished waiting at stop sign"
-
-        return True, reason
-
 class BaseActionSM(BaseSM):
     """Base class for simple action state machines."""
+
+    # Condition key: (condition_action.value, actor_type)
+    ConditionKey = Tuple[str, str]
+
     def __init__(self, config : GlobalConfig):
         super().__init__()
         self.config = config
 
-        self.conditions_registry : Dict[int, Union[StopForSM, YieldForSM]] = {} # Key = actor_id, value = Condition SM
-        self.cleared_actor_ids : Set[int] = set()
+        self.conditions_registry : Dict[BaseActionSM.ConditionKey, StopForSM] = {}
+        self.cleared_condition_keys : Set[BaseActionSM.ConditionKey] = set()
         self.collision_events : deque = deque(maxlen=self.config.collision_data_max_entries)
 
     def reset(self) -> None:
@@ -396,33 +275,84 @@ class BaseActionSM(BaseSM):
         super().reset()
 
         self.conditions_registry.clear()
-        # TODO/NOTE: KEEPING CLEARED ACTOR REGISTRY TO AVOID ENDLESS LOOPS
-        self.cleared_actor_ids.clear()
+        self.cleared_condition_keys.clear()
 
         self.collision_events.clear()
 
-    def update_conditions(self, conditions : List[ConditionCommand]):
-        def is_same_cond(cond_a : ConditionCommand, cond_b : ConditionCommand) -> bool:
+    @staticmethod
+    def _cond_key(cond: ConditionCommand) -> 'BaseActionSM.ConditionKey':
+        return (cond.condition_action.value, cond.target.actor_type.value)
+
+    def update_conditions(self, plan_state: PlanState) -> None:
+        """
+        Register StopForSM state machines for STOP_FOR conditions only.
+
+        All other condition types (YIELD_FOR, WATCH_FOR, etc.) are treated as
+        costmap/speed modifiers and are handled inline by subclass implementations
+        rather than via persistent state machines.
+        """
+        def is_same_cond(a: ConditionCommand, b: ConditionCommand) -> bool:
             return (
-                cond_a.condition_action == cond_b.condition_action and
-                cond_a.obj_type == cond_b.obj_type and
-                cond_a.traffic_type == cond_b.traffic_type and
-                cond_a.importance == cond_b.importance
+                a.condition_action == b.condition_action and
+                a.target.actor_type  == b.target.actor_type and
+                a.target.traffic_type == b.target.traffic_type and
+                a.priority           == b.priority
             )
 
-        for cond in conditions:
-            if cond.id not in self.conditions_registry:
-                if cond.id not in self.cleared_actor_ids:
-                    condition_sm = StopForSM(condition=cond) if cond.condition_action == ConditionAction.STOP_FOR else YieldForSM(condition=cond)
-                    # TODO: VALIDATE CONDITION BEFORE ADDING TO REGISTRY
-                    self.conditions_registry[cond.id] = condition_sm
+        for cond in plan_state.plan.conditions:
+            if cond.condition_action != ConditionAction.STOP_FOR:
+                continue
+            key = self._cond_key(cond)
+            if key in self.cleared_condition_keys:
+                continue
+            if key not in self.conditions_registry:
+                self.conditions_registry[key] = StopForSM(condition=cond)
             else:
-                condition_sm = self.conditions_registry[cond.id]
-                if not is_same_cond(condition_sm.condition, cond):
-                    # TODO: MIGHT WANT TO CONSIDER REMOVING STALE CONDITIONS, CURRENTLY CONDITIONS REMOVED ONLY WHEN CONDITION CLEARS
-                    condition_sm.update_condition(cond)
+                cond_sm = self.conditions_registry[key]
+                if not is_same_cond(cond_sm.condition, cond):
+                    cond_sm.update_condition(cond)
 
-                    self.conditions_registry[cond.id] = condition_sm
+    def _step_conditions(
+        self,
+        scene_data: SceneData,
+        planner_state: PlannerState,
+    ) -> Tuple[List[ConditionStatus], List[str], List[str], bool]:
+        """Step all registered StopFor SMs and collect results.
+
+        Returns (condition_statuses, reasons, replan_reasons, has_blocking).
+        replan_reasons is populated whenever a condition has needs_replan set,
+        regardless of the condition's current phase.
+        """
+        condition_statuses: List[ConditionStatus] = []
+        reasons: List[str] = []
+        replan_reasons: List[str] = []
+        has_blocking = False
+
+        for cond_key, cond_sm in list(self.conditions_registry.items()):
+            cond_status: ConditionStatus = cond_sm.step(
+                config=self.config,
+                scene_data=scene_data,
+                planner_state=planner_state,
+            )
+            if cond_status is None:
+                continue
+
+            has_blocking = has_blocking or cond_status.is_blocking
+            condition_statuses.append(cond_status)
+
+            if cond_status.phase == ActionPhase.CLEARED:
+                self.cleared_condition_keys.add(cond_key)
+                del self.conditions_registry[cond_key]
+
+            if cond_status.needs_replan:
+                replan_reasons.append(cond_status.reason)
+
+            reasons.append(cond_status.reason)
+
+        if scene_data.collision_data:
+            self.collision_events.append(scene_data.collision_data[0])
+
+        return condition_statuses, reasons, replan_reasons, has_blocking
 
 # ---------------------------------------------------------------------------
 # Route Following
@@ -466,67 +396,25 @@ class FollowRouteSM(BaseActionSM):
     def update_state(
         self,
         *,
-        config,
         scene_data : SceneData,
         planner_state : PlannerState,
     ) -> CommandStatus:
-        condition_statuses : List[ConditionStatus] = []
-        command_reasons : List[str] = []
-        replan_reasons : List[str] = []
-
-        has_blocking_conditions : bool = False
-
-        # Update condition state machines first
-        all_conditions = list(self.conditions_registry.values())
-        for cond_sm in all_conditions:
-            cond_status : ConditionStatus = cond_sm.step(
-                config=config,
-                scene_data=scene_data,
-                planner_state=planner_state
-            )
-            # TODO: FIX ONCE ALL THE OTHER CONDITIONS HAVE BEEN ADDED
-            # TODO: CONDITIONS REGISTRY DOES NOT EMPTY FULLY IF INCORRECT ID IS ADDED, LIKELY ARTIFACT OF CURRENT INCOMPLETE IMPLEMENTATION
-            if cond_status is None:
-                continue
-
-            has_blocking_conditions = has_blocking_conditions or cond_status.is_blocking
-            condition_statuses.append(cond_status)
-
-            # Condition has finished
-            if cond_status.phase == ActionPhase.CLEARED:
-                # Remove from conditions registry
-                # TODO: DECIDE WHETHER IT'S WORTH TO TRIM CONDITIONS LIST
-                # self.conditions_registry.pop(cond_status.condition.id)
-
-                # Update cleared actor id registry
-                self.cleared_actor_ids.add(cond_status.condition.id)
-
-                # Check if any conditions have set the replan flag
-                if cond_status.needs_replan:
-                    replan_reasons.append(cond_status.reason)
-
-            # Update command reasons
-            command_reasons.append(cond_status.reason)
-
-        # Update main command state if conditions blocking completion
-        # TODO: CURRENTLY BLOCKS BASED ON EXISTENCE OF CONDITIONS, MIGHT WANNA REVISIT
+        condition_statuses, command_reasons, replan_reasons, has_blocking_conditions = \
+            self._step_conditions(scene_data, planner_state)
 
         if scene_data.collision_data:
             print(f'\n\nFOLLOW ROUTE SM ADDING COLLISION EVENT\n\n')
-            self.collision_events.append(scene_data.collision_data[0])
 
-        # Directly set main state to CLEARED if any earlier conditions have set the replan flag
-        if len(replan_reasons) > 0:
-            self.phase = ActionPhase.CLEARED
+        if replan_reasons:
+            self.phase = ActionPhase.FAILED
             return CommandStatus(
                 cur_cmd=Action.FOLLOW_ROUTE,
                 phase=self.phase,
                 is_blocked=False,
                 conditions_status=condition_statuses,
-                reasons=replan_reasons
+                reasons=replan_reasons,
             )
 
-        # Otherwise, step main command and advance state machine as normal
         completed, base_reason = self.step(has_blocking_conditions)
         command_reasons.append(base_reason)
 
@@ -535,7 +423,7 @@ class FollowRouteSM(BaseActionSM):
             phase=self.phase,
             is_blocked=has_blocking_conditions,
             conditions_status=condition_statuses,
-            reasons=command_reasons
+            reasons=command_reasons,
         )
 
 # ---------------------------------------------------------------------------
@@ -544,141 +432,89 @@ class FollowRouteSM(BaseActionSM):
 
 class TurnSM(BaseActionSM):
     """Tracks intersection traversal for turn actions."""
+
+    # Used only when converting route_cmd (RoadOption) from route data to Action
+    _RO_TO_ACTION: Dict[RoadOption, 'Action'] = {
+        RoadOption.LEFT:     Action.TURN_LEFT,
+        RoadOption.RIGHT:    Action.TURN_RIGHT,
+        RoadOption.STRAIGHT: Action.TURN_STRAIGHT,
+    }
+
     def __init__(self, config : GlobalConfig):
         super().__init__(config)
-        self.prev_end_idx = -1
+
+        self.cur_plan_idxs : Optional[Tuple[int, int]] = None # (start_idx, end_idx)
+        self.cur_turn_cmd  : Optional[Action] = None
 
     def reset(self) -> None:
         super().reset()
-        self.prev_end_idx = -1
 
-    def step(self, turn_dir: RoadOption, route_index: int, scene_data: SceneData) -> Tuple[bool, str]:
+        self.cur_plan_idxs = None
+        self.cur_turn_cmd = None
+
+    def activate(self) -> None:
+        self.phase = ActionPhase.EXECUTING
+
+    @property
+    def has_active_plan(self) -> bool:
+        return self.is_executing and self.cur_plan_idxs is not None and self.cur_turn_cmd is not None
+
+    def step(self, turn_cmd: Action, route_index: int, scene_data: SceneData) -> Tuple[bool, str]:
         """
         :param route_index: Current index along ego's route.
         :returns: (completed, reason)
         """
-        if turn_dir == RoadOption.LEFT:
-            cmd_name = 'turn_left'
-        elif turn_dir == RoadOption.RIGHT:
-            cmd_name = 'turn_right'
-        else:
-            cmd_name = 'turn_straight'
+        cmd_name = turn_cmd.value
 
-        # Check if any intersection/turn data exists
-        intersection_data = scene_data.route_data.intersection_data if scene_data.route_data else None
-        if intersection_data is None and not self.is_executing:
-            # No intersection to track and command not currently executing, reset and replan
+        if not self.is_executing:
+            self.phase = ActionPhase.FAILED
+            return True, f"Failed to activate {cmd_name}"
+
+        if not self.has_active_plan:
+            self.phase = ActionPhase.FAILED
+            return True, f"Cannot run {cmd_name}. No turns in upcoming route, reevaluate"
+
+        if self.cur_turn_cmd != turn_cmd:
+            self.phase = ActionPhase.FAILED
+            return True, f"Mismatched turn commands, called {cmd_name} when route requires {self.cur_turn_cmd.value} maneuver"
+
+        _, end_idx = self.cur_plan_idxs
+        if route_index >= end_idx:
             self.phase = ActionPhase.CLEARED
-            return True, "No turns in upcoming route, replan"
-
-        # Set state to executing if idle
-        if intersection_data is not None and self.is_idle:
-            route_cmd, start_idx, end_idx, _ = intersection_data.entry
-
-            # Reset and replan due to mismatched commands
-            if route_cmd != turn_dir:
-                if route_cmd == RoadOption.LEFT:
-                    route_turn_dir = 'Turn LEFT'
-                elif route_cmd == RoadOption.RIGHT:
-                    route_turn_dir = 'Turn RIGHT'
-                else:
-                    route_turn_dir = 'Turn STRAIGHT'
-
-                self.phase = ActionPhase.CLEARED
-                return True, f"Mismatched turn commands, called {cmd_name} when route requires {route_turn_dir} maneuver"
-
-            self.prev_end_idx = end_idx
-            self.phase = ActionPhase.EXECUTING
-
-        if self.phase is ActionPhase.EXECUTING:
-            # Index tracking error, reset and replan
-            if self.prev_end_idx == -1:
-                self.phase = ActionPhase.CLEARED
-                return True, "Not tracking turn maneuver, replan"
-
-            # Check if current position has passed end point of turn maneuver
-            if route_index >= self.prev_end_idx:
-                self.prev_end_idx = -1
-                self.phase = ActionPhase.CLEARED
-                return True, f"Completed {cmd_name} maneuver and cleared intersection segment"
+            return True, f"Completed {cmd_name} maneuver and cleared intersection segment"
 
         return False, f"Running {cmd_name}"
 
     def update_state(
         self,
         *,
-        config,
-        scene_data : SceneData,
+        scene_data    : SceneData,
         planner_state : PlannerState,
-        turn_dir : RoadOption,
+        turn_cmd      : Action,
     ) -> CommandStatus:
-        condition_statuses : List[ConditionStatus] = []
-        command_reasons : List[str] = []
-        replan_reasons : List[str] = []
+        condition_statuses, command_reasons, replan_reasons, has_blocking_conditions = \
+            self._step_conditions(scene_data, planner_state)
 
-        has_blocking_conditions : bool = False
-        if turn_dir == RoadOption.LEFT:
-            turn_cmd = Action.TURN_LEFT
-        elif turn_dir == RoadOption.RIGHT:
-            turn_cmd = Action.TURN_RIGHT
-        else:
-            turn_cmd = Action.TURN_STRAIGHT
-
-        # Update condition state machines first
-        all_conditions = list(self.conditions_registry.values())
-        for cond_sm in all_conditions:
-            cond_status : ConditionStatus = cond_sm.step(
-                config=config,
-                scene_data=scene_data,
-                planner_state=planner_state
-            )
-            # TODO: FIX ONCE ALL THE OTHER CONDITIONS HAVE BEEN ADDED
-            # TODO: CONDITIONS REGISTRY DOES NOT EMPTY FULLY IF INCORRECT ID IS ADDED, LIKELY ARTIFACT OF CURRENT INCOMPLETE IMPLEMENTATION
-            if cond_status is None:
-                continue
-
-            has_blocking_conditions = has_blocking_conditions or cond_status.is_blocking
-            condition_statuses.append(cond_status)
-
-            # Condition has finished
-            if cond_status.phase == ActionPhase.CLEARED:
-                # Remove from conditions registry
-                # TODO: DECIDE WHETHER IT'S WORTH TO TRIM CONDITIONS LIST
-                # self.conditions_registry.pop(cond_status.condition.id)
-
-                # Update cleared actor id registry
-                self.cleared_actor_ids.add(cond_status.condition.id)
-
-                # Check if any conditions have set the replan flag
-                if cond_status.needs_replan:
-                    replan_reasons.append(cond_status.reason)
-
-            # Update command reasons
-            command_reasons.append(cond_status.reason)
-
-        # Update main command state if conditions blocking completion
-        # TODO: CURRENTLY BLOCKS BASED ON EXISTENCE OF CONDITIONS, MIGHT WANNA REVISIT
-        if scene_data.collision_data:
-            self.collision_events.append(scene_data.collision_data[0])
-
-        # Directly set main state to CLEARED if any earlier conditions have set the replan flag
-        if len(replan_reasons) > 0:
-            self.phase = ActionPhase.CLEARED
+        if replan_reasons:
+            self.phase = ActionPhase.FAILED
             return CommandStatus(
                 cur_cmd=turn_cmd,
                 phase=self.phase,
                 is_blocked=False,
                 conditions_status=condition_statuses,
-                reasons=replan_reasons
+                reasons=replan_reasons,
             )
 
-        # Otherwise, step main command and advance state machine as normal
-        completed, base_reason = self.step(
-            turn_dir, planner_state.route_index, scene_data
-        )
-        command_reasons.append(base_reason)
+        turn_data = scene_data.route_data.intersection_data
+        if not self.has_active_plan and turn_data is not None:
+            route_cmd, turn_start_idx, turn_end_idx, _ = turn_data.entry
+            turn_buffer = self.config.meters_to_dense_route_idx(self.config.long_planning_turn_buffer_m)
+            turn_end_idx = min(planner_state.route_len - 1, turn_end_idx + turn_buffer)
+            self.cur_plan_idxs = (turn_start_idx, turn_end_idx)
+            self.cur_turn_cmd = self._RO_TO_ACTION[route_cmd]
 
-        # Reset blocking conditions, if high-level command is completed
+        completed, base_reason = self.step(turn_cmd, planner_state.route_index, scene_data)
+        command_reasons.append(base_reason)
         has_blocking_conditions = False if completed else has_blocking_conditions
 
         return CommandStatus(
@@ -686,7 +522,7 @@ class TurnSM(BaseActionSM):
             phase=self.phase,
             is_blocked=has_blocking_conditions,
             conditions_status=condition_statuses,
-            reasons=command_reasons
+            reasons=command_reasons,
         )
 # ---------------------------------------------------------------------------
 # Lane Change Handling
@@ -694,133 +530,84 @@ class TurnSM(BaseActionSM):
 
 class LaneChangeSM(BaseActionSM):
     """Tracks lane change progression and planning horizons."""
+
+    # Used only when converting route_cmd (RoadOption) from route data to Action
+    _RO_TO_ACTION: Dict[RoadOption, 'Action'] = {
+        RoadOption.CHANGELANELEFT:  Action.CHANGE_LANE_LEFT,
+        RoadOption.CHANGELANERIGHT: Action.CHANGE_LANE_RIGHT,
+    }
+
     def __init__(self, config : GlobalConfig):
         super().__init__(config)
-        self.prev_end_idx = -1
+
+        self.cur_plan_idxs : Optional[Tuple[int, int]] = None # (start_idx, end_idx)
+        self.cur_lc_cmd    : Optional[Action] = None
+        self.route_shifted : bool = False
 
     def reset(self) -> None:
         super().reset()
-        self.prev_end_idx = -1
 
-    def step(self, lc_dir: RoadOption, route_index: int, scene_data: SceneData) -> Tuple[bool, str]:
-        """
-        :returns: (plan_s_goal_m, completed, reason)
-        """
-        cmd_name = 'change_lane_left' if lc_dir == RoadOption.CHANGELANELEFT else 'change_lane_right'
+        self.cur_plan_idxs = None
+        self.cur_lc_cmd = None
+        self.route_shifted = False
 
-        # Check if any lane change data exists
-        lane_change_data = scene_data.route_data.lane_change_data if scene_data.route_data else None
+    def activate(self) -> None:
+        self.phase = ActionPhase.EXECUTING
 
-        # TODO: REVISIT THIS WHEN HANDLING MANEUVERING AROUND CYCLISTS, CURRENTLY SAYING IF NO LANE CHANGES IN ROUTE WE SHOULD REPLAN, DOESNT ACCOUNT FOR ROUTE CHANGES
-        if lane_change_data is None:
-            # No lane change segment currently active, reset and replan
+    @property
+    def has_active_plan(self) -> bool:
+        return self.is_executing and self.cur_plan_idxs is not None and self.cur_lc_cmd is not None
+
+    def step(self, lc_cmd: Action, route_index: int, scene_data: SceneData) -> Tuple[bool, str]:
+        cmd_name = lc_cmd.value
+
+        if not self.is_executing:
+            self.phase = ActionPhase.FAILED
+            return True, f"Failed to activate {cmd_name}"
+
+        if not self.has_active_plan:
+            self.phase = ActionPhase.FAILED
+            return True, f"Cannot run {cmd_name}. No lane changes in upcoming route, reevaluate"
+
+        if self.cur_lc_cmd != lc_cmd:
+            self.phase = ActionPhase.FAILED
+            return True, f"Mismatched lane change commands, called {cmd_name} when route requires {self.cur_lc_cmd.value} maneuver"
+
+        _, end_idx = self.cur_plan_idxs
+        if route_index >= end_idx:
             self.phase = ActionPhase.CLEARED
-            return True, "No lane changes in upcoming route, reevaluate"
-
-        # Set state to executing if idle
-        if self.is_idle:
-            route_cmd, start_idx, end_idx = lane_change_data.entry
-
-            # Reset and replan due to mismatched commands
-            if route_cmd != lc_dir:
-                if route_cmd == RoadOption.CHANGELANELEFT:
-                    route_lc_dir = 'Change lane LEFT'
-                elif route_cmd == RoadOption.CHANGELANERIGHT:
-                    route_lc_dir = 'Change lane RIGHT'
-                else:
-                    route_lc_dir = 'Go STRAIGHT'
-
-                self.phase = ActionPhase.CLEARED
-                return True, f"Mismatched lane change commands, called {cmd_name} when route requires {route_lc_dir} maneuver"
-
-            self.prev_end_idx = end_idx
-            self.phase = ActionPhase.EXECUTING
-
-        if self.phase is ActionPhase.EXECUTING:
-            # Index tracking error, reset and replan
-            if self.prev_end_idx == -1:
-                self.phase = ActionPhase.CLEARED
-                return True, "Not tracking lane change maneuver, replan"
-
-            # Check if current position has passed end point of lane change maneuver
-            if route_index >= self.prev_end_idx:
-                self.prev_end_idx = -1
-                self.phase = ActionPhase.CLEARED
-                return True, f"Completed {cmd_name} maneuver and cleared lane change segment"
+            return True, f"Completed {cmd_name} maneuver and cleared lane change segment"
 
         return False, f"Running {cmd_name}"
 
     def update_state(
         self,
         *,
-        config,
-        scene_data : SceneData,
+        scene_data    : SceneData,
         planner_state : PlannerState,
-        lc_dir : RoadOption,
+        lc_cmd        : Action,
     ) -> CommandStatus:
-        condition_statuses : List[ConditionStatus] = []
-        command_reasons : List[str] = []
-        replan_reasons : List[str] = []
+        condition_statuses, command_reasons, replan_reasons, has_blocking_conditions = \
+            self._step_conditions(scene_data, planner_state)
 
-        has_blocking_conditions : bool = False
-        lc_cmd = Action.CHANGE_LANE_LEFT if lc_dir == RoadOption.CHANGELANELEFT else Action.CHANGE_LANE_RIGHT
-
-        # Update condition state machines first
-        all_conditions = list(self.conditions_registry.values())
-        for cond_sm in all_conditions:
-            cond_status : ConditionStatus = cond_sm.step(
-                config=config,
-                scene_data=scene_data,
-                planner_state=planner_state
-            )
-            # TODO: FIX ONCE ALL THE OTHER CONDITIONS HAVE BEEN ADDED
-            # TODO: CONDITIONS REGISTRY DOES NOT EMPTY FULLY IF INCORRECT ID IS ADDED, LIKELY ARTIFACT OF CURRENT INCOMPLETE IMPLEMENTATION
-            if cond_status is None:
-                continue
-
-            has_blocking_conditions = has_blocking_conditions or cond_status.is_blocking
-            condition_statuses.append(cond_status)
-
-            # Condition has finished
-            if cond_status.phase == ActionPhase.CLEARED:
-                # Remove from conditions registry
-                # TODO: DECIDE WHETHER IT'S WORTH TO TRIM CONDITIONS LIST
-                # self.conditions_registry.pop(cond_status.condition.id)
-
-                # Update cleared actor id registry
-                self.cleared_actor_ids.add(cond_status.condition.id)
-
-                # Check if any conditions have set the replan flag
-                if cond_status.needs_replan:
-                    replan_reasons.append(cond_status.reason)
-
-            # Update command reasons
-            command_reasons.append(cond_status.reason)
-
-        # Update main command state if conditions blocking completion
-        # TODO: CURRENTLY BLOCKS BASED ON EXISTENCE OF CONDITIONS, MIGHT WANNA REVISIT
-
-        if scene_data.collision_data:
-            self.collision_events.append(scene_data.collision_data[0])
-
-        # Directly set main state to CLEARED if any earlier conditions have set the replan flag
-        if len(replan_reasons) > 0:
-            self.phase = ActionPhase.CLEARED
+        if replan_reasons:
+            self.phase = ActionPhase.FAILED
             return CommandStatus(
                 cur_cmd=lc_cmd,
                 phase=self.phase,
                 is_blocked=False,
                 conditions_status=condition_statuses,
-                reasons=replan_reasons
+                reasons=replan_reasons,
             )
 
-        # Otherwise, step main command and advance state machine as normal
-        completed, base_reason = self.step(
-            lc_dir, planner_state.route_index, scene_data
-        )
-        command_reasons.append(base_reason)
+        lane_change_data = scene_data.route_data.lane_change_data
+        if not self.has_active_plan and lane_change_data is not None:
+            route_cmd, lc_start_idx, lc_end_idx = lane_change_data.entry
+            self.cur_plan_idxs = (lc_start_idx, lc_end_idx)
+            self.cur_lc_cmd = self._RO_TO_ACTION[route_cmd]
 
-        # Reset blocking conditions, if high-level command is completed
+        completed, base_reason = self.step(lc_cmd, planner_state.route_index, scene_data)
+        command_reasons.append(base_reason)
         has_blocking_conditions = False if completed else has_blocking_conditions
 
         return CommandStatus(
@@ -828,246 +615,308 @@ class LaneChangeSM(BaseActionSM):
             phase=self.phase,
             is_blocked=has_blocking_conditions,
             conditions_status=condition_statuses,
-            reasons=command_reasons
+            reasons=command_reasons,
         )
+
 # ---------------------------------------------------------------------------
 # Overtake Handling
 # ---------------------------------------------------------------------------
 
+@dataclass
+class OvertakeSegments:
+    """Route-index boundaries for each sub-phase of a lane-change overtake."""
+    lc_out_start  : int   # route_index at plan time (current ego position)
+    lc_out_end    : int   # outbound LC complete — ego is fully in the target lane
+    follow_end    : int   # IDM-follow phase ends, return LC begins
+    lc_return_end : int   # return LC complete — ego is back in the source lane
+
+
 class OvertakeSM(BaseActionSM):
-    """Tracks temporary route changes during overtakes."""
+    """
+    Tracks overtake maneuvers.
+
+    Two overtake types are supported:
+      LANE_CHANGE — overtake via an adjacent parallel driving lane.
+                    Sub-phases: LC_OUTBOUND → IN_TARGET_LANE → LC_RETURN
+      ONCOMING    — overtake by temporarily invading the oncoming lane.
+                    Sub-phases: LC_OUTBOUND (executing) only; completion when
+                    route_index reaches maneuver_end_idx.
+    """
     def __init__(self, config : GlobalConfig):
         super().__init__(config)
-        self.cur_route_changes: Optional[Tuple[int, int]] = None # (start_idx, end_idx)
-        self.target_end_idx: Optional[int] = None
-        self.last_intrusion_idx: Optional[int] = None
-        self.end_locked: bool = False
+
+        self.overtake_type  : Optional[OvertakeType]    = None
+        self.sub_phase      : OvertakeSubPhase           = OvertakeSubPhase.PENDING_PLAN
+
+        # Overtake segment boundaries
+        self.segments       : Optional[OvertakeSegments] = None
+
+        # Full maneuver end index
+        self.maneuver_end_idx : Optional[int]            = None
+
+        self.lat_plan_status : LateralPlanStatus = LateralPlanStatus.NONE
+        self.plan_fail_count : int = 0
+        self.max_plan_failures : int = 5  # TODO: move to config
 
     def reset(self) -> None:
         super().reset()
-        self.cur_route_changes = None
-        self.target_end_idx: Optional[int] = None
-        self.last_intrusion_idx: Optional[int] = None
-        self.end_locked: bool = False
+
+        self.overtake_type    = None
+        self.sub_phase        = OvertakeSubPhase.PENDING_PLAN
+        self.segments         = None
+        self.maneuver_end_idx = None
+
+        self.lat_plan_status  = LateralPlanStatus.NONE
+        self.plan_fail_count  = 0
+
+    def activate(self) -> None:
+        self.phase = ActionPhase.EXECUTING
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
     @property
-    def needs_route_adjustment(self) -> bool:
+    def has_active_plan(self) -> bool:
         """
-        :returns: True if we should plan a new overtake path segment.
+        True when the ST planner should run with explicit s-bounds.
+        For LANE_CHANGE: only during LC_OUTBOUND and LC_RETURN.
+        For ONCOMING:    whenever we have a valid segment (sub_phase != PENDING_PLAN).
+        IN_TARGET_LANE uses IDM only — no ST bounds needed.
         """
-        if self.cur_route_changes is None:
-            return True
+        if not self.is_executing or self.segments is None:
+            return False
+        if self.overtake_type == OvertakeType.ONCOMING:
+            return self.sub_phase != OvertakeSubPhase.PENDING_PLAN
+        return self.sub_phase in (OvertakeSubPhase.LC_OUTBOUND, OvertakeSubPhase.LC_RETURN)
 
-        if self.target_end_idx is None:
-            return True
+    # ------------------------------------------------------------------
+    # Replanning gate
+    # ------------------------------------------------------------------
 
-        return self.target_end_idx > self.cur_route_changes[-1]
-
-    def set_route_changes(self, route_change_idxs: Optional[Tuple[int, int]]):
-        if route_change_idxs is not None:
-            self.cur_route_changes = route_change_idxs
-            self.phase = ActionPhase.EXECUTING
-
-    def get_target_end_idx(
+    def compute_replan_need(
         self,
-        *,
-        config : GlobalConfig,
-        planner_state : PlannerState,
-        scene_data : SceneData,
+        scene_data    : SceneData,
         prediction_data : PredictionData,
-        actor_registry : Dict[str, Set[int]],
-        target_distance_initial : float,
-        buffer_distance : float,
-    ) -> int:
-        if self.end_locked and self.target_end_idx is not None:
-            return self.target_end_idx
+    ) -> bool:
+        """
+        Returns True if lat_planner.run_step should be called this tick.
+
+        Triggers:
+          1. No lateral plan has been generated yet.
+          2. A static obstacle is currently intruding the route.
+          3. A cyclist is currently intruding the route.
+        """
+        print(f'\n\nOVERTAKE REPLANNING')
+        # 1. No plan yet
+        if self.lat_plan_status == LateralPlanStatus.NONE:
+            print(f'\tNO LAT PLAN')
+            return True
+
+        # 2. Static obstacle intruding the route
+        if scene_data.obstacle_data and scene_data.obstacle_data.ego_obstacles:
+            print(f'\tHAS EGO OBSTACLES')
+            return True
+
+        # 3. Cyclist intruding the route
+        cyclists = scene_data.vehicle_data.get(vehicle_types={'cyclist'}, get_intruders=True)
+        if cyclists:
+            print(f'\tHAS CYCLISTS')
+            return True
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Helpers (computed from data already available in update_state)
+    # ------------------------------------------------------------------
+
+    def _determine_overtake_type(
+        self,
+        scene_data : SceneData,
+    ) -> OvertakeType:
+        """
+        Returns LANE_CHANGE if there is a proper parallel driving lane in the
+        overtake direction, otherwise ONCOMING.
+        """
+        lane_info = scene_data.route_data.lane_info
+
+        if lane_info.same_direction_lane_change_available:
+            return OvertakeType.LANE_CHANGE
+
+        return OvertakeType.ONCOMING
+
+    def _extract_segments(
+        self,
+        planner_state   : PlannerState,
+        lat_plan_result : LatPlannerResult,
+    ) -> Optional[OvertakeSegments]:
+        """
+        Convert the local (route-slice-relative) segment indices computed by
+        lat_planner into global route indices and return an OvertakeSegments.
+        Returns None if the LatPlanner result contains no segment data.
+        """
+        if lat_plan_result.lc_out_end_local is None:
+            return None
 
         route_index = planner_state.route_index
-        route_len = planner_state.route_len
+        route_len   = planner_state.route_len
 
-        initial_end_idx = min(
-            route_len - 1,
-            route_index + int(target_distance_initial * config.points_per_meter)
+        lc_out_end    = min(route_index + lat_plan_result.lc_out_end_local,    route_len - 1)
+        follow_end    = min(route_index + lat_plan_result.follow_end_local,    route_len - 1)
+        lc_return_end = min(route_index + lat_plan_result.lc_return_end_local, route_len - 1)
+
+        # Enforce strict monotonic ordering
+        lc_out_end    = max(route_index + 1, lc_out_end)
+        follow_end    = max(lc_out_end  + 1, follow_end)
+        lc_return_end = max(follow_end  + 1, lc_return_end)
+
+        return OvertakeSegments(
+            lc_out_start  = route_index,
+            lc_out_end    = lc_out_end,
+            follow_end    = follow_end,
+            lc_return_end = lc_return_end,
         )
-        buffer_pts = int(buffer_distance * config.points_per_meter)
 
-        furthest_idx = None
-        obs_ids = actor_registry["obstacles"]
-        cyclist_ids = actor_registry["cyclist"]
+    def _apply_segments(self, segments: OvertakeSegments) -> None:
+        self.segments         = segments
+        self.maneuver_end_idx = segments.lc_return_end
+        if self.sub_phase == OvertakeSubPhase.PENDING_PLAN:
+            self.sub_phase = OvertakeSubPhase.LC_OUTBOUND
 
-        ego_obstacles = scene_data.obstacle_data.ego_obstacles
-        for obs_data in ego_obstacles:
-            print(f'\t(overtake) FOUND OBSTACLE ID, id: {obs_data.id}, distance: {obs_data.relative_distance}, intrusion_idx: {obs_data.intrusion_idx}')
-            if furthest_idx is None:
-                furthest_idx = obs_data.intrusion_idx
-            else:
-                furthest_idx = max(furthest_idx, obs_data.intrusion_idx)
+    def _apply_oncoming_end(self, route_index: int, end_idx: int) -> None:
+        self.segments = OvertakeSegments(
+            lc_out_start  = route_index,
+            lc_out_end    = end_idx,
+            follow_end    = end_idx,
+            lc_return_end = end_idx,
+        )
+        self.maneuver_end_idx = end_idx
+        if self.sub_phase == OvertakeSubPhase.PENDING_PLAN:
+            self.sub_phase = OvertakeSubPhase.LC_OUTBOUND
 
+    # ------------------------------------------------------------------
+    # State transition
+    # ------------------------------------------------------------------
 
-        # if obs_ids:
-        #     print(f'\n(overtake) FOUND OBSTACLE IDS FROM LLM, len: {len(obs_ids)}')
-        #     for obs_data in scene_data.obstacle_data:
-        #         if obs_data.id in obs_ids and obs_data.intrusion_idx is not None:
-        #             print(f'\t(overtake) FOUND OBSTACLE ID, id: {obs_data.id}, distance: {obs_data.relative_distance}, intrusion_idx: {obs_data.intrusion_idx}')
-        #             if furthest_idx is None:
-        #                 furthest_idx = obs_data.intrusion_idx
-        #             else:
-        #                 furthest_idx = max(furthest_idx, obs_data.intrusion_idx)
+    def step(self, overtake_cmd: Action, route_index: int, scene_data: SceneData) -> Tuple[bool, str]:
+        cmd_name = overtake_cmd.value
 
-        # if cyclist_ids:
-        #     print(f'\n(cyclist) FOUND CYCLIST IDS FROM LLM, len: {len(cyclist_ids)}')
-        #     all_cyclist_data = scene_data.vehicle_data.get(traffic_type="leading", vehicle_types={"cyclist"}, vehicle_ids=cyclist_ids)
-        #     for cyc_data in all_cyclist_data:
-        #         print(f'\t(overtake) FOUND CYCLIST ID, id: {cyc_data.id}, distance: {cyc_data.relative_distance}, intrusion_idx: {cyc_data.intrusion_idx}')
-        #         if furthest_idx is None:
-        #             furthest_idx = cyc_data.intrusion_idx
-        #         else:
-        #             furthest_idx = max(furthest_idx, cyc_data.intrusion_idx)
-        all_cyclist_data = scene_data.vehicle_data.get(traffic_type="leading", vehicle_types={"cyclist"})
-        for cyc_data in all_cyclist_data:
-            print(f'\n\n(overtake_sm) FOUND CYCLIST ID, id: {cyc_data.id}, speed: {cyc_data.speed}, distance: {cyc_data.relative_distance}, intrusion_idx: {cyc_data.intrusion_idx}')
+        if not self.is_executing:
+            self.phase = ActionPhase.FAILED
+            return True, f"Failed to activate {cmd_name}"
 
-            # Check if cyclist overlaps with ego route
-            if cyc_data.id in prediction_data.all_actor_overlaps:
-                cyclist_overlap = prediction_data.all_actor_overlaps.get(cyc_data.id)[0]
+        if self.lat_plan_status == LateralPlanStatus.INVALID_FATAL:
+            self.phase = ActionPhase.FAILED
+            return True, f"Failed to generate a feasible plan for {cmd_name}"
 
-                # Get predicted bounding box at approximately 2s
-                num_frames = 40
+        lane_info = scene_data.route_data.lane_info
+        can_overtake = (
+            (lane_info.has_left_lane and overtake_cmd == Action.OVERTAKE_LEFT) or
+            (lane_info.has_right_lane and overtake_cmd == Action.OVERTAKE_RIGHT)
+        )
+        if self.sub_phase == OvertakeSubPhase.PENDING_PLAN and not can_overtake:
+            self.phase = ActionPhase.FAILED
+            return True, f"Cannot run {cmd_name}, no lanes available"
 
-                if num_frames in cyclist_overlap.frame_occupancies:
-                    bb_end_idx = cyclist_overlap.frame_occupancies.get(num_frames)[1]
+        if self.sub_phase == OvertakeSubPhase.PENDING_PLAN:
+            return False, f"Waiting for feasible {cmd_name} plan"
 
-                    print(f'\n\nDISTANCE TO TIMED OVERLAP END INDEX: {(bb_end_idx * 20) / self.config.points_per_meter}')
-                    route_end_idx = bb_end_idx * 20 + route_index
-                    if furthest_idx is None:
-                        furthest_idx = route_end_idx
-                    else:
-                        furthest_idx = max(furthest_idx, route_end_idx)
+        if self.segments is None:
+            return False, f"Waiting for segment data for {cmd_name}"
 
-            # if cyc_data.intrusion_idx is not None:
-            #     if furthest_idx is None:
-            #         furthest_idx = cyc_data.intrusion_idx
-            #     else:
-            #         furthest_idx = max(furthest_idx, cyc_data.intrusion_idx)
-
-        print(f'\n\nINITIAL IDX')
-        print(f'\tINITIAL DIST: {(initial_end_idx - route_index) / self.config.points_per_meter}, INITIAL END IDX: {initial_end_idx}')
-        if furthest_idx is not None:
-            self.last_intrusion_idx = furthest_idx
-
-            print(f'\n\nFURTHEST_IDX')
-            print(f'\tBUFFER DIST: {((furthest_idx + buffer_pts) - route_index) / self.config.points_per_meter} BUFER IDX: {furthest_idx + buffer_pts}')
-            target_end_idx = min(initial_end_idx, furthest_idx + buffer_pts)
-            if self.target_end_idx is None:
-                self.target_end_idx = target_end_idx
-            else:
-                self.target_end_idx = max(self.target_end_idx, target_end_idx)
-        else:
-            if self.target_end_idx is None:
-                self.target_end_idx = initial_end_idx
-
-        if self.last_intrusion_idx is not None:
-            if route_index >= self.last_intrusion_idx:
-                self.end_locked = True
-
-        print(f'\n\nFINAL OVERTAKE INDEX: {self.target_end_idx}')
-        return self.target_end_idx
-
-    def step(self, overtake_dir: RoadOption, route_index: int, scene_data: SceneData) -> Tuple[bool, str]:
-        cmd_name = 'overtake_left' if overtake_dir == RoadOption.CHANGELANELEFT else 'overtake_right'
-
-        # Check if any overtake adjustments have been made
-        if self.cur_route_changes is None:
-            # Unable to change route, reset and replan
-            self.phase = ActionPhase.CLEARED
-            return True, "Unable to modify route, replan"
-
-        if self.phase is ActionPhase.EXECUTING:
-            # Planning error, reset and replan
-            if self.cur_route_changes is None:
+        # ── ONCOMING: single-phase execution ──────────────────────────
+        if self.overtake_type == OvertakeType.ONCOMING:
+            if route_index >= self.maneuver_end_idx:
                 self.phase = ActionPhase.CLEARED
-                return True, "Not tracking overtake maneuver, replan"
+                return True, f"Completed {cmd_name} (oncoming invasion) maneuver"
+            return False, f"Running {cmd_name} (oncoming), sub_phase={self.sub_phase.name}"
 
-            # Check if current position has passed end point of overtake maneuver
-            _, end_idx = self.cur_route_changes
-            if route_index > end_idx:
-                self.cur_route_changes = None
+        # ── LANE_CHANGE: advance through sub-phases ───────────────────
+        segs = self.segments
+
+        if self.sub_phase == OvertakeSubPhase.LC_OUTBOUND:
+            if route_index >= segs.lc_out_end:
+                self.sub_phase = OvertakeSubPhase.IN_TARGET_LANE
+                return False, f"{cmd_name}: outbound LC complete — now in target lane"
+
+        if self.sub_phase == OvertakeSubPhase.IN_TARGET_LANE:
+            if route_index >= segs.follow_end:
+                self.sub_phase = OvertakeSubPhase.LC_RETURN
+                return False, f"{cmd_name}: beginning return LC"
+
+        if self.sub_phase == OvertakeSubPhase.LC_RETURN:
+            if route_index >= segs.lc_return_end:
                 self.phase = ActionPhase.CLEARED
-                return True, f"Completed {cmd_name} maneuver and cleared overtake segment"
+                return True, f"Completed {cmd_name} maneuver — back in source lane"
 
-        return False, f"Running {cmd_name}"
+        return False, f"Running {cmd_name}, sub_phase={self.sub_phase.name}"
+
+    # ------------------------------------------------------------------
+    # Main update
+    # ------------------------------------------------------------------
 
     def update_state(
         self,
         *,
-        config,
-        scene_data : SceneData,
-        planner_state : PlannerState,
-        overtake_dir : RoadOption,
+        scene_data         : SceneData,
+        planner_state      : PlannerState,
+        overtake_cmd       : Action,
+        lat_planner_result : Optional[LatPlannerResult] = None,
     ) -> CommandStatus:
-        condition_statuses : List[ConditionStatus] = []
-        command_reasons : List[str] = []
-        replan_reasons : List[str] = []
 
-        has_blocking_conditions : bool = False
-        overtake_cmd = Action.OVERTAKE_LEFT if overtake_dir == RoadOption.CHANGELANELEFT else Action.OVERTAKE_RIGHT
+        # ── 1. Latch overtake type once ───────────────────────────────
+        if self.overtake_type is None:
+            self.overtake_type = self._determine_overtake_type(scene_data)
 
-        # Update condition state machines first
-        all_conditions = list(self.conditions_registry.values())
-        for cond_sm in all_conditions:
-            cond_status : ConditionStatus = cond_sm.step(
-                config=config,
-                scene_data=scene_data,
-                planner_state=planner_state
-            )
-            # TODO: FIX ONCE ALL THE OTHER CONDITIONS HAVE BEEN ADDED
-            # TODO: CONDITIONS REGISTRY DOES NOT EMPTY FULLY IF INCORRECT ID IS ADDED, LIKELY ARTIFACT OF CURRENT INCOMPLETE IMPLEMENTATION
-            if cond_status is None:
-                continue
+        # ── 2. Step condition state machines ─────────────────────────
+        condition_statuses, command_reasons, replan_reasons, has_blocking_conditions = \
+            self._step_conditions(scene_data, planner_state)
 
-            has_blocking_conditions = has_blocking_conditions or cond_status.is_blocking
-            condition_statuses.append(cond_status)
-
-            # Condition has finished
-            if cond_status.phase == ActionPhase.CLEARED:
-                # Remove from conditions registry
-                # TODO: DECIDE WHETHER IT'S WORTH TO TRIM CONDITIONS LIST
-                # self.conditions_registry.pop(cond_status.condition.id)
-
-                # Update cleared actor id registry
-                self.cleared_actor_ids.add(cond_status.condition.id)
-
-                # Check if any conditions have set the replan flag
-                if cond_status.needs_replan:
-                    replan_reasons.append(cond_status.reason)
-
-            # Update command reasons
-            command_reasons.append(cond_status.reason)
-
-        # Update main command state if conditions blocking completion
-        # TODO: CURRENTLY BLOCKS BASED ON EXISTENCE OF CONDITIONS, MIGHT WANNA REVISIT
-
-        if scene_data.collision_data:
-            self.collision_events.append(scene_data.collision_data[0])
-
-        # Directly set main state to CLEARED if any earlier conditions have set the replan flag
-        if len(replan_reasons) > 0:
-            self.phase = ActionPhase.CLEARED
+        # ── 3. Early-exit: condition-driven replan ────────────────────
+        if replan_reasons:
+            self.phase = ActionPhase.FAILED
             return CommandStatus(
                 cur_cmd=overtake_cmd,
                 phase=self.phase,
                 is_blocked=False,
                 conditions_status=condition_statuses,
-                reasons=replan_reasons
+                reasons=replan_reasons,
             )
 
-        # Otherwise, step main command and advance state machine as normal
+        # ── 4. Update lateral plan status ────────────────────────────
+        if lat_planner_result is not None:
+            if lat_planner_result.is_empty_plan:
+                self.plan_fail_count += 1
+                self.lat_plan_status = (
+                    LateralPlanStatus.INVALID_FATAL
+                    if self.plan_fail_count >= self.max_plan_failures
+                    else LateralPlanStatus.INVALID_TRANSIENT
+                )
+            else:
+                self.lat_plan_status = LateralPlanStatus.VALID
+                self.plan_fail_count = 0
+
+        # ── 5. Ingest new segment data from a fresh LatPlanner result ─
+        if lat_planner_result is not None and lat_planner_result.is_new_plan:
+            segs = self._extract_segments(planner_state, lat_planner_result)
+            if self.overtake_type == OvertakeType.LANE_CHANGE:
+                if segs is not None:
+                    self._apply_segments(segs)
+            else:
+                target_idx = lat_planner_result.goal_idx
+                if segs is not None:
+                    target_idx = segs.lc_return_end
+                self._apply_oncoming_end(
+                    planner_state.route_index,
+                    target_idx,
+                )
+
+        # ── 6. Advance the state machine ─────────────────────────────
         completed, base_reason = self.step(
-            overtake_dir, planner_state.route_index, scene_data
+            overtake_cmd, planner_state.route_index, scene_data
         )
         command_reasons.append(base_reason)
 
-        # Reset blocking conditions, if high-level command is completed
         has_blocking_conditions = False if completed else has_blocking_conditions
 
         return CommandStatus(
@@ -1075,7 +924,7 @@ class OvertakeSM(BaseActionSM):
             phase=self.phase,
             is_blocked=has_blocking_conditions,
             conditions_status=condition_statuses,
-            reasons=command_reasons
+            reasons=command_reasons,
         )
 
 # ---------------------------------------------------------------------------
@@ -1089,150 +938,260 @@ class PullOverPhase(Enum):
     RETURNING = auto()
 
 class PullOverSM(BaseActionSM):
-    """Tracks pull-over maneuvers and route restoration bookkeeping."""
-    def __init__(self, config : GlobalConfig):
+    """
+    Tracks pull-over maneuvers for emergency vehicle yielding.
+
+    Two action types (read from PlanState):
+      PULL_OVER_LEFT / PULL_OVER_RIGHT — shift route to shoulder, stop, merge back.
+      PULL_OVER_IN_LANE               — stop in place, no lateral deviation.
+
+    Three sub-phases:
+      YIELDING  — lateral shift + decelerate  (or just decelerate for IN_LANE)
+      WAITING   — hold at stop, monitor YIELD_FOR emergency_vehicle conditions inline
+      RETURNING — follow pre-shifted return route (L/R) or skip to CLEARED (IN_LANE)
+
+    STOP_FOR conditions are tracked via the inherited conditions_registry (StopForSM).
+    YIELD_FOR conditions for regular traffic are costmap modifiers handled by the
+    longitudinal planner; they do not gate sub-phase transitions.
+    YIELD_FOR emergency_vehicle conditions are checked inline to gate WAITING→RETURNING.
+    """
+
+    def __init__(self, config: GlobalConfig):
         super().__init__(config)
-        self.cur_route_changes: Optional[Tuple[int, int, int]] = None # (start_idx, wait_idx, end_idx)
-        self.sub_phase : PullOverPhase = PullOverPhase.IDLE
+
+        self.sub_phase   : PullOverPhase    = PullOverPhase.IDLE
+        self.pull_action : Optional[Action] = None   # latched once on first activate
+
+        # YIELD_FOR emergency_vehicle conditions extracted from plan (refreshed each tick)
+        self.ev_yield_conditions : List[ConditionCommand] = []
+
+        # For PULL_OVER_LEFT / PULL_OVER_RIGHT route tracking
+        self.route_shifted     : bool          = False
+        self.maneuver_wait_idx : Optional[int] = None  # global route idx where ego parks
+        self.maneuver_end_idx  : Optional[int] = None  # global route idx where return ends
+
+        self.preconditions_checked : bool = False
 
     def reset(self) -> None:
         super().reset()
-        self.cur_route_changes = None
-        self.sub_phase = PullOverPhase.IDLE
+        self.sub_phase           = PullOverPhase.IDLE
+        self.pull_action         = None
+        self.ev_yield_conditions = []
+        self.route_shifted       = False
+        self.maneuver_wait_idx   = None
+        self.maneuver_end_idx    = None
+        self.preconditions_checked = False # Reset the flag
+
+    def activate(self) -> None:
+        self.phase = ActionPhase.EXECUTING
+        if self.sub_phase == PullOverPhase.IDLE:
+            self.sub_phase = PullOverPhase.YIELDING
+
+    def update_conditions(self, plan_state: PlanState) -> None:
+        """
+        Delegate STOP_FOR tracking to base class (StopForSM per actor).
+        Refresh EV-specific YIELD_FOR list for inline WAITING checks.
+        """
+        super().update_conditions(plan_state)
+        self.ev_yield_conditions = [
+            c for c in plan_state.plan.conditions
+            if c.condition_action == ConditionAction.YIELD_FOR
+            and c.target.actor_type == "emergency_vehicle"
+        ]
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
     @property
-    def needs_route_adjustment(self) -> bool:
-        return self.cur_route_changes is None
+    def has_active_plan(self) -> bool:
+        return self.is_executing and self.route_shifted
 
-    def set_route_changes(self, route_change_idxs: Optional[Tuple[int, int, int]]):
-        if route_change_idxs is not None:
-            self.cur_route_changes = route_change_idxs
-            self.phase = ActionPhase.EXECUTING
-            self.sub_phase = PullOverPhase.YIELDING
+    # ------------------------------------------------------------------
+    # Replanning gate
+    # ------------------------------------------------------------------
+
+    def compute_replan_need(
+        self,
+        scene_data      : SceneData,
+        prediction_data : PredictionData,
+    ) -> bool:
+        """
+        True when shift_route_smoothly should be called this tick.
+
+        PULL_OVER_IN_LANE: never (no lateral shift needed).
+        PULL_OVER_L/R:     only until the route has been shifted once.
+        """
+        if self.pull_action == Action.PULL_OVER_IN_LANE:
+            return False
+        return not self.route_shifted
+
+    # ------------------------------------------------------------------
+    # Inline EV condition check (no state machine needed)
+    # ------------------------------------------------------------------
+
+    def _ev_condition_cleared(
+        self,
+        condition       : ConditionCommand,
+        scene_data      : SceneData,
+        prediction_data : PredictionData,
+    ) -> bool:
+        """
+        Returns True when the emergency vehicle described by *condition* has passed.
+
+        Resolves the abstract ConditionTarget against live perception:
+        - If no EVs with active sirens exist in scene → condition cleared.
+        - crossing  → no active-siren EV overlaps our route bounding boxes.
+        - trailing / oncoming → no active-siren EV matches the target traffic_type.
+        """
+        evs = scene_data.vehicle_data.get(vehicle_types={'emergency_vehicle'})
+        # Filter to only EVs with active sirens
+        active_evs = [ev for ev in evs if ev.emergency_sirens_active] if evs else []
+
+        if not active_evs:
+            return True  # no active-siren EVs → treat as passed
+
+        target_traffic_type = condition.target.traffic_type
+
+        if target_traffic_type == "crossing":
+            for ev in active_evs:
+                if ev.id in prediction_data.all_actor_overlaps:
+                    return False
+            return True
+
+        # For trailing/oncoming: check if any active-siren EV still has matching traffic_type
+        for ev in active_evs:
+            if ev.traffic_type == target_traffic_type:
+                return False
+        return True
+
+    # ------------------------------------------------------------------
+    # State transition
+    # ------------------------------------------------------------------
 
     def step(
         self,
-        pull_over_dir : RoadOption,
-        route_index : int,
-        scene_data: SceneData,
-        vehicle_id : int,
-        vehicle_passed : bool,
-        has_vehicle : bool,
+        pull_over_cmd : Action,
+        route_index     : int,
+        ego_speed       : float,
+        scene_data      : SceneData,
+        prediction_data : PredictionData,
     ) -> Tuple[bool, str]:
-        cmd_name = 'pull_over_left' if pull_over_dir == RoadOption.CHANGELANELEFT else 'pull_over_right'
+        cmd_name = pull_over_cmd.value
 
-        # Check if any pull over adjustments have been made
-        if self.cur_route_changes is None:
-            # No changes made to route, reset and replan
-            self.phase = ActionPhase.CLEARED
-            return True, "Unable to modify route, replan"
+        if not self.is_executing:
+            self.phase = ActionPhase.FAILED
+            return True, "Failed to activate pull_over"
 
-        if self.phase is ActionPhase.EXECUTING:
-            # Planning error, reset and replan
-            if self.cur_route_changes is None:
-                self.phase = ActionPhase.CLEARED
-                return True, "Not tracking pull over maneuver, replan"
+        if not self.preconditions_checked:
+            emergency_vehicles = scene_data.vehicle_data.get(vehicle_types={"emergency_vehicle"})
+            evs_siren = [ev for ev in emergency_vehicles if ev.emergency_sirens_active]
 
-            start_idx, wait_idx, end_idx = self.cur_route_changes
-            if self.sub_phase is PullOverPhase.YIELDING:
-                # Currently yielding to vehicle
-                if route_index >= wait_idx:
+            if not evs_siren:
+                self.phase = ActionPhase.FAILED
+                return True, f"Cannot run {cmd_name}, no emergency vehicles present"
+
+            lane_info = scene_data.route_data.lane_info
+            can_pull_over = (
+                (lane_info.left_same_dir and pull_over_cmd == Action.PULL_OVER_LEFT) or
+                (lane_info.right_same_dir and pull_over_cmd == Action.PULL_OVER_RIGHT) or
+                (pull_over_cmd == Action.PULL_OVER_IN_LANE)
+            )
+            if not can_pull_over:
+                self.phase = ActionPhase.FAILED
+                return True, f"Cannot run {cmd_name}, no lanes available"
+
+            # Checks passed; latch the boolean so we don't evaluate this again
+            self.preconditions_checked = True
+
+        # ── YIELDING → WAITING ────────────────────────────────────────
+        if self.sub_phase == PullOverPhase.YIELDING:
+            if self.pull_action == Action.PULL_OVER_IN_LANE:
+                if ego_speed < 0.5:
                     self.sub_phase = PullOverPhase.WAITING
-                    return False, f"Waiting for vehicle {vehicle_id} to pass"
+                    return False, "pull_over_in_lane: stopped, waiting for EV to pass"
+            else:
+                if self.route_shifted and self.maneuver_wait_idx is not None:
+                    if route_index >= self.maneuver_wait_idx:
+                        self.sub_phase = PullOverPhase.WAITING
+                        return False, "pull_over: at shoulder, waiting for EV to pass"
 
-                return False, f"Pulling over for vehicle {vehicle_id}"
+        # ── WAITING → RETURNING ───────────────────────────────────────
+        if self.sub_phase == PullOverPhase.WAITING:
+            if self.ev_yield_conditions:
+                all_cleared = all(
+                    self._ev_condition_cleared(c, scene_data, prediction_data)
+                    for c in self.ev_yield_conditions
+                )
+            else:
+                # FIX: If there are no EV conditions dictating we should wait, the coast is clear.
+                all_cleared = True
 
-            elif self.sub_phase is PullOverPhase.WAITING:
-                if vehicle_passed or not has_vehicle:
-                    self.sub_phase = PullOverPhase.RETURNING
-                    return False, f"Vehicle {vehicle_id} has passed, resuming route"
-
-                return False, f"Waiting for vehicle {vehicle_id} to pass"
-
-            elif self.sub_phase is PullOverPhase.RETURNING:
-                if route_index >= end_idx:
+            if all_cleared:
+                if self.pull_action == Action.PULL_OVER_IN_LANE:
                     self.phase = ActionPhase.CLEARED
-                    self.sub_phase = PullOverPhase.IDLE
-                    self.cur_route_changes = None
-                    return True, f"Completed {cmd_name} maneuver and cleared pull over segment"
+                    return True, "pull_over_in_lane: EV passed, command complete"
+                self.sub_phase = PullOverPhase.RETURNING
+                return False, "pull_over: EV passed, merging back to lane"
 
-                return False, f"Vehicle {vehicle_id} has passed, resuming route"
+        # ── RETURNING → CLEARED ───────────────────────────────────────
+        if self.sub_phase == PullOverPhase.RETURNING:
+            if self.maneuver_end_idx is not None and route_index >= self.maneuver_end_idx:
+                self.phase = ActionPhase.CLEARED
+                return True, "pull_over: return complete, back in lane"
 
-        return False, f"Running {cmd_name}"
+        return False, f"pull_over sub_phase={self.sub_phase.name}"
+
+    # ------------------------------------------------------------------
+    # Main update
+    # ------------------------------------------------------------------
 
     def update_state(
         self,
         *,
-        config,
-        scene_data : SceneData,
-        planner_state : PlannerState,
-        pull_over_dir : RoadOption,
-        vehicle_id : int,
-        vehicle_passed : bool,
-        has_vehicle : bool
+        plan_state         : PlanState,
+        scene_data         : SceneData,
+        planner_state      : PlannerState,
+        prediction_data    : PredictionData,
+        route_shifted_idxs : Optional[Tuple[int, int, int]] = None,
     ) -> CommandStatus:
-        condition_statuses : List[ConditionStatus] = []
-        command_reasons : List[str] = []
-        replan_reasons : List[str] = []
+        pull_over_cmd = plan_state.plan.action
 
-        has_blocking_conditions : bool = False
-        pull_over_cmd = Action.PULL_OVER_LEFT if pull_over_dir == RoadOption.CHANGELANELEFT else Action.PULL_OVER_RIGHT
+        # ── 1. Latch pull action from plan ────────────────────────────
+        if self.pull_action is None:
+            self.pull_action = plan_state.plan.action
 
-        # Update condition state machines first
-        all_conditions = list(self.conditions_registry.values())
-        for cond_sm in all_conditions:
-            cond_status : ConditionStatus = cond_sm.step(
-                config=config,
-                scene_data=scene_data,
-                planner_state=planner_state
-            )
-            # TODO: FIX ONCE ALL THE OTHER CONDITIONS HAVE BEEN ADDED
-            # TODO: CONDITIONS REGISTRY DOES NOT EMPTY FULLY IF INCORRECT ID IS ADDED, LIKELY ARTIFACT OF CURRENT INCOMPLETE IMPLEMENTATION
-            if cond_status is None:
-                continue
+        # ── 2. Step StopFor condition state machines ──────────────────
+        condition_statuses, command_reasons, replan_reasons, has_blocking_conditions = \
+            self._step_conditions(scene_data, planner_state)
 
-            has_blocking_conditions = has_blocking_conditions or cond_status.is_blocking
-            condition_statuses.append(cond_status)
-
-            # Condition has finished
-            if cond_status.phase == ActionPhase.CLEARED:
-                # Remove from conditions registry
-                # TODO: DECIDE WHETHER IT'S WORTH TO TRIM CONDITIONS LIST
-                # self.conditions_registry.pop(cond_status.condition.id)
-
-                # Update cleared actor id registry
-                self.cleared_actor_ids.add(cond_status.condition.id)
-
-                # Check if any conditions have set the replan flag
-                if cond_status.needs_replan:
-                    replan_reasons.append(cond_status.reason)
-
-            # Update command reasons
-            command_reasons.append(cond_status.reason)
-
-        # Update main command state if conditions blocking completion
-        # TODO: CURRENTLY BLOCKS BASED ON EXISTENCE OF CONDITIONS, MIGHT WANNA REVISIT
-        if scene_data.collision_data:
-            self.collision_events.append(scene_data.collision_data[0])
-
-        # Directly set main state to CLEARED if any earlier conditions have set the replan flag
-        if len(replan_reasons) > 0:
-            self.phase = ActionPhase.CLEARED
+        # ── 3. Early-exit: condition-driven replan ────────────────────
+        if replan_reasons:
+            self.phase = ActionPhase.FAILED
             return CommandStatus(
                 cur_cmd=pull_over_cmd,
                 phase=self.phase,
                 is_blocked=False,
                 conditions_status=condition_statuses,
-                reasons=replan_reasons
+                reasons=replan_reasons,
             )
 
-        # Otherwise, step main command and advance state machine as normal
+        # ── 4. Ingest route-shifted indices (first time only) ─────────
+        if route_shifted_idxs is not None and not self.route_shifted:
+            _, wait_idx, end_idx = route_shifted_idxs
+            self.maneuver_wait_idx = wait_idx
+            self.maneuver_end_idx  = end_idx
+            self.route_shifted     = True
+
+        # ── 5. Advance the state machine ─────────────────────────────
         completed, base_reason = self.step(
-            pull_over_dir, planner_state.route_index, scene_data, vehicle_id, vehicle_passed, has_vehicle
+            self.pull_action,
+            planner_state.route_index,
+            scene_data.ego_data.speed,
+            scene_data,
+            prediction_data,
         )
         command_reasons.append(base_reason)
-
-        # Reset blocking conditions, if high-level command is completed
         has_blocking_conditions = False if completed else has_blocking_conditions
 
         return CommandStatus(
@@ -1240,172 +1199,144 @@ class PullOverSM(BaseActionSM):
             phase=self.phase,
             is_blocked=has_blocking_conditions,
             conditions_status=condition_statuses,
-            reasons=command_reasons
+            reasons=command_reasons,
         )
 
 class ShareLaneSM(BaseActionSM):
-    """Tracks temporary route changes during lane shares."""
+    """
+    Tracks temporary lateral route adjustments during lane shares.
+
+    Triggered when oncoming vehicles intrude into the ego lane.
+    The lat planner shifts the path within the source lane to create clearance.
+    Replanning triggers whenever oncoming intruders are detected on the route.
+    The command clears once the ego has passed the maneuver end index and no
+    oncoming intruders remain.
+    """
 
     def __init__(self, config : GlobalConfig):
         super().__init__(config)
-        self.cur_route_changes: Optional[Tuple[int, int]] = None # (start_idx, end_idx)
-        self.target_end_idx: Optional[int] = None
-        self.last_intrusion_idx: Optional[int] = None
-        self.end_locked: bool = False
+
+        self.maneuver_end_idx : Optional[int] = None
+
+        self.lat_plan_status  : LateralPlanStatus = LateralPlanStatus.NONE
+        self.plan_fail_count  : int = 0
+        self.max_plan_failures: int = 5  # TODO: move to config
 
     def reset(self) -> None:
         super().reset()
-        self.cur_route_changes = None
-        self.target_end_idx: Optional[int] = None
-        self.last_intrusion_idx: Optional[int] = None
-        self.end_locked: bool = False
+
+        self.maneuver_end_idx = None
+        self.lat_plan_status  = LateralPlanStatus.NONE
+        self.plan_fail_count  = 0
+
+    def activate(self) -> None:
+        self.phase = ActionPhase.EXECUTING
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
 
     @property
-    def needs_route_adjustment(self) -> bool:
-        """
-        :returns: True if we should plan a new lane share path segment.
-        """
-        if self.cur_route_changes is None:
-            return True
+    def has_active_plan(self) -> bool:
+        return self.is_executing and self.maneuver_end_idx is not None
 
-        if self.target_end_idx is None:
-            return True
+    # ------------------------------------------------------------------
+    # Replanning gate
+    # ------------------------------------------------------------------
 
-        # return self.target_end_idx > self.cur_route_changes[-1]
-        return True
-
-    def set_route_changes(self, route_change_idxs: Optional[Tuple[int, int]]):
-        if route_change_idxs is not None:
-            self.phase = ActionPhase.EXECUTING
-            self.cur_route_changes = route_change_idxs
-
-    def get_target_end_idx(
+    def compute_replan_need(
         self,
-        *,
-        config : GlobalConfig,
-        planner_state : PlannerState,
-        scene_data : SceneData,
+        scene_data      : SceneData,
         prediction_data : PredictionData,
-        actor_registry : Dict[str, Set[int]],
-        target_distance_initial : float,
-        buffer_distance : float,
-    ) -> int:
-        # if self.end_locked and self.target_end_idx is not None:
-        #     return self.target_end_idx
+    ) -> bool:
+        """
+        Returns True if lat_planner.run_step should be called this tick.
 
-        route_index = planner_state.route_index
-        route_len = planner_state.route_len
+        Triggers:
+          1. No lateral plan has been generated yet.
+          2. An oncoming vehicle is currently intruding the route.
+        """
+        if self.lat_plan_status == LateralPlanStatus.NONE:
+            return True
 
-        initial_end_idx = min(
-            route_len - 1,
-            route_index + int(target_distance_initial * config.points_per_meter)
-        )
-        buffer_pts = int(buffer_distance * config.points_per_meter)
+        if scene_data.vehicle_data.get(traffic_type="oncoming", get_intruders=True):
+            return True
 
-        furthest_idx = None
+        return False
 
-        # Get intruders
-        all_intruder_data = scene_data.vehicle_data.get(traffic_type="oncoming", get_intruders=True)
-        if self.target_end_idx is None:
-            self.target_end_idx = initial_end_idx
-
-        if all_intruder_data:
-            self.target_end_idx = initial_end_idx
-
-        print(f'\n\nFINAL SHARE LANE INDEX: {self.target_end_idx}')
-        return self.target_end_idx
+    # ------------------------------------------------------------------
+    # State transition
+    # ------------------------------------------------------------------
 
     def step(self, route_index: int, scene_data: SceneData) -> Tuple[bool, str]:
-        # Check if any lane share adjustments have been made
-        if self.cur_route_changes is None:
-            # Unable to change route, reset and replan
+        cmd_name = 'share_lane'
+
+        if not self.is_executing:
+            self.phase = ActionPhase.FAILED
+            return True, f"Failed to activate {cmd_name}"
+
+        if self.lat_plan_status == LateralPlanStatus.INVALID_FATAL:
+            self.phase = ActionPhase.FAILED
+            return True, f"Failed to generate plan for {cmd_name}"
+
+        if self.lat_plan_status == LateralPlanStatus.NONE:
+            return False, f"Waiting for feasible {cmd_name} plan"
+
+        # Clear when past the maneuver end and no more intruders
+        has_intruders = bool(scene_data.vehicle_data.get(traffic_type="oncoming", get_intruders=True))
+        if self.maneuver_end_idx is not None and route_index >= self.maneuver_end_idx and not has_intruders:
             self.phase = ActionPhase.CLEARED
-            return True, "Unable to modify route, replan"
+            return True, f"Completed {cmd_name} — shared segment cleared"
 
-        if self.phase is ActionPhase.EXECUTING:
-            # Planning error, reset and replan
-            if self.cur_route_changes is None:
-                self.phase = ActionPhase.CLEARED
-                return True, "Not tracking lane share maneuver, replan"
+        return False, f"Running {cmd_name}"
 
-            # Check if current position has passed end point of lane share maneuver
-            _, end_idx = self.cur_route_changes
-            if route_index > end_idx and not scene_data.vehicle_data.get(traffic_type="oncoming", get_intruders=True):
-                self.cur_route_changes = None
-                self.phase = ActionPhase.CLEARED
-                return True, f"Completed share_lane maneuver and cleared shared segment with no more intruding vehicles"
-
-        return False, f"Running share_lane"
+    # ------------------------------------------------------------------
+    # Main update
+    # ------------------------------------------------------------------
 
     def update_state(
         self,
         *,
-        config,
-        scene_data : SceneData,
-        planner_state : PlannerState,
+        scene_data         : SceneData,
+        planner_state      : PlannerState,
+        lat_planner_result : Optional[LatPlannerResult] = None,
     ) -> CommandStatus:
-        condition_statuses : List[ConditionStatus] = []
-        command_reasons : List[str] = []
-        replan_reasons : List[str] = []
-
-        has_blocking_conditions : bool = False
         share_lane_cmd = Action.SHARE_LANE
 
-        # Update condition state machines first
-        all_conditions = list(self.conditions_registry.values())
-        for cond_sm in all_conditions:
-            cond_status : ConditionStatus = cond_sm.step(
-                config=config,
-                scene_data=scene_data,
-                planner_state=planner_state
-            )
-            # TODO: FIX ONCE ALL THE OTHER CONDITIONS HAVE BEEN ADDED
-            # TODO: CONDITIONS REGISTRY DOES NOT EMPTY FULLY IF INCORRECT ID IS ADDED, LIKELY ARTIFACT OF CURRENT INCOMPLETE IMPLEMENTATION
-            if cond_status is None:
-                continue
+        # ── 1. Step condition state machines ─────────────────────────
+        condition_statuses, command_reasons, replan_reasons, has_blocking_conditions = \
+            self._step_conditions(scene_data, planner_state)
 
-            has_blocking_conditions = has_blocking_conditions or cond_status.is_blocking
-            condition_statuses.append(cond_status)
-
-            # Condition has finished
-            if cond_status.phase == ActionPhase.CLEARED:
-                # Remove from conditions registry
-                # TODO: DECIDE WHETHER IT'S WORTH TO TRIM CONDITIONS LIST
-                # self.conditions_registry.pop(cond_status.condition.id)
-
-                # Update cleared actor id registry
-                self.cleared_actor_ids.add(cond_status.condition.id)
-
-                # Check if any conditions have set the replan flag
-                if cond_status.needs_replan:
-                    replan_reasons.append(cond_status.reason)
-
-            # Update command reasons
-            command_reasons.append(cond_status.reason)
-
-        # Update main command state if conditions blocking completion
-        # TODO: CURRENTLY BLOCKS BASED ON EXISTENCE OF CONDITIONS, MIGHT WANNA REVISIT
-        if scene_data.collision_data:
-            self.collision_events.append(scene_data.collision_data[0])
-
-        # Directly set main state to CLEARED if any earlier conditions have set the replan flag
-        if len(replan_reasons) > 0:
-            self.phase = ActionPhase.CLEARED
+        # ── 2. Early-exit: condition-driven replan ────────────────────
+        if replan_reasons:
+            self.phase = ActionPhase.FAILED
             return CommandStatus(
                 cur_cmd=share_lane_cmd,
                 phase=self.phase,
                 is_blocked=False,
                 conditions_status=condition_statuses,
-                reasons=replan_reasons
+                reasons=replan_reasons,
             )
 
-        # Otherwise, step main command and advance state machine as normal
-        completed, base_reason = self.step(
-            planner_state.route_index, scene_data
-        )
+        # ── 3. Update lateral plan status ────────────────────────────
+        if lat_planner_result is not None:
+            if lat_planner_result.is_empty_plan:
+                self.plan_fail_count += 1
+                self.lat_plan_status = (
+                    LateralPlanStatus.INVALID_FATAL
+                    if self.plan_fail_count >= self.max_plan_failures
+                    else LateralPlanStatus.INVALID_TRANSIENT
+                )
+            else:
+                self.lat_plan_status = LateralPlanStatus.VALID
+                self.plan_fail_count = 0
+                if lat_planner_result.is_new_plan:
+                    self.maneuver_end_idx = lat_planner_result.goal_idx
+
+        # ── 4. Advance the state machine ─────────────────────────────
+        completed, base_reason = self.step(planner_state.route_index, scene_data)
         command_reasons.append(base_reason)
 
-        # Reset blocking conditions, if high-level command is completed
         has_blocking_conditions = False if completed else has_blocking_conditions
 
         return CommandStatus(
@@ -1413,5 +1344,5 @@ class ShareLaneSM(BaseActionSM):
             phase=self.phase,
             is_blocked=has_blocking_conditions,
             conditions_status=condition_statuses,
-            reasons=command_reasons
+            reasons=command_reasons,
         )
