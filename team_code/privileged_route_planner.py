@@ -14,7 +14,33 @@ import os
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import List, Dict, Set, Optional
+from enum import Enum
+from typing import List, Dict, Set, Optional, Tuple
+
+
+class IntersectionType(Enum):
+    SIGNALIZED = 0
+    UNSIGNALIZED = 1
+    OTHER = 2
+
+
+@dataclass(frozen=True, slots=True)
+class IntersectionSegment:
+    """Precomputed description of an intersection segment in the global route."""
+    cmd: RoadOption
+    start_idx: int
+    end_idx: int
+    signalized: IntersectionType
+
+
+@dataclass(frozen=True, slots=True)
+class LaneChangeSegment:
+    """Precomputed description of a lane change segment in the global route."""
+    cmd: RoadOption
+    start_idx: int
+    end_idx: int
+    boundary_idx: int  # first route index where the lane ID changes
+
 
 @dataclass(frozen=True, slots=True)
 class PlannerState:
@@ -32,9 +58,16 @@ class PlannerState:
     cleared_stop_sign_ids : Set[int]
     route_bbs : List[carla.BoundingBox]
     s_route : np.ndarray
+
     original_route_points : np.ndarray
+    original_rotation_angles : np.ndarray
+    original_route_s : np.ndarray
     original_route_waypoints : List[carla.Waypoint]
     original_route_bbs : List[carla.BoundingBox]
+
+    # Precomputed segment lists — updated whenever the global route changes
+    intersection_segments : List[IntersectionSegment]
+    lane_change_segments : List[LaneChangeSegment]
 
 class PrivilegedRoutePlanner(object):
   """
@@ -89,6 +122,10 @@ class PrivilegedRoutePlanner(object):
     # NOTE: Cleared stop sign state tracker for trajectory_planner
     self.cleared_stop_sign_ids = set()
 
+    # Precomputed route segment lists (populated by _compute_route_segments)
+    self.intersection_segments : List[IntersectionSegment] = []
+    self.lane_change_segments : List[LaneChangeSegment] = []
+
     self.route_index = 0
     self.last_route_index = 0
 
@@ -119,8 +156,12 @@ class PrivilegedRoutePlanner(object):
          route_bbs = self.route_bbs,
          s_route = self.s_route,
          original_route_points=self.original_route_points,
-         original_route_waypoints=self.original_route_waypoints,
-         original_route_bbs=self.original_route_bbs,
+         original_rotation_angles=self.rotation_angles.copy(),
+         original_route_s=self.s_route.copy(),
+         original_route_waypoints=self.route_waypoints.copy(),
+         original_route_bbs=self.route_bbs.copy(),
+         intersection_segments=self.intersection_segments,
+         lane_change_segments=self.lane_change_segments,
       )
 
   def update_cleared_stop_signs(self, stop_sign_id : int):
@@ -281,6 +322,8 @@ class PrivilegedRoutePlanner(object):
                                             while a value of 0.0 means the route will stay in the center of
                                                 the current lane.
         """
+    route_pts_new = self.route_points[start_index:end_index].copy()
+
     for idx in range(start_index, end_index):
       # Get the location of the left / right center lane
       if shift_to_left_lane:
@@ -308,8 +351,10 @@ class PrivilegedRoutePlanner(object):
           self.commands[idx] = RoadOption.CHANGELANELEFT
 
       # The actual route shift
-      self.route_points[idx] = lane_transition_factor * transition_factor * loc + (
-          1. - lane_transition_factor * transition_factor) * self.route_points[idx]
+      route_pts_new[idx - start_index] = lane_transition_factor * transition_factor * loc + (
+          1. - lane_transition_factor * transition_factor) * route_pts_new[idx - start_index]
+
+    self.rebuild_global_plan(route_pts_new=route_pts_new, start_idx=start_index, goal_idx=end_index)
 
   def get_closest_route_index(self, begin_idx, location):
     """
@@ -467,9 +512,28 @@ class PrivilegedRoutePlanner(object):
       self.route_index = 0
       self.last_route_index = 0
 
-      # cmds.insert(0, RoadOption.CHANGELANELEFT)
-      # route_waypoints.insert(0, carla_map.get_waypoint(vehicle_loc, lane_type=carla.LaneType.Any))
-      cmds[0] = RoadOption.CHANGELANELEFT
+      # NOTE: Original hop resolution for leaderboard challenge set to 1.0. Called in route_scenario.py, defined in route_manipulation.py
+      # Here we're enforcing a minimum 5.0m lane change distance
+      num_hops = 5
+      route_waypoints = route_waypoints[num_hops:]
+      cmds = cmds[num_hops:]
+
+      # print(f'\n\nORIGINAL WAYPOINTS')
+      # print(f'\tSTART_WP: {start_wp.transform.location}, SECOND_WP: {second_wp.transform.location}, THIRD: {third_wp.transform.location}')
+      # print(f'\tDIST TO SECOND: {start_wp.transform.location.distance(second_wp.transform.location)}, DIST TO THIRD: {start_wp.transform.location.distance(third_wp.transform.location)}')
+
+      start_wp = carla_map.get_waypoint(vehicle_loc, lane_type=carla.LaneType.Any)
+      next_wps = start_wp.next(1)
+      if len(next_wps) != 0:
+        route_waypoints.insert(0, next_wps[0])
+        cmds.insert(0, RoadOption.CHANGELANELEFT)
+
+      route_waypoints.insert(0, start_wp)
+      cmds.insert(0, RoadOption.LANEFOLLOW)
+
+      # route_wp = carla_map.get_waypoint(vehicle_loc, lane_type=carla.LaneType.Parking)
+      # route_waypoints[0] = route_wp
+      # cmds[0] = RoadOption.CHANGELANELEFT
     else:
       # Add extra waypoints at the beginning of the route
       for _ in range(self.extra_route_length):
@@ -502,7 +566,7 @@ class PrivilegedRoutePlanner(object):
     # Get the waypoint objects for the route points
     self.route_waypoints = []
     for route_loc in self.route_points:
-      wp = carla_map.get_waypoint(carla.Location(x=route_loc[0], y=route_loc[1], z=route_loc[2]))
+      wp = carla_map.get_waypoint(carla.Location(x=route_loc[0], y=route_loc[1], z=route_loc[2]), lane_type=carla.LaneType.Any)
       self.route_waypoints.append(wp)
 
     self.compute_route_info(carla_world, carla_map)
@@ -602,14 +666,196 @@ class PrivilegedRoutePlanner(object):
       route_points = self.route_points,
       route_yaws=self.rotation_angles,
       route_waypoints=self.route_waypoints,
-      stride=self.config.points_per_meter
     )
-    self.original_route_waypoints = self.route_waypoints.copy()
-    self.original_route_bbs = self.route_bbs.copy()
-
     self.s_route = self.cumulative_arclength(
       route_points=self.route_points
     )
+
+    # Build the precomputed segment lists after all route data is ready
+    self._compute_route_segments()
+
+  # Distance threshold (m) used to classify intersections as signalized
+  _SIGNALIZED_THRESHOLD_M = 10.0
+
+  def _compute_route_segments(self) -> None:
+    """Scan the current route and populate intersection_segments and lane_change_segments.
+
+    This is called once after setup_route finishes and again after any in-place
+    route modification (rebuild_global_plan, _interpolate_lateral_plan).
+    """
+    route_wps  = self.route_waypoints
+    route_cmds = self.commands
+    n = len(route_cmds)
+
+    intersection_segments : List[IntersectionSegment] = []
+    lane_change_segments  : List[LaneChangeSegment]   = []
+
+    i = 0
+    while i < n:
+        cmd = route_cmds[i]
+        wp  = route_wps[i]
+
+        if wp.is_junction and cmd in (RoadOption.LEFT, RoadOption.STRAIGHT, RoadOption.RIGHT):
+            start_idx = i
+            end_idx   = start_idx
+            while end_idx < n - 1 and route_cmds[end_idx] == cmd:
+                end_idx += 1
+
+            # Signalization is determined from the precomputed TL/stop-sign distance
+            # at the segment entrance — this captures the signalization context even
+            # after the vehicle has passed the traffic control device.
+            dist_tl = self.distances_to_next_traffic_lights[start_idx]
+            dist_ss = self.distances_to_next_stop_signs[start_idx]
+            thr = self._SIGNALIZED_THRESHOLD_M
+            if (dist_tl != np.inf and dist_tl < thr) or (dist_ss != np.inf and dist_ss < thr):
+                signalized = IntersectionType.SIGNALIZED
+            else:
+                signalized = IntersectionType.UNSIGNALIZED
+
+            intersection_segments.append(IntersectionSegment(
+                cmd=cmd,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                signalized=signalized,
+            ))
+            i = end_idx + 1
+
+        elif cmd in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
+            start_idx = i
+            end_idx   = start_idx
+            while end_idx < n - 1 and route_cmds[end_idx] == cmd:
+                end_idx += 1
+
+            # Locate the first route index where the lane ID changes
+            start_lane_id = route_wps[start_idx].lane_id
+            boundary_idx  = start_idx
+            for j in range(start_idx, end_idx + 1):
+                if route_wps[j].lane_id != start_lane_id:
+                    boundary_idx = j
+                    break
+
+            lane_change_segments.append(LaneChangeSegment(
+                cmd=cmd,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                boundary_idx=boundary_idx,
+            ))
+            i = end_idx + 1
+
+        else:
+            i += 1
+
+    self.intersection_segments = intersection_segments
+    self.lane_change_segments  = lane_change_segments
+
+  def recompute_route_segments(self) -> None:
+    """Public hook: rebuild segment lists after any in-place route modification."""
+    self._compute_route_segments()
+
+  def rebuild_global_plan(
+    self,
+    route_pts_new : np.ndarray,
+    start_idx : int,
+    goal_idx : int,
+  ) -> None:
+      start_point = self.route_points[start_idx]
+      goal_point = self.route_points[goal_idx]
+
+      # Recompute route yaws
+      indices = np.arange(1, route_pts_new.shape[0] - 1)
+      diffs = route_pts_new[indices + 1] - route_pts_new[indices - 1]
+      route_yaws_new = np.arctan2(diffs[:, 1], diffs[:, 0]) * 180. / np.pi
+
+      # Start point yaw using yaw of original start point
+      route_yaw_new_start = self.rotation_angles[start_idx]
+
+      # Goal point yaw using last interpolated point and true goal point
+      dx = goal_point[0] - route_pts_new[-1, 0]
+      dy = goal_point[1] - route_pts_new[-1, 1]
+      route_yaw_new_goal = np.degrees(np.arctan2(dy, dx))
+      route_yaws_new = np.concatenate([[route_yaw_new_start], route_yaws_new, [route_yaw_new_goal]])
+
+      # Recompute lane bounding boxes
+      route_bbs_new = self.generate_route_bbs(
+          route_points=route_pts_new,
+          route_yaws=route_yaws_new,
+          route_waypoints=self.route_waypoints[start_idx:goal_idx],
+      )
+
+      # Overwrite only [start_idx : goal_idx), leave goal_idx as-is
+      self.route_points[start_idx:goal_idx] = route_pts_new
+
+      # Recompute route cumulative distances
+      s_route_new = self.cumulative_arclength(
+          route_points=self.route_points[start_idx:],
+      ) + self.s_route[start_idx]
+
+      self.rotation_angles[start_idx:goal_idx] = route_yaws_new
+
+      self.s_route[start_idx:] = s_route_new
+
+      bb_start_idx = self.config.dense_route_idx_to_bb_route_idx(start_idx)
+      bb_goal_idx = self.config.dense_route_idx_to_bb_route_idx(goal_idx)
+      self.route_bbs[bb_start_idx : bb_goal_idx] = route_bbs_new
+
+      self.recompute_route_segments()
+
+  def shift_route_single_direction(self,
+                                 start_index,
+                                 end_index,
+                                 shift_to_left_lane,
+                                 transition_length,
+                                 lane_transition_factor=1.):
+    """
+    Generate a smooth lane change transition exactly between the start and end indices,
+    overriding any sharp jumps that exist in the base route.
+
+    Args:
+        start_index (int): The index of the route waypoint where the shift should start.
+        end_index (int): The index of the route waypoint where the shift should end.
+        shift_to_left_lane (bool): Whether to shift the route to the left lane.
+        lane_transition_factor (float): A factor between 0 and 1 that controls the amount of shift towards
+                                            the neighboring lane.
+    """
+    # Identify the lane ID where the maneuver begins to detect when the base route jumps
+    start_lane_id = self.route_waypoints[start_index].lane_id
+    route_pts_new = self.route_points[start_index:end_index].copy()
+
+    for idx in range(start_index, end_index):
+        current_wp = self.route_waypoints[idx]
+
+        # 1. Determine the continuous reference points for both the Start Lane and Target Lane
+        if current_wp.lane_id == start_lane_id:
+            # The base route is still in the original lane geographically
+            loc_start = current_wp.transform.location
+            target_wp = current_wp.get_left_lane() if shift_to_left_lane else current_wp.get_right_lane()
+            loc_target = target_wp.transform.location if target_wp else loc_start
+        else:
+            # The base route has already made the sharp jump to the target lane
+            loc_target = current_wp.transform.location
+            # To get the start lane, we must look back in the opposite direction
+            start_wp = current_wp.get_right_lane() if shift_to_left_lane else current_wp.get_left_lane()
+            loc_start = start_wp.transform.location if start_wp else loc_target
+
+        # Convert to numpy arrays for calculation
+        loc_start_arr = np.array([loc_start.x, loc_start.y, loc_start.z])
+        loc_target_arr = np.array([loc_target.x, loc_target.y, loc_target.z])
+
+        # 2. Calculate the transition factor and clamp to 1.0 max
+        fraction = min(1.0, float(idx - start_index) / transition_length)
+        transition_factor = self._smooth_transition(fraction) * lane_transition_factor
+
+        # 3. Apply commands
+        if shift_to_left_lane:
+            self.commands[idx] = RoadOption.CHANGELANELEFT
+        else:
+            self.commands[idx] = RoadOption.CHANGELANERIGHT
+
+        # 4. Interpolate cleanly between the Start Lane and Target Lane
+        # self.route_points[idx] = (1.0 - transition_factor) * loc_start_arr + transition_factor * loc_target_arr
+        route_pts_new[idx - start_index] = (1.0 - transition_factor) * loc_start_arr + transition_factor * loc_target_arr
+
+    self.rebuild_global_plan(route_pts_new=route_pts_new, start_idx=start_index, goal_idx=end_index)
 
   def cumulative_arclength(
     self,
@@ -626,23 +872,24 @@ class PrivilegedRoutePlanner(object):
     route_yaws : np.ndarray,
     route_waypoints : List[carla.Waypoint],
     *,
-    stride : int,
     from_index : Optional[int] = None,
     to_index : Optional[int] = None,
-    spacing_m : int = 2,
-    buffer_lat : float = 0.0,
-    buffer_lon : float = 0.25,
   ) -> List[carla.BoundingBox]:
+    stride = self.config.points_per_meter
+    spacing_m = self.config.route_bbox_m_per_point
+    buffer_lon = self.config.long_buffer_m
+    buffer_lat = self.config.lat_buffer_m
+
     route_bbs : List[carla.BoundingBox] = []
 
     # TODO: VERIFY IF OFF BY ONE INDEXING PROBLEMS EXIST
     from_index = 0 if from_index is None else from_index
     to_index = len(route_waypoints) - 1 if to_index is None else to_index
 
-    half_len = 0.5 * float(spacing_m) + float(buffer_lon)
-    for i in range(from_index, to_index + 1, stride * spacing_m):
-      lane_width = route_waypoints[i].lane_width
-      half_wid = 0.5 * float(lane_width) + float(buffer_lat)
+    half_len = 0.5 * spacing_m + buffer_lon
+    bbox_stride = int(stride * spacing_m)
+    for i in range(from_index, to_index + 1, bbox_stride):
+      half_wid = float(self.config.ego_extent_y) + float(buffer_lat)
 
       extent = carla.Vector3D(x=half_len, y=half_wid, z=1.0)
 
@@ -923,522 +1170,6 @@ class PrivilegedRoutePlanner(object):
         same_dir_wps.insert(0, left_wp)
 
     return same_dir_wps
-
-  def get_opposite_dir_lanes(self, waypoint):
-    """
-      Gets all the lanes with opposite direction of the road of a wp
-      Ordered from the center lane to the edge one (from inwards to outwards)
-
-      Args:
-          waypoint (carla.Waypoint): Waypoint to start the search from.
-
-      Returns:
-          list: List of waypoints with opposite direction of the road.
-    """
-    other_dir_wps = []
-    other_dir_wp = None
-
-    # Get the first lane of the opposite direction
-    left_wp = waypoint
-    while True:
-        possible_left_wp = left_wp.get_left_lane()
-        if possible_left_wp is None:
-            break
-        if possible_left_wp.lane_id * left_wp.lane_id < 0:
-            other_dir_wp = possible_left_wp
-            break
-        left_wp = possible_left_wp
-
-    if not other_dir_wp:
-        return other_dir_wps
-
-    # Check roads on the right
-    right_wp = other_dir_wp
-    while True:
-        if right_wp.lane_type == carla.LaneType.Driving:
-            other_dir_wps.append(right_wp)
-        possible_right_wp = right_wp.get_right_lane()
-        if possible_right_wp is None:
-            break
-        right_wp = possible_right_wp
-
-    return other_dir_wps
-
-  def create_junction_map(self, junction_wp):
-      junction_connections = None
-
-      if junction_wp:
-          junction_obj = junction_wp.get_junction()
-          print(f'Junction ID: {junction_obj.id}')
-
-          # Get the junction waypoints
-          junction_wps = junction_obj.get_waypoints(carla.LaneType.Driving)
-
-          # Identify the unique entry and exit waypoints
-          junction_connection_map = defaultdict(set)
-          for entry_wp, exit_wp in junction_wps:
-              # TODO MAY NEED TO FIX THIS
-              entry_connection_wp = entry_wp.previous(0.25)[0]
-              exit_connection_wp = exit_wp.next(0.25)[0]
-
-              entry_connection_key = (entry_connection_wp.lane_id, entry_connection_wp.road_id)
-              exit_connection_key = (exit_connection_wp.lane_id, exit_connection_wp.road_id)
-
-              # Bidirectional key
-              connection_key = frozenset({entry_connection_key, exit_connection_key})
-
-              # Store junction lanelet connections
-              connection_data = (entry_connection_wp, entry_wp, exit_wp, exit_connection_wp)
-              junction_connection_map[connection_key].add(connection_data)
-
-          # Create a reverse index for the junction waypoints
-          junction_connections = defaultdict(set)
-          for key, connections in junction_connection_map.items():
-              for lane_id, road_id in key:
-                  junction_connections[(lane_id, road_id)].update(connections)
-
-      return junction_connections
-
-  def get_junction_connections(self, junction_map, lane_wp):
-      lanelet = None
-      lane_wp_key = (lane_wp.lane_id, lane_wp.road_id)
-      lane_connections = junction_map.get(lane_wp_key, None)
-      if lane_connections:
-          # print(f'\tLane Connections: {len(lane_connections)}')
-          for lane_connection in lane_connections:
-              entry_connection_wp, entry_wp, exit_wp, exit_connection_wp = lane_connection
-              # print(f'\t\tEntry Connection Waypoint Lane ID: {entry_connection_wp.lane_id}, Road ID: {entry_connection_wp.road_id}')
-              # print(f'\t\tEntry Waypoint Lane ID: {entry_wp.lane_id}, Road ID: {entry_wp.road_id}')
-              # print(f'\t\tExit Waypoint Lane ID: {exit_wp.lane_id}, Road ID: {exit_wp.road_id}')
-              # print(f'\t\tExit Connection Waypoint Lane ID: {exit_connection_wp.lane_id}, Road ID: {exit_connection_wp.road_id}')
-
-              lanelet = (entry_wp, exit_connection_wp)
-
-      return lanelet
-
-  def get_leading_vehicles(self, carla_map, npc_vehicles, traffic_type):
-    """
-        Get the instances of vehicles leading ahead of the ego vehicle.
-
-        Args:
-            carla_map (carla.Map): Carla map instance.
-            npc_vehicles (list): List of all NPC vehicles.
-            traffic_type (str): Type of traffic to consider (either "ongoing" or "oncoming").
-
-        Returns:
-            dict: Dictionary containing the leading vehicles grouped by their target lane IDs.
-    """
-    if npc_vehicles and self.route_index != self.route_points.shape[0]:
-        # Get the current ego waypoint
-        ego_wp = self.route_waypoints[self.route_index]
-        leading_max_detection_radius = self.config.leading_vehicles_maximum_detection_radius
-
-        # Get the lanes in the same direction and opposite direction as the ego vehicle
-        same_lanes = self.get_same_dir_lanes(ego_wp)
-        opposite_lanes = self.get_opposite_dir_lanes(ego_wp)
-
-        # Check if the ego is near a junction
-        junction_wp = None
-        for i in range(min(leading_max_detection_radius, len(self.route_waypoints[self.route_index:]))):
-            if self.route_waypoints[self.route_index + i].is_junction:
-                junction_wp = self.route_waypoints[self.route_index + i]
-                break
-
-        junction_connections = self.create_junction_map(junction_wp)
-        if junction_connections:
-            color_entry_connection = carla.Color(255, 0, 0, 255)
-            color_entry = carla.Color(255, 255, 0, 255)
-            color_exit = carla.Color(0, 255, 255, 255)
-            color_exit_connection = carla.Color(0, 0, 255, 255)
-
-            same_lane_junction_wps = set()
-            opposite_lane_junction_wps = set()
-            # for same_lane_wp in same_lanes:
-            #     print(f'Same Lane Waypoint Lane ID: {same_lane_wp.lane_id}, Road ID: {same_lane_wp.road_id}')
-            #     lanelet = self.get_junction_connections(junction_connections, same_lane_wp)
-            #     if lanelet:
-            #         entry_wp, exit_connection_wp = lanelet
-            #         same_lane_junction_wps.add(entry_wp)
-            #         same_lane_junction_wps.add(exit_connection_wp)
-
-            #         # Draw the junction waypoints
-            #         self._world.debug.draw_point(same_lane_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_entry_connection, life_time=0.)
-            #         # self._world.debug.draw_point(entry_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_entry, life_time=0.)
-            #         # self._world.debug.draw_point(exit_connection_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_exit, life_time=0.)
-
-            for opposite_lane_wp in opposite_lanes:
-                # print(f'Opposite Lane Waypoint Lane ID: {opposite_lane_wp.lane_id}, Road ID: {opposite_lane_wp.road_id}')
-                lanelet = self.get_junction_connections(junction_connections, opposite_lane_wp)
-                if lanelet:
-                    entry_wp, exit_connection_wp = lanelet
-                    opposite_lane_junction_wps.add(entry_wp)
-                    opposite_lane_junction_wps.add(exit_connection_wp)
-
-                    # Draw the junction waypoints
-                    # self._world.debug.draw_point(opposite_lane_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_entry_connection, life_time=0.)
-                    # self._world.debug.draw_point(entry_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_entry, life_time=0.)
-                    # self._world.debug.draw_point(exit_connection_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_exit, life_time=0.)
-
-            # junction_wps = junction_wp.get_junction().get_waypoints(carla.LaneType.Driving)
-            # for entry_exit_pair in junction_wps:
-            #     entry_wp = entry_exit_pair[0]
-            #     exit_wp = entry_exit_pair[1]
-
-            #     # Draw the junction waypoints
-            #     self._world.debug.draw_point(entry_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_entry, life_time=0.)
-            #     self._world.debug.draw_point(exit_wp.transform.location + carla.Location(z=0.1), size=0.25, color=color_exit, life_time=0.)
-
-            same_lanes = same_lanes + list(same_lane_junction_wps)
-            opposite_lanes = opposite_lanes + list(opposite_lane_junction_wps)
-
-        # Get NPC waypoints for lane filtering
-        vehicle_waypoints = [carla_map.get_waypoint(vehicle.get_location()) for vehicle in npc_vehicles]
-
-        # Filter NPC vehicles based on lane direction
-        valid_npc_vehicles = []
-        if traffic_type == "ongoing":
-            target_lanes = same_lanes
-        elif traffic_type == "oncoming":
-            target_lanes = opposite_lanes
-            # Add the ego waypoint to the target lanes to check for oncoming vehicles invading the lane
-            target_lanes.append(ego_wp)
-
-        target_lane_road_ids = {(wp.lane_id, wp.road_id) for wp in target_lanes}
-        valid_npc_vehicles = [
-            (npc_vehicles[i], wp.lane_id)
-            for i, wp in enumerate(vehicle_waypoints)
-            if (wp.lane_id, wp.road_id) in target_lane_road_ids
-        ]
-
-        # Check if there are valid NPC vehicles
-        if self.previous_leading_vehicle_ids[traffic_type].size > 0:
-            # Check if previous leading vehicle IDs are still valid
-            for i, vehicle in enumerate(npc_vehicles):
-                if vehicle.id in self.previous_leading_vehicle_ids[traffic_type] and (vehicle, vehicle_waypoints[i].lane_id) not in valid_npc_vehicles:
-                    valid_npc_vehicles.append((vehicle, vehicle_waypoints[i].lane_id))
-
-        if not valid_npc_vehicles:
-            print(f"No valid NPC vehicles found for {traffic_type} leading traffic.")
-            return {}
-
-        # print(f"Valid NPC vehicles for {traffic_type} traffic:")
-        # for vehicle, lane_id in valid_npc_vehicles:
-        #     print(f"\tID: {vehicle.id}, Lane ID: {lane_id}, Road ID: {carla_map.get_waypoint(vehicle.get_location()).road_id}")
-        min_lane_id = min(valid_npc_vehicles, key=lambda x: x[1])[1]
-        max_lane_id = max(valid_npc_vehicles, key=lambda x: x[1])[1]
-
-        # for vehicle, lane_id in valid_npc_vehicles:
-        #     print(f"Vehicle {vehicle.id} is in lane {lane_id}")
-
-        # Get the IDs, locations, and yaw angles of all NPC vehicles
-        vehicle_ids = np.array([vehicle.id for vehicle, _ in valid_npc_vehicles])
-        vehicle_locations = np.array([[vehicle.get_location().x, vehicle.get_location().y, vehicle.get_location().z] for vehicle, _ in valid_npc_vehicles])
-        vehicle_yaws = np.array([vehicle.get_transform().rotation.yaw for vehicle, _ in valid_npc_vehicles])
-
-        # Compute relative distances each NPC vehicle with the ego's route points
-        # Returns a 3D array with shape (num_vehicles, num_route_points, 2)
-        relative_positions = vehicle_locations[:, np.newaxis, :2] - \
-          self.route_points[np.newaxis, self.route_index:self.route_index + leading_max_detection_radius, :2][:, ::self.config.points_per_meter, :]
-
-        # Compute the relative distances
-        # Returns a 2D array with shape (num_vehicles, num_route_points)
-        relative_distances = np.linalg.norm(relative_positions, axis=2)
-
-        # Get the indices of the minimum distances
-        route_indices = relative_distances.argmin(axis=1)
-
-        # Get the minimum distance for each NPC vehicle
-        min_distances = relative_distances[np.arange(len(route_indices)), route_indices]
-
-        # Get the yaw angles of the route points
-        rotation_angles = self.rotation_angles[self.route_index:self.route_index + leading_max_detection_radius][::self.points_per_meter]
-        route_yaws = rotation_angles[route_indices]
-        yaw_differences = (route_yaws - vehicle_yaws) % 360
-        yaw_differences = np.minimum(yaw_differences, 360 - yaw_differences)
-
-        # Define the maximum distance and yaw difference thresholds
-        # Get the maximum lane offset from the ego vehicle's lane id
-        max_lane_offset = max(abs(min_lane_id - ego_wp.lane_id), abs(max_lane_id - ego_wp.lane_id))
-        max_distance = self.config.leading_vehicles_max_route_distance * (1 + max_lane_offset)
-
-        ego_fwd_vec = self.route_waypoints[self.route_index].transform.get_forward_vector()
-        ego_fwd_vec = np.array([ego_fwd_vec.x, ego_fwd_vec.y])
-
-        # Filter leading vehicles based on traffic type
-        yaw_indices = []
-        if traffic_type == "ongoing":
-            max_yaw_difference = self.config.leading_vehicles_max_route_angle_ongoing
-            # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' relative locations to the ego
-            # Used to assert leading vehicles are in front of the ego vehicle
-            ego_actor_vec = vehicle_locations[:, :2] - self.route_points[self.route_index, :2]
-            loc_dot_products = np.sum(ego_actor_vec * ego_fwd_vec, axis=1)
-
-            yaw_indices = np.where((yaw_differences < max_yaw_difference) & (loc_dot_products >= 0))[0]
-
-        elif traffic_type == "oncoming":
-            # print(f'Yaw differences: {yaw_differences}, Max yaw difference: {self.config.leading_vehicles_max_route_angle_oncoming}')
-            # print(f'Distance: {min_distances}, Max distance: {max_distance}')
-            max_yaw_difference = self.config.leading_vehicles_max_route_angle_oncoming
-
-            vehicle_fwd_vecs = np.array([
-              [vehicle.get_transform().get_forward_vector().x, vehicle.get_transform().get_forward_vector().y]
-              for vehicle, _ in valid_npc_vehicles
-            ])
-            # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' forward vectors
-            # Used to assert leading vehicles are traveling in the opposite direction to the ego vehicle
-            heading_dot_products = np.sum(vehicle_fwd_vecs * ego_fwd_vec, axis=1)
-
-            # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' relative locations to the ego
-            # Used to assert leading vehicles are in front of the ego vehicle
-            ego_actor_vec = vehicle_locations[:, :2] - self.route_points[self.route_index, :2]
-            loc_dot_products = np.sum(ego_actor_vec * ego_fwd_vec, axis=1)
-
-            # for idx, vehicle_id in enumerate(vehicle_ids):
-            #    print(f'Vehicle ID: {vehicle_id}\n \tYaw Difference: {yaw_differences[idx]}, Min Distance: {min_distances[idx]}, Heading Dot Product: {heading_dot_products[idx]}, Location Dot Product: {loc_dot_products[idx]}')
-
-            # NOTE THE YAW DIFFERENCE ONLY WORKS WHEN THE ROUTE IS STRAIGHT. DURING TURNS, THE YAW DIFFERENCE IS A LOT LOWER EVEN THOUGH THE VEHICLES CROSSING THE EGO'S PATH ARE STILL ONCOMING TRAFFIC
-            # yaw_indices = np.where((yaw_differences > max_yaw_difference) & (heading_dot_products < 0) & (loc_dot_products >= 0))[0]
-            yaw_indices = np.where((heading_dot_products < 0) & (loc_dot_products >= 0))[0]
-
-        yaw_mask = np.zeros_like(vehicle_ids, dtype=bool)
-        yaw_mask[yaw_indices] = True
-
-        # Usually the road is 3.5 m wide, but in case of ParkingCrossingPedestrian it's less
-        leading_vehicle_ids = vehicle_ids[(min_distances < max_distance) & yaw_mask]
-        # leading_vehicle_ids = vehicle_ids[yaw_mask]
-        # print(f"Leading vehicle IDs for {traffic_type} traffic: {leading_vehicle_ids}")
-        self.previous_leading_vehicle_ids[traffic_type] = leading_vehicle_ids
-
-        # Group leading vehicles by their target lane ids
-        leading_vehicle_groups = {}
-        for target_lane_wp in target_lanes:
-            # print(f'Target Lane Waypoint Lane ID: {target_lane_wp.lane_id}, Road ID: {target_lane_wp.road_id}')
-            leading_vehicle_groups[target_lane_wp.lane_id] = []
-            for vehicle, lane_id in valid_npc_vehicles:
-                # print(f'\tVehicle ID: {vehicle.id}, Lane ID: {lane_id}, Road ID: {carla_map.get_waypoint(vehicle.get_location()).road_id}')
-                if vehicle.id in leading_vehicle_ids and lane_id == target_lane_wp.lane_id:
-                    leading_vehicle_groups[target_lane_wp.lane_id].append(vehicle)
-
-        return leading_vehicle_groups
-    else:
-        return {}
-
-  def get_trailing_vehicles(self, carla_map, npc_vehicles, traffic_type):
-    """
-        Get the instances of vehicles trailing behind the ego vehicle.
-
-        Args:
-            carla_map (carla.Map): Carla map instance.
-            npc_vehicles (list): List of all NPC vehicles.
-            traffic_type (str): Type of traffic to consider (either "ongoing" or "oncoming").
-
-        Returns:
-            dict: Dictionary containing the trailing vehicles grouped by their target lane IDs.
-    """
-    if npc_vehicles and self.route_index != 0:
-        # Get the current ego waypoint
-        ego_wp = self.route_waypoints[self.route_index]
-
-        # Get the lanes in the same direction and opposite direction as the ego vehicle
-        same_lanes = self.get_same_dir_lanes(ego_wp)
-        opposite_lanes = self.get_opposite_dir_lanes(ego_wp)
-
-        trailing_max_detection_radius = self.config.tailing_vehicles_maximum_detection_radius
-
-        # Get NPC waypoints for lane filtering
-        vehicle_waypoints = [carla_map.get_waypoint(vehicle.get_location()) for vehicle in npc_vehicles]
-
-        # Filter NPC vehicles based on lane direction
-        valid_npc_vehicles = []
-        if traffic_type == "ongoing":
-            target_lanes = same_lanes
-        elif traffic_type == "oncoming":
-            target_lanes = opposite_lanes
-            # Add the ego waypoint to the target lanes to check for oncoming vehicles invading the lane
-            target_lanes.append(ego_wp)
-
-        target_lane_road_ids = {(wp.lane_id, wp.road_id) for wp in target_lanes}
-        valid_npc_vehicles = [
-            (npc_vehicles[i], wp.lane_id)
-            for i, wp in enumerate(vehicle_waypoints)
-            if (wp.lane_id, wp.road_id) in target_lane_road_ids
-        ]
-
-        # Check if there are valid NPC vehicles
-        if self.previous_trailing_vehicle_ids[traffic_type].size > 0:
-            # Check if previous trailing vehicle IDs are still valid
-            for i, vehicle in enumerate(npc_vehicles):
-                if vehicle.id in self.previous_trailing_vehicle_ids[traffic_type] and (vehicle, vehicle_waypoints[i].lane_id) not in valid_npc_vehicles:
-                    valid_npc_vehicles.append((vehicle, vehicle_waypoints[i].lane_id))
-
-        if not valid_npc_vehicles:
-            print(f"No valid NPC vehicles found for {traffic_type} trailing traffic.")
-            return {}
-
-        # print(f"Valid NPC vehicles for {traffic_type} traffic:")
-        # for vehicle, lane_id in valid_npc_vehicles:
-        #     print(f"\tID: {vehicle.id}")
-
-        min_lane_id = min(valid_npc_vehicles, key=lambda x: x[1])[1]
-        max_lane_id = max(valid_npc_vehicles, key=lambda x: x[1])[1]
-
-        # Get the IDs, locations, and yaw angles of all NPC vehicles
-        vehicle_ids = np.array([vehicle.id for vehicle, _ in valid_npc_vehicles])
-        vehicle_locations = np.array([[vehicle.get_location().x, vehicle.get_location().y, vehicle.get_location().z] for vehicle, _ in valid_npc_vehicles])
-        vehicle_yaws = np.array([vehicle.get_transform().rotation.yaw for vehicle, _ in valid_npc_vehicles])
-
-        # Compute relative distances each NPC vehicle with the ego's route points
-        # Returns a 3D array with shape (num_vehicles, num_route_points, 2)
-        from_idx = max(0, self.route_index - trailing_max_detection_radius)
-        relative_positions = vehicle_locations[:, np.newaxis, :2] - \
-          self.route_points[np.newaxis, from_idx:self.route_index, :2][:, ::self.config.points_per_meter, :]
-
-        # Compute the relative distances
-        # Returns a 2D array with shape (num_vehicles, num_route_points)
-        relative_distances = np.linalg.norm(relative_positions, axis=2)
-
-        # Get the indices of the minimum distances
-        route_indices = relative_distances.argmin(axis=1)
-
-        # Get the minimum distance for each NPC vehicle
-        min_distances = relative_distances[np.arange(len(route_indices)), route_indices]
-
-        # Get the yaw angles of the route points
-        rotation_angles = self.rotation_angles[from_idx:self.route_index][::self.points_per_meter]
-        route_yaws = rotation_angles[route_indices]
-        yaw_differences = (route_yaws - vehicle_yaws) % 360
-        yaw_differences = np.minimum(yaw_differences, 360 - yaw_differences)
-
-        # Define the maximum distance and yaw difference thresholds
-        max_lane_offset = max(abs(min_lane_id - ego_wp.lane_id), abs(max_lane_id - ego_wp.lane_id))
-        max_distance = self.config.trailing_vehicles_max_route_distance * (1 + max_lane_offset)
-
-        ego_fwd_vec = self.route_waypoints[self.route_index].transform.get_forward_vector()
-        ego_fwd_vec = np.array([ego_fwd_vec.x, ego_fwd_vec.y])
-
-        # Filter trailing vehicles based on traffic type
-        yaw_indices = []
-        if traffic_type == "ongoing":
-            max_yaw_difference = self.config.trailing_vehicles_max_route_angle_ongoing
-            # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' relative locations to the ego
-            # Used to assert trailing vehicles are behind the ego vehicle
-            ego_actor_vec = vehicle_locations[:, :2] - self.route_points[self.route_index, :2]
-            loc_dot_products = np.sum(ego_actor_vec * ego_fwd_vec, axis=1)
-
-            yaw_indices = np.where((yaw_differences < max_yaw_difference) & (loc_dot_products < 0))[0]
-
-        elif traffic_type == "oncoming":
-            max_yaw_difference = self.config.trailing_vehicles_max_route_angle_oncoming
-
-            vehicle_fwd_vecs = np.array([
-              [vehicle.get_transform().get_forward_vector().x, vehicle.get_transform().get_forward_vector().y]
-              for vehicle, _ in valid_npc_vehicles
-            ])
-            # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' forward vectors
-            # Used to assert trailing vehicles are traveling in the opposite direction to the ego vehicle
-            heading_dot_products = np.sum(vehicle_fwd_vecs * ego_fwd_vec, axis=1)
-
-            # Compute the dot product between the ego vehicle's forward vector and the NPC vehicles' relative locations to the ego
-            # Used to assert trailing vehicles are behind the ego vehicle
-            ego_actor_vec = vehicle_locations[:, :2] - self.route_points[self.route_index, :2]
-            loc_dot_products = np.sum(ego_actor_vec * ego_fwd_vec, axis=1)
-
-            yaw_indices = np.where((yaw_differences > max_yaw_difference) & (heading_dot_products < 0) & (loc_dot_products < 0))[0]
-
-        yaw_mask = np.zeros_like(vehicle_ids, dtype=bool)
-        yaw_mask[yaw_indices] = True
-
-        # Usually the road is 3.5 m wide, but in case of ParkingCrossingPedestrian it's less
-        trailing_vehicle_ids = vehicle_ids[(min_distances < max_distance) & yaw_mask]
-        # print(f"Trailing vehicle IDs for {traffic_type} traffic: {trailing_vehicle_ids}")
-        self.previous_trailing_vehicle_ids[traffic_type] = trailing_vehicle_ids
-
-        # Group trailing vehicles by their target lane ids
-        trailing_vehicle_groups = {}
-        for target_lane_wp in target_lanes:
-            trailing_vehicle_groups[target_lane_wp.lane_id] = []
-            for vehicle, lane_id in valid_npc_vehicles:
-                if vehicle.id in trailing_vehicle_ids and lane_id == target_lane_wp.lane_id:
-                    trailing_vehicle_groups[target_lane_wp.lane_id].append(vehicle)
-
-        return trailing_vehicle_groups
-    else:
-        return {}
-
-  def get_upcoming_lane_change(self, ego_velocity):
-    """
-      Computes if the ego agent is/was close to a lane change maneuver.
-
-      Args:
-          ego_velocity (float): The current velocity of the ego agent in m/s.
-
-      Returns:
-          bool: True if the ego agent is close to a lane change, False otherwise.
-    """
-    lane_change_data = {}
-    has_lane_change = False
-    lane_change_direction = None
-    lane_change_early_start_point = None
-    lane_change_late_start_point = None
-    lane_change_end_point = None
-
-    # Calculate the braking distance based on the ego velocity
-    braking_distance = ((
-        (ego_velocity * 3.6) / 10.0)**2 / 2.0) + self.config.braking_distance_calculation_safety_distance
-
-    # Determine the number of waypoints to look ahead based on the braking distance
-    look_ahead_points = max(self.config.minimum_lookahead_distance_to_compute_near_lane_change,
-        min(self.route_points.shape[0], self.config.points_per_meter * int(braking_distance)))
-    current_route_index = self.route_index
-    max_route_length = len(self.commands_orig)
-
-    from_index = current_route_index
-    to_index = min(max_route_length - 1, current_route_index + look_ahead_points)
-
-    # Iterate over the points around the current position, checking for lane change commands
-    lane_change_idx = from_index
-    for i in range(from_index, to_index, 1):
-        if self.commands_orig[i] in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
-            # Set the lane change direction and mandatory start point to begin the maneuver
-            has_lane_change = True
-            lane_change_direction = "left" if self.commands_orig[i] == RoadOption.CHANGELANELEFT else "right"
-            lane_change_idx = i
-            break
-
-    if has_lane_change:
-      lane_change_late_start_point = self.route_waypoints[lane_change_idx]
-      cur_idx = lane_change_idx
-      traveled_distance = 0
-
-      # Find the early start point of the lane change, where the ego can execute the maneuver in advance
-      while (cur_idx >= from_index) and \
-        self.route_waypoints[cur_idx].lane_id == lane_change_late_start_point.lane_id and \
-        self.route_waypoints[cur_idx].road_id == lane_change_late_start_point.road_id and \
-        traveled_distance < 50.0:
-          cur_idx -= 1
-          lane_change_early_start_point = self.route_waypoints[cur_idx]
-          traveled_distance = lane_change_late_start_point.transform.location.distance(
-              lane_change_early_start_point.transform.location)
-
-      # Find the end point of the lane change, where the lane change is completed
-      lane_change_cmd = self.commands_orig[lane_change_idx]
-      cur_idx = lane_change_idx
-      while (cur_idx < max_route_length) and \
-        self.commands_orig[cur_idx] == lane_change_cmd:
-          cur_idx += 1
-          lane_change_end_point = self.route_waypoints[cur_idx]
-
-      # print(f'EARLY START ROAD ID: {lane_change_early_start_point.road_id}, LANE ID: {lane_change_early_start_point.lane_id}, LOC: \n\tX: {lane_change_early_start_point.transform.location.x}, Y: {lane_change_early_start_point.transform.location.y}, Z: {lane_change_early_start_point.transform.location.z}')
-      # print(f'LATE START ROAD ID: {lane_change_late_start_point.road_id}, LANE ID: {lane_change_late_start_point.lane_id}, LOC: \n\tX: {lane_change_late_start_point.transform.location.x}, Y: {lane_change_late_start_point.transform.location.y}, Z: {lane_change_late_start_point.transform.location.z}')
-      # print(f'END ROAD ID: {lane_change_end_point.road_id}, LANE ID: {lane_change_end_point.lane_id}, LOC: \n\tX: {lane_change_end_point.transform.location.x}, Y: {lane_change_end_point.transform.location.y}, Z: {lane_change_end_point.transform.location.z}')
-    lane_change_data = {
-        "has_lane_change": has_lane_change,
-        "lane_change_direction": lane_change_direction,
-        "lane_change_early_start_point": lane_change_early_start_point,
-        "lane_change_late_start_point": lane_change_late_start_point,
-        "lane_change_end_point": lane_change_end_point,
-    }
-    return lane_change_data
 
   def change_lane(self,
                   start_index,
