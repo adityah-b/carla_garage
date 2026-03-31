@@ -13,6 +13,7 @@ class EgoVehicleData:
     speed: float
     orientation: float
     position: List[float]
+    accel: float
 
 class EgoVehicleDataExtractor:
     """
@@ -34,7 +35,7 @@ class EgoVehicleDataExtractor:
     def extract_ego_data(
         self,
         ego_vehicle : carla.Vehicle,
-        planner_state: PlannerState
+        planner_state: PlannerState,
     ) -> EgoVehicleData:
         """
         Extract structured ego vehicle data from context.
@@ -52,10 +53,12 @@ class EgoVehicleDataExtractor:
         ego_orientation = round(np.deg2rad(ego_transform.rotation.yaw), 2)
 
         ego_speed = round(ego_vehicle.get_velocity().length(), 2)
+        ego_accel = round(ego_vehicle.get_acceleration().length(), 2)
 
         return EgoVehicleData(
             ego_vehicle=ego_vehicle,
             speed=ego_speed,
             orientation=ego_orientation,
             position=ego_position,
+            accel=ego_accel,
         )

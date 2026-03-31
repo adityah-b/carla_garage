@@ -3,17 +3,11 @@ import numpy as np
 
 from typing import List, Dict, Any, Optional, Literal, Tuple
 from dataclasses import dataclass
-from enum import Enum
 
 from config import GlobalConfig
-from privileged_route_planner import PlannerState
+from privileged_route_planner import PlannerState, IntersectionType, IntersectionSegment, LaneChangeSegment
 from agents.navigation.local_planner import RoadOption
 from srunner.scenariomanager.carla_data_provider import CarlaDataProvider
-
-class IntersectionType(Enum):
-    SIGNALIZED = 0
-    UNSIGNALIZED = 1
-    OTHER = 2
 
 LaneChangeEntry = Tuple[RoadOption, int, int]
 IntersectionEntry = Tuple[RoadOption, int, int, IntersectionType]
@@ -25,7 +19,7 @@ class LaneChangeData:
     target_maneuver: Literal[RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT]
     is_executing_maneuver : bool
     entry : LaneChangeEntry
-
+    lane_boundary_idx : int
 
 @dataclass(frozen=True, slots=True)
 class IntersectionData:
@@ -40,14 +34,19 @@ class IntersectionData:
 class LaneInfo:
     has_left_lane : bool
     has_right_lane : bool
+
     left_oncoming : bool
     right_oncoming : bool
-    can_change_left : bool
-    can_change_right : bool
+
+    left_same_dir : bool
+    right_same_dir : bool
+
+    left_wp : Optional[carla.Waypoint]
+    right_wp : Optional[carla.Waypoint]
 
     @property
     def same_direction_lane_change_available(self) -> bool:
-        return self.can_change_left or self.can_change_right
+        return self.left_same_dir or self.right_same_dir
 
 @dataclass(frozen=True, slots=True)
 class RouteData:
@@ -57,7 +56,6 @@ class RouteData:
 
     # highway merge
 
-# TODO: Store intersection and lane change state so as to avoid recomputing the same shit
 class RouteDataExtractor:
     LOOKAHEAD_DISTANCE = 50.0
 
@@ -115,12 +113,12 @@ class RouteDataExtractor:
         right_oncoming = right_available and _is_oncoming(right_wp)
 
         lane_change = ego_wp.lane_change
-        can_change_left = (
+        left_same_dir = (
             left_available
             and not left_oncoming
             and (lane_change in (carla.LaneChange.Left, carla.LaneChange.Both) or ego_wp.lane_type != carla.LaneType.Driving)
         )
-        can_change_right = (
+        right_same_dir = (
             right_available
             and not right_oncoming
             and (lane_change in (carla.LaneChange.Right, carla.LaneChange.Both) or ego_wp.lane_type != carla.LaneType.Driving)
@@ -131,8 +129,10 @@ class RouteDataExtractor:
             has_right_lane=right_available,
             left_oncoming=left_oncoming,
             right_oncoming=right_oncoming,
-            can_change_left=can_change_left,
-            can_change_right=can_change_right
+            left_same_dir=left_same_dir,
+            right_same_dir=right_same_dir,
+            left_wp=left_wp,
+            right_wp=right_wp,
         )
 
     def _extract_intersection_data(
@@ -140,34 +140,31 @@ class RouteDataExtractor:
         ego_wp : carla.Waypoint,
         planner_state : PlannerState
     ) -> Optional[IntersectionData]:
-        route_index = planner_state.route_index
-        ego_tf = ego_wp.transform
-        ego_loc = ego_tf.location
-        ego_cmd = planner_state.route_commands[route_index]
-
-        intersection_data_raw = self._get_upcoming_intersection(planner_state)
-        if not intersection_data_raw:
+        segment = self._find_intersection_segment(planner_state)
+        if not segment:
             return None
 
-        # Unpack intersection information
-        intersection_cmd, start_idx, end_idx, signalized = intersection_data_raw
+        route_index = planner_state.route_index
+        ego_loc     = ego_wp.transform.location
+        ego_cmd     = planner_state.route_commands[route_index]
+
+        start_idx        = segment.start_idx
+        end_idx          = segment.end_idx
+        intersection_cmd = segment.cmd
+        # Use the signalization type captured at route-build time so it is stable
+        # even after the vehicle has passed the traffic control device.
+        signalized = segment.signalized
 
         start_wp = planner_state.route_waypoints[start_idx]
-        end_wp = planner_state.route_waypoints[end_idx]
 
-        # passed_start_wp = self._has_passed_waypoint(ego_tf, start_wp)
-        # passed_end_wp = self._has_passed_waypoint(ego_tf, end_wp)
-        passed_start_wp = route_index >= start_idx
-        passed_end_wp = route_index > end_idx
+        passed_start_wp    = route_index >= start_idx
+        passed_end_wp      = route_index > end_idx
+        inside_intersection = passed_start_wp and not passed_end_wp
 
-        inside_intersection = (passed_start_wp) and not passed_end_wp
-
-        if not passed_start_wp:
-            dist_to_intersection = ego_loc.distance(start_wp.transform.location)
-        else:
-            dist_to_intersection = 0.0
-
+        dist_to_intersection  = 0.0 if passed_start_wp else ego_loc.distance(start_wp.transform.location)
         is_executing_maneuver = (intersection_cmd == ego_cmd) and inside_intersection
+
+        entry = (intersection_cmd, start_idx, end_idx, signalized)
 
         return IntersectionData(
             distance_to_intersection=dist_to_intersection,
@@ -175,7 +172,7 @@ class RouteDataExtractor:
             signalized=signalized,
             target_maneuver=intersection_cmd,
             is_executing_maneuver=is_executing_maneuver,
-            entry=intersection_data_raw
+            entry=entry
         )
 
     def _extract_lane_change_data(
@@ -183,133 +180,76 @@ class RouteDataExtractor:
         ego_vehicle : carla.Vehicle,
         planner_state : PlannerState
     ) -> Optional[LaneChangeData]:
-        # Get ego state
-        ego_tf = ego_vehicle.get_transform()
-        ego_loc = ego_tf.location
+        ego_tf    = ego_vehicle.get_transform()
+        ego_loc   = ego_tf.location
         ego_speed = ego_vehicle.get_velocity().length()
-        ego_cmd = planner_state.route_commands[planner_state.route_index]
+        ego_cmd   = planner_state.route_commands[planner_state.route_index]
 
-        lane_change_data_raw = self._get_upcoming_lane_change(ego_speed, planner_state)
-        if not lane_change_data_raw:
+        segment = self._find_lane_change_segment(ego_speed, planner_state)
+        if not segment:
             return None
 
-        # Unpack lane change information
-        lane_change_cmd, lc_start_idx, lc_end_idx = lane_change_data_raw
-
-        # TODO: PUT THIS IN CONFIG
-        # Make sure lane changes are at least 5.0m
-        if (lc_end_idx - lc_start_idx) / self.config.points_per_meter < 5.0:
-            lc_end_idx = lc_start_idx + 5.0 * self.config.points_per_meter
+        lane_change_cmd = segment.cmd
+        lc_start_idx    = segment.start_idx
+        lc_end_idx      = segment.end_idx
 
         start_wp = planner_state.route_waypoints[lc_start_idx]
-        end_wp = planner_state.route_waypoints[lc_end_idx]
+        end_wp   = planner_state.route_waypoints[lc_end_idx]
+
         passed_start_wp = self._has_passed_waypoint(ego_tf, start_wp)
-        passed_end_wp = self._has_passed_waypoint(ego_tf, end_wp)
+        passed_end_wp   = self._has_passed_waypoint(ego_tf, end_wp)
 
-        inside_lane_change = (passed_start_wp) and not passed_end_wp
-
-        if not passed_start_wp:
-            dist_to_lane_change = ego_loc.distance(start_wp.transform.location)
-        else:
-            dist_to_lane_change = 0.0
-
+        inside_lane_change  = passed_start_wp and not passed_end_wp
+        dist_to_lane_change = 0.0 if passed_start_wp else ego_loc.distance(start_wp.transform.location)
         is_executing_maneuver = (lane_change_cmd == ego_cmd) and inside_lane_change
+
+        entry = (lane_change_cmd, lc_start_idx, lc_end_idx)
 
         return LaneChangeData(
             distance_to_lane_change=dist_to_lane_change,
             inside_lane_change=inside_lane_change,
             target_maneuver=lane_change_cmd,
             is_executing_maneuver=is_executing_maneuver,
-            entry=lane_change_data_raw
+            entry=entry,
+            lane_boundary_idx=segment.boundary_idx,
         )
 
-    def _get_upcoming_intersection(
+    def _find_intersection_segment(
         self,
         planner_state : PlannerState
-    ) -> Optional[IntersectionEntry]:
-        # Unpack planner state
+    ) -> Optional[IntersectionSegment]:
+        """Return the first intersection segment at or ahead of the current route index.
+
+        Reads directly from the precomputed list in PlannerState — no per-tick
+        search or mutable cache state required.
+        """
         route_index = planner_state.route_index
-        route_wps = planner_state.route_waypoints
-        route_cmds = planner_state.route_commands
+        for seg in planner_state.intersection_segments:
+            if seg.end_idx >= route_index:
+                return seg
+        return None
 
-        max_route_length = len(route_wps)
-        look_ahead_points = int(self.LOOKAHEAD_DISTANCE * self.config.points_per_meter)
-        to_index = min(max_route_length - 1, route_index + look_ahead_points)
-
-        # Look for upcoming intersection
-        intersection_start_idx = None
-        intersection_cmd = None
-        for i in range(route_index, to_index):
-            cmd = route_cmds[i]
-            wp = route_wps[i]
-            if (wp.is_junction) and (cmd in (RoadOption.LEFT, RoadOption.STRAIGHT, RoadOption.RIGHT)):
-                intersection_start_idx = i
-                intersection_cmd = cmd
-                break
-
-        if intersection_start_idx is None:
-            return None
-
-        intersection_end_idx = intersection_start_idx
-        while (intersection_end_idx < max_route_length - 1) and route_cmds[intersection_end_idx] == intersection_cmd:
-            intersection_end_idx +=1
-
-        print(f'\n\nINTERSECTION TURN')
-        print(f'\t\tstart: {intersection_start_idx}, end: {intersection_end_idx}')
-
-        # Any intersections with traffic lights are automatically signalized
-        dist_next_tl = planner_state.dist_to_next_traffic_lights[route_index]
-
-        dist_to_junc = route_wps[intersection_start_idx].transform.location.distance(route_wps[route_index].transform.location)
-
-        # TODO: IDEALLY ALL THIS SHOULD BE PRECOMPUTED IN THE PRIVILEGEDROUTEPLANNER
-        if dist_next_tl != np.inf and abs(dist_next_tl - dist_to_junc) < 10.0:
-            return (intersection_cmd, intersection_start_idx, intersection_end_idx, IntersectionType.SIGNALIZED)
-
-        return (intersection_cmd, intersection_start_idx, intersection_end_idx, IntersectionType.UNSIGNALIZED)
-
-    def _get_upcoming_lane_change(
+    def _find_lane_change_segment(
         self,
         ego_speed : float,
         planner_state : PlannerState
-    ) -> Optional[LaneChangeEntry]:
-        # Unpack planner state
+    ) -> Optional[LaneChangeSegment]:
+        """Return the first lane change segment within braking/lookahead distance.
+
+        Reads directly from the precomputed list in PlannerState — no per-tick
+        search or mutable cache state required.
+        """
         route_index = planner_state.route_index
-        route_pts = planner_state.route_points
-        route_cmds = planner_state.route_commands
 
-        # Calculate the braking distance based on the ego speed
-        braking_distance = ((
-            (ego_speed * 3.6) / 10.0)**2 / 2.0) + self.config.braking_distance_calculation_safety_distance
+        braking_distance = (
+            ((ego_speed * 3.6) / 10.0) ** 2 / 2.0
+            + self.config.braking_distance_calculation_safety_distance
+        )
+        look_ahead_m  = max(self.LOOKAHEAD_DISTANCE, braking_distance)
+        look_ahead_pts = int(look_ahead_m * self.config.points_per_meter)
+        to_index = route_index + look_ahead_pts
 
-        # Determine the number of waypoints to look ahead based on the braking distance
-        look_ahead_points = max(self.LOOKAHEAD_DISTANCE * self.config.points_per_meter,
-            min(route_pts.shape[0], self.config.points_per_meter * int(braking_distance)))
-        look_ahead_points = int(look_ahead_points)
-        max_route_length = len(route_cmds)
-
-        to_index = min(max_route_length - 1, route_index + look_ahead_points)
-
-        # Iterate over the points around the current position, checking for lane change commands
-        lc_start_idx = None
-        lane_change_cmd = None
-        for i in range(route_index, to_index):
-            cmd = route_cmds[i]
-            if cmd in (RoadOption.CHANGELANELEFT, RoadOption.CHANGELANERIGHT):
-                # Set the lane change direction and mandatory start point to begin the maneuver
-                lc_start_idx = i
-                lane_change_cmd = cmd
-                break
-
-        if lc_start_idx is None:
-            return None
-
-        # Find the end point of the lane change, where the lane change is completed
-        lc_end_idx = lc_start_idx
-        while (lc_end_idx < max_route_length - 1) and route_cmds[lc_end_idx] == lane_change_cmd:
-            lc_end_idx += 1
-
-        print(f'\n\nLANE CHANGE')
-        print(f'\t\tstart: {lc_start_idx}, end: {lc_end_idx}')
-
-        return (lane_change_cmd, lc_start_idx, lc_end_idx)
+        for seg in planner_state.lane_change_segments:
+            if seg.end_idx >= route_index and seg.start_idx <= to_index:
+                return seg
+        return None

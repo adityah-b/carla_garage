@@ -16,7 +16,7 @@ from .collision_data_extractor import CollisionData, CollisionDataExtractor
 
 @dataclass(frozen=True, slots=True)
 class SceneData:
-    traffic_data : Optional[TrafficData]
+    traffic_data : TrafficData
     ego_data : Optional[EgoVehicleData]
     vehicle_data : VehicleData
     ped_data : Optional[List[PedestrianData]]
@@ -93,11 +93,11 @@ class SceneExtractor:
         )
 
         return SceneData(
-            traffic_data=traffic_data if traffic_data else None,
+            traffic_data=traffic_data,
             ego_data=ego_data if ego_data else None,
             vehicle_data=vehicle_data,
             ped_data=ped_data if ped_data else None,
             obstacle_data=obstacle_data,
-            route_data=route_data if route_data else None,
+            route_data=route_data,
             collision_data=collision_data
         )

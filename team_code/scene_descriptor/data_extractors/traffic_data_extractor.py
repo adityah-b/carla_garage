@@ -78,6 +78,7 @@ class TrafficDataExtractor:
             next_stop_sign=self._extract_stop_sign_data(
                 stop_sign=next_ss,
                 ego_loc=ego_loc,
+                dist_to_next_ss=dist_to_next_ss,
                 cleared_stop_sign_ids=cleared_stop_sign_ids
             ),
             speed_limit=speed_limit
@@ -102,7 +103,7 @@ class TrafficDataExtractor:
         Returns:
             TrafficLightData object or None if not relevant
         """
-        if not traffic_light or distance_to_light >= self.config.traffic_light_distance_threshold:
+        if not traffic_light or distance_to_light >= self.config.traffic_light_detection_radius_m:
             return None
 
         state_mapping = {
@@ -123,6 +124,7 @@ class TrafficDataExtractor:
         self,
         stop_sign,
         ego_loc: carla.Location,
+        dist_to_next_ss : float,
         cleared_stop_sign_ids : Set[int],
     ) -> Optional[StopSignData]:
         """
@@ -139,7 +141,10 @@ class TrafficDataExtractor:
             return None
 
         distance_to_stop_sign = stop_sign.get_transform().transform(stop_sign.trigger_volume.location).distance(ego_loc)
-        if distance_to_stop_sign >= self.config.stop_sign_distance_threshold:
+        if distance_to_stop_sign <= self.config.clearing_distance_to_stop_sign:
+            distance_to_stop_sign = dist_to_next_ss
+
+        if distance_to_stop_sign >= self.config.stop_sign_detection_radius_m:
             return None
 
         ss_cleared = stop_sign.id in cleared_stop_sign_ids

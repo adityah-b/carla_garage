@@ -3,12 +3,13 @@ import numpy as np
 
 from typing import List, Dict
 
+from team_code.config import GlobalConfig
 from agents.navigation.local_planner import RoadOption
 from privileged_route_planner import PlannerState
 from actor_prediction.collision_checker import CollisionChecker
 
 class BaseActorExtractor:
-    def __init__(self, config):
+    def __init__(self, config : GlobalConfig):
         self.config = config
 
     def _get_ego_transform_matrix(self, ego_transform: carla.Transform) -> np.ndarray:
@@ -69,14 +70,11 @@ class BaseActorExtractor:
         route_bbs = planner_state.route_bbs
         route_cmds = planner_state.route_commands
 
-        # TODO: UPDATE INDEX TRANSFORMATION WITH CONFIG NUMBERS
         # Convert indices to route_bb index
-        route_index_spaced = route_index // self.config.points_per_meter
-        route_index_spaced = route_index_spaced // 2
+        route_index_spaced = self.config.dense_route_idx_to_bb_route_idx(route_index)
 
-        # TODO: UPDATE INDEX TRANSORMATION WITH CONFIG NUMBERS
         max_route_bbs = len(route_bbs)
-        lookahead_distance = int(80.0 // 2)
+        lookahead_distance = self.config.meters_to_bb_route_idx(self.config.vehicle_detection_radius_m)
         to_index_spaced = min(max_route_bbs, route_index_spaced + lookahead_distance + 1)
 
         route_bbs_subset = route_bbs[route_index_spaced : to_index_spaced]
@@ -94,7 +92,8 @@ class BaseActorExtractor:
             intrusion_idx = route_index_spaced + intrusion_idx_offset
 
             # Convert route_bb index to dense route index
-            intrusion_idx_dense = int(np.clip(intrusion_idx * 2 * self.config.points_per_meter, 0, route_cmds.shape[0] - 1))
+            intrusion_idx_dense = self.config.bb_route_idx_to_dense_route_idx(intrusion_idx)
+            intrusion_idx_dense = int(np.clip(intrusion_idx_dense, 0, route_cmds.shape[0] - 1))
 
             # Add to overall dict if intrusion index is not in a junction
             if route_cmds[intrusion_idx_dense] not in [RoadOption.LEFT, RoadOption.RIGHT, RoadOption.STRAIGHT]:
