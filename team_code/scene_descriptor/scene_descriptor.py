@@ -18,7 +18,8 @@ from .formatters.scene_formatter import SceneFormatter
 @dataclass(frozen=True, slots=True)
 class SceneContext:
     scene_data : SceneData
-    formatted_text : Optional[str]
+    formatted_text : Optional[str]   # dense structured text for logging/debugging
+    scene_summary : Optional[str]    # simplified natural-language summary for VLM prompts
 
 class SceneDescriptor:
     def __init__(self, config, carla_map: carla.Map):
@@ -121,19 +122,7 @@ class SceneDescriptor:
         self,
         scene_data: SceneData,
     ) -> str:
-        """
-        Convert structured scene data to formatted text representation.
-
-        Args:
-            structured_data: Dictionary containing structured scene data
-            compact: Whether to use compact formatting
-
-        Returns:
-            Formatted string representation of scene data
-        """
-        return self._formatter.format_scene(
-            scene_data=scene_data
-        )
+        return self._formatter.format_scene(scene_data=scene_data)
 
     def process_complete_scene(
         self,
@@ -162,14 +151,16 @@ class SceneDescriptor:
             ego_vehicle, actors, planner_state, lidar_data=lidar_data, collision_sensor_data=collision_sensor_data
         )
 
-        # Add formatted text if requested
         formatted_text = None
+        scene_summary = None
         if format_as_text:
             formatted_text = self.format_scene_as_text(scene_data)
+            scene_summary = self._formatter.summarize(scene_data=scene_data)
 
         return SceneContext(
             scene_data=scene_data,
-            formatted_text=formatted_text
+            formatted_text=formatted_text,
+            scene_summary=scene_summary,
         )
 
     # Properties for accessing internal components (useful for testing/debugging)
