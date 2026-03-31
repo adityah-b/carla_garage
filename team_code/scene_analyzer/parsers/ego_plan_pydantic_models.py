@@ -1,64 +1,29 @@
 from pydantic import BaseModel, Field
-from typing import List, Literal, Optional, Tuple, Deque
+from typing import Any, List, Literal, Optional, Deque, Union
 from enum import Enum
-
 from dataclasses import dataclass
 
-class Action(str, Enum):
-    ########################################
-    # LONGITUDINAL
-    ########################################
+from team_code.scene_analyzer.parsers.base_pydantic_models import *
 
-    FOLLOW_ROUTE = "follow_route"
-
-    ########################################
-    # LATERAL
-    ########################################
-
-    # Turns
-    TURN_LEFT = "turn_left"
-    TURN_RIGHT = "turn_right"
-    TURN_STRAIGHT = "turn_straight"
-
-    # Lane changes
-    CHANGE_LANE_LEFT = "change_lane_left"
-    CHANGE_LANE_RIGHT = "change_lane_right"
-
-    # Overtakes
-    OVERTAKE_LEFT = "overtake_left"
-    OVERTAKE_RIGHT = "overtake_right"
-
-    # Pull over for emergency vehicles
-    PULL_OVER_LEFT = "pull_over_left"
-    PULL_OVER_RIGHT = "pull_over_right"
-
-    # Lane share
-    SHARE_LANE = "share_lane"
-
-class ConditionAction(str, Enum):
-    YIELD_FOR = "yield_for"
-    STOP_FOR = "stop_for"
+class ConditionTarget(BaseModel):
+    """Single-actor target that the low-level planner resolves against live perception each tick."""
+    actor_type: EntityType
+    traffic_type: TrafficType
+    region: RegionType
 
 class ConditionCommand(BaseModel):
-    condition_action : ConditionAction
-    id : int = Field(description="The actor ID of the chosen target")
-    obj_type : Literal["vehicle", "cyclist", "pedestrian", "obstacle", "stop_sign", "traffic_light"]
-    traffic_type : Literal["leading", "trailing", "oncoming", "cross", "other"]
-    importance : float = 1.0
+    condition_action: ConditionAction
+    target: ConditionTarget
+    priority: Priority = "medium"
 
 class EgoPlan(BaseModel):
-    # High-level action
-    action : Action
-
-    # Optional adjustment parameters
-    target_speed : Optional[float] = None
-
-    # Conditions
-    conditions : List[ConditionCommand]
-    reasoning : List[str] = Field(
+    action: Action
+    target_speed: Optional[float] = None
+    conditions: List[ConditionCommand]
+    reasoning: List[str] = Field(
         min_length=1,
         max_length=5,
-        description="Step by step reasoning on why each step and parameter choice is valid"
+        description="Step by step reasoning on why each step and parameter choice is valid",
     )
 
     def to_string(self) -> str:
@@ -71,19 +36,24 @@ class EgoPlan(BaseModel):
         lines.append("CONDITIONS:")
         if self.conditions:
             for condition in self.conditions:
+                t = condition.target
                 cond_desc = (
-                    f"- {condition.condition_action.value} {condition.obj_type} "
-                    f"id={condition.id}"
+                    f"- {condition.condition_action.value} "
+                    f"{t.actor_type} [{t.region}] "
+                    f"traffic={t.traffic_type} "
+                    f"priority={condition.priority}"
                 )
                 lines.append(cond_desc)
         else:
             lines.append("- none")
 
+        lines.append("")
         lines.append("REASONING:")
         for idx, reason in enumerate(self.reasoning, start=1):
             lines.append(f"{idx}. {reason}")
 
         return "\n".join(lines)
+
 
 class PlanStatus(str, Enum):
     EXECUTING = "executing"
@@ -91,45 +61,37 @@ class PlanStatus(str, Enum):
     FAILED = "failed"
 
 @dataclass
-class PlanExecution:
+class PlanState:
+    """Bundles all state for a plan execution — current or archived."""
     plan: EgoPlan
+    hl_beh: Any  # HighLevelBehaviour from either single_stage/ or dual_stage/ pipeline
     status: PlanStatus
     reason: Optional[str] = None
     collision_events: Optional[Deque] = None
+    # Scene state captured at the moment the plan was created — used for memory logging
+    scene_text: Optional[str] = None
+    scene_image: Any = None  # np.ndarray | None
 
     def to_string(self) -> str:
         lines = []
-        ego_plan = self.plan
-        lines.append(f"action: {ego_plan.action.value}")
+        lines.append(f"action: {self.plan.action.value}")
         lines.append("conditions:")
-
-        if ego_plan.conditions:
-            for condition in ego_plan.conditions:
-                cond_desc = (
-                    f"- {condition.condition_action.value} {condition.obj_type} "
-                    f"id={condition.id}"
+        if self.plan.conditions:
+            for condition in self.plan.conditions:
+                t = condition.target
+                lines.append(
+                    f"- {condition.condition_action.value} "
+                    f"{t.actor_type} [{t.region}] "
+                    f"traffic={t.traffic_type}"
                 )
-                lines.append(cond_desc)
         else:
             lines.append("- none")
-
-        # lines.append("reasoning:")
-        # if ego_plan.reasoning:
-        #     for idx, reason in enumerate(ego_plan.reasoning, start=1):
-        #         lines.append(f"- {idx}. {reason}")
-        # else:
-        #     lines.append("- none")
-
         status_line = f"status: {self.status.value}"
         if self.reason:
-            status_line = f"{status_line} (reason: {self.reason})"
+            status_line += f" (reason: {self.reason})"
         lines.append(status_line)
-
-        # TODO: TEMPORARY DEBUGGING
-        # NOTE: THIS IS ONLY FOR DEBUGGING
         if self.collision_events:
             lines.append("HAS COLLISIONS")
             for event in self.collision_events:
                 lines.append(f"- Actor ID: {event.id}, time: {event.timestamp}")
-
         return "\n".join(lines)

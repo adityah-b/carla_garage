@@ -1,23 +1,25 @@
 import os
+import cv2
 import uuid
 import json
 import time
+import tempfile
+
+import numpy as np
 
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
 
-from langchain_community.document_loaders import TextLoader
 from langchain_community.vectorstores import Chroma
 from langchain_experimental.open_clip import OpenCLIPEmbeddings
 from langchain_core.documents import Document
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 
-from team_code.scene_analyzer.rag_utils.planner_memory.planner_hint_parser import PlanHintParser
-from team_code.scene_analyzer.parsers.hl_beh_pydantic_models import *
-from team_code.scene_analyzer.parsers.ego_plan_pydantic_models import *
+from team_code.scene_analyzer.rag_utils.planner_memory.dual_stage.planner_hint_parser import PlanHintParser
+from team_code.scene_analyzer.parsers.ego_plan_pydantic_models import EgoPlan
 
 class PlannerMemory:
     def __init__(self):
@@ -26,6 +28,9 @@ class PlannerMemory:
         db_path = self.rag_dir.joinpath('db/chroma_planner_mem/')
 
         self.embedding = OpenCLIPEmbeddings(model_name="ViT-B-32", checkpoint="laion2b_s34b_b79k")
+
+        self.images_dir = self.rag_dir.joinpath('db/images')
+        self.images_dir.mkdir(parents=True, exist_ok=True)
 
         # Always open the store
         self.store = Chroma(
@@ -42,26 +47,93 @@ class PlannerMemory:
         print(f"========== Loaded {db_path} Memory. Database has {count} items. ==========")
 
     def _load_base_memories(self):
-        base_hints_path = self.rag_dir.joinpath('planning_hints.txt')
-        loader = TextLoader(file_path=str(base_hints_path))
-        docs = loader.load()  # typically returns a single Document for the whole file
-        if not docs:
-            raise FileNotFoundError(f"No content loaded from {base_hints_path}")
+        parsed = PlanHintParser.parse_memories()
+        if not parsed:
+            raise ValueError("No seed memories returned from PlanHintParser")
 
-        parsed_docs = PlanHintParser.parse_memories_from_text(docs[0].page_content)
-        if not parsed_docs:
-            raise ValueError(f"Could not parse any memories from {base_hints_path}")
+        docs: List[Document] = []
+        for memory_id, hl_beh, ego_plan in parsed:
+            driving_skill = hl_beh.primary_intent.value
+            added_at_iso = datetime.now(timezone.utc).isoformat()
+            added_at_ts = int(time.time() * 1000)
 
-        self.store.add_documents(parsed_docs)
+            payload = self._build_payload(
+                episode_id=memory_id,
+                driving_skill=driving_skill,
+                added_at_iso=added_at_iso,
+                added_at_ts=added_at_ts,
+                hl_behaviour=hl_beh,
+                ego_plan=ego_plan,
+            )
+
+            # Embedding text: ONLY the HighLevelBehaviour semantic string.
+            # The EgoPlan is payload only — it must not pollute the vector space.
+            embedding_text = hl_beh.to_string()
+
+            # Full memory text for RAG display (includes both hl_beh and ego_plan)
+            display_text = self.format_memory_text(payload)
+
+            metadata: Dict[str, Any] = {
+                "episode_id": memory_id,
+                "driving_skill": driving_skill,
+                "added_at_iso": added_at_iso,
+                "added_at_ts": added_at_ts,
+                "hl_primary_intent": driving_skill,
+                "ego_action": getattr(
+                    getattr(ego_plan, "action", None),
+                    "value",
+                    str(getattr(ego_plan, "action", "")),
+                ),
+                "payload_json": json.dumps(payload, ensure_ascii=False),
+                "display_text": display_text,
+                "is_seed": True,
+            }
+
+            # page_content is what gets embedded — use the hl_beh semantic string
+            docs.append(Document(page_content=embedding_text, metadata=metadata))
+
+        self.store.add_documents(docs, ids=[memory_id for memory_id, _, _ in parsed])
         self.store.persist()
 
     def num_items(self) -> int:
         return int(self.store._collection.count())
 
+    def _save_image(self, episode_id: str, image: np.ndarray) -> str:
+        path = str(self.images_dir / f"{episode_id}.png")
+        cv2.imwrite(path, image)
+        return path
+
+    def _compute_query_embedding(
+        self,
+        text: str,
+        image: Optional[np.ndarray] = None,
+        text_weight: float = 0.5,
+    ) -> List[float]:
+        """Compute embedding from text and optional image via weighted average in CLIP space."""
+        text_emb = np.array(self.embedding.embed_query(text))
+
+        if image is None:
+            return text_emb.tolist()
+
+        # OpenCLIPEmbeddings.embed_image expects file paths
+        fd, temp_path = tempfile.mkstemp(suffix='.png')
+        os.close(fd)
+        try:
+            cv2.imwrite(temp_path, image)
+            image_emb = np.array(self.embedding.embed_image([temp_path])[0])
+        finally:
+            os.unlink(temp_path)
+
+        fused = text_weight * text_emb + (1.0 - text_weight) * image_emb
+        norm = np.linalg.norm(fused)
+        if norm > 1e-12:
+            fused = fused / norm
+        return fused.tolist()
+
     def _doc_to_payload(self, doc: Document) -> Optional[Dict[str, Any]]:
         """
         Prefer metadata['payload_json'] so we can always reconstruct even if page_content changes.
-        Returns None for older/seed docs that don’t store payload_json.
+        Returns None for older/seed docs that don't store payload_json.
         """
         md = doc.metadata or {}
         pj = md.get("payload_json")
@@ -128,13 +200,32 @@ class PlannerMemory:
         query_text: str,
         driving_skill: str,
         k: int,
+        *,
+        query_embedding: Optional[List[float]] = None,
     ) -> Tuple[Optional[Document], Optional[float]]:
         """
         Returns (best_doc, best_similarity) in the given skill bucket.
 
+        If query_embedding is provided, searches by vector; otherwise by text.
         Similarity is in [0,1] when available; otherwise a pseudo-relevance computed from distance.
         """
-        # Preferred: relevance scores (0..1 higher is more similar)
+        if query_embedding is not None:
+            # Vector-based search with pre-computed (fused) embedding
+            if hasattr(self.store, "similarity_search_by_vector_with_relevance_scores"):
+                try:
+                    pairs = self.store.similarity_search_by_vector_with_relevance_scores(
+                        embedding=query_embedding,
+                        k=k,
+                        filter={"driving_skill": driving_skill},
+                    )
+                    if not pairs:
+                        return None, None
+                    best_doc, best_rel = max(pairs, key=lambda p: p[1])
+                    return best_doc, float(best_rel)
+                except Exception:
+                    pass
+
+        # Preferred: text-based relevance scores (0..1 higher is more similar)
         if hasattr(self.store, "similarity_search_with_relevance_scores"):
             try:
                 pairs = self.store.similarity_search_with_relevance_scores(
@@ -226,7 +317,7 @@ class PlannerMemory:
         driving_skill : str,
         added_at_iso : str,
         added_at_ts : int,
-        hl_behaviour : HighLevelBehaviour,
+        hl_behaviour : Any,
         ego_plan : EgoPlan,
         *,
         extra : Optional[Dict[str, Any]] = None,
@@ -260,7 +351,7 @@ class PlannerMemory:
           - memory inspection/debugging
 
         max_list_items:
-          - caps long lists (actors/objects/obstacles) to avoid bloating RAG
+          - caps long lists to avoid bloating RAG
         """
         episode_id = payload.get("episode_id", "unknown")
         driving_skill = payload.get("driving_skill", "unknown")
@@ -268,8 +359,15 @@ class PlannerMemory:
         hl = payload.get("high_level_behaviour", {})
         ep = payload.get("ego_plan", {})
 
-        hl_next = hl.get("next_action", "")
+        hl_intent = hl.get("primary_intent", "")
+        # Support both pipeline schemas:
+        # single_stage has target_speed_limit; dual_stage has drivable_space_status
+        if "target_speed_limit" in hl:
+            hl_space = f"speed_limit={hl['target_speed_limit']}"
+        else:
+            hl_space = hl.get("drivable_space_status", "")
         hl_reasoning = hl.get("reasoning", [])
+        conflict_zones = hl.get("conflict_zones", [])
 
         plan_action = ep.get("action", "")
         plan_reasoning = ep.get("reasoning", [])
@@ -291,18 +389,37 @@ class PlannerMemory:
                     out.append(prefix + str(it))
             return "\n".join(out)
 
+        def format_conflict_zones(zones: List[Any]) -> str:
+            if not zones:
+                return "- (none)"
+            lines: List[str] = []
+            for z in cap(zones):
+                if isinstance(z, dict):
+                    region = z.get("region", "")
+                    actors = z.get("entity_types", [])
+                    traffic = z.get("traffic_types", [])
+                    risk = z.get("risk_level", "")
+                    action = z.get("suggested_action", "")
+                    desc = z.get("description", "")
+                    action_str = f" action={action}" if action else ""
+                    lines.append(f"- [{region}] actors={actors} traffic={traffic} risk={risk}{action_str}: {desc}")
+                else:
+                    lines.append(f"- {z}")
+            return "\n".join(lines)
+
         def format_conditions(conds: List[Any]) -> str:
             if not conds:
                 return "- (none)"
             lines: List[str] = []
-            for c in conds:
+            for c in cap(conds):
                 if isinstance(c, dict):
                     ca = c.get("condition_action", "")
-                    obj_type = c.get("obj_type", "")
-                    tid = c.get("id", "")
-                    ttype = c.get("traffic_type", "")
-                    imp = c.get("importance", 1.0)
-                    lines.append(f"- {ca} {obj_type} id={tid} traffic_type={ttype} importance={imp}")
+                    target = c.get("target", {})
+                    region = target.get("region", "")
+                    actor = target.get("actor_type", "")
+                    traffic = target.get("traffic_type", "")
+                    priority = c.get("priority", "medium")
+                    lines.append(f"- {ca} [{region}] actor={actor} traffic={traffic} priority={priority}")
                 else:
                     lines.append(f"- {c}")
             return "\n".join(lines)
@@ -312,7 +429,9 @@ class PlannerMemory:
             f"Episode: {episode_id}\n"
             f"DrivingSkill: {driving_skill}\n\n"
             f"HighLevelBehaviour\n"
-            f"- next_action: {hl_next}\n"
+            f"- primary_intent: {hl_intent}\n"
+            f"- drivable_space: {hl_space}\n"
+            f"- conflict_zones:\n{format_conflict_zones(conflict_zones)}\n"
             f"- reasoning:\n{bullets(hl_reasoning)}\n\n"
             f"EgoPlan\n"
             f"- action: {plan_action}\n"
@@ -324,9 +443,10 @@ class PlannerMemory:
 
     def add_memory(
         self,
-        hl_behaviour : HighLevelBehaviour,
+        hl_behaviour : Any,
         ego_plan : EgoPlan,
         *,
+        image: Optional[np.ndarray] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
         # override defaults (optional)
         max_similarity_to_existing : float = 0.8,
@@ -353,11 +473,11 @@ class PlannerMemory:
         protect = protect_seed
 
         # ids + timestamps (no parsing required later)
-        episode_id = int(uuid.uuid4())
+        episode_id = str(uuid.uuid4())
         added_at_iso = datetime.now(timezone.utc).isoformat()
         added_at_ts = int(time.time() * 1000)  # epoch ms
 
-        driving_skill = hl_behaviour.next_action
+        driving_skill = hl_behaviour.primary_intent.value
 
         payload = self._build_payload(
             episode_id=episode_id,
@@ -368,17 +488,25 @@ class PlannerMemory:
             ego_plan=ego_plan,
         )
 
-        # Organized doc content used for BOTH embedding + readability
-        page_content = self.format_memory_text(
+        # Embedding text: ONLY the HighLevelBehaviour semantic string.
+        # EgoPlan is NOT embedded — it is payload only.
+        embedding_text = hl_behaviour.to_string()
+
+        # Compute embedding (fused text+image when image is available)
+        query_embedding = self._compute_query_embedding(embedding_text, image)
+
+        # Full display text for RAG
+        display_text = self.format_memory_text(
             payload,
             max_list_items=max_list_items_for_storage,
         )
 
         # ---- Novelty gate: compare against existing episodes in the same skill ----
         best_doc, best_sim = self._best_similarity_within_skill(
-            query_text=page_content,
+            query_text=embedding_text,
             driving_skill=driving_skill,
             k=ncheck,
+            query_embedding=query_embedding,
         )
 
         if best_sim is not None and best_sim >= max_similarity:
@@ -397,71 +525,99 @@ class PlannerMemory:
             reserve_slots=1,
         )
 
+        # Save image to disk if provided
+        image_path = ""
+        if image is not None:
+            image_path = self._save_image(episode_id, image)
+
         metadata: Dict[str, Any] = {
             "episode_id": episode_id,
             "driving_skill": driving_skill,
             "added_at_iso": added_at_iso,
             "added_at_ts": added_at_ts,
-            "hl_next_action": str(hl_behaviour.next_action),
+            "hl_primary_intent": driving_skill,
             "ego_action": getattr(getattr(ego_plan, "action", None), "value", str(getattr(ego_plan, "action", ""))),
             "payload_json": json.dumps(payload, ensure_ascii=False),
+            "display_text": display_text,
+            "image_path": image_path,
             "is_seed": False,
         }
         if extra_metadata:
             metadata.update(extra_metadata)
 
-        doc = Document(page_content=page_content, metadata=metadata)
+        # Insert with pre-computed embedding via low-level API
+        def _upsert():
+            self.store._collection.add(
+                ids=[episode_id],
+                embeddings=[query_embedding],
+                metadatas=[metadata],
+                documents=[embedding_text],
+            )
 
-        # Upsert-ish behavior: replace if episode_id already exists
         try:
-            self.store.add_documents([doc], ids=[episode_id])
+            _upsert()
         except Exception:
             try:
                 self._delete_ids([episode_id])
             except Exception:
                 pass
-            self.store.add_documents([doc], ids=[episode_id])
+            _upsert()
 
         return episode_id
 
     def retrieve_memories(
         self,
-        hl_behaviour : HighLevelBehaviour,
+        hl_behaviour : Any,
         num_entries : int = 3,
         *,
+        image: Optional[np.ndarray] = None,
         max_list_items_for_rag: Optional[int] = 10,
         backfill_global: bool = True,
     ) -> List[Document]:
         """
         Retrieve relevant memories for RAG.
 
-        Steps:
-          1) driving_skill bucket = normalize(hl_behaviour.next_action)
-          2) similarity query = "\\n".join(hl_behaviour.reasoning) (fallback to driving_skill if empty)
-          3) similarity_search within the same skill bucket
-          4) optionally backfill globally if bucket is sparse
-          5) re-render each doc via format_memory_text(payload) when payload_json exists
+        Two-Level Filtering:
+          Level 1 (Metadata): Filter by driving_skill == primary_intent.value
+          Level 2 (Semantic):  Embed hl_behaviour.to_string() (+ optional image) and vector-search
+
+        The EgoPlan is NOT part of the embedding — it is retrieved as payload only.
         """
         if num_entries <= 0:
             return []
 
-        driving_skill = hl_behaviour.next_action
-        reasoning_lines = list(hl_behaviour.reasoning or [])
-        query_text = "\n".join(reasoning_lines).strip() or driving_skill
+        driving_skill = hl_behaviour.primary_intent.value
 
-        # 1) within skill bucket
-        docs: List[Document] = self.store.similarity_search(
-            query=query_text,
-            k=num_entries,
-            filter={"driving_skill": driving_skill},
-        )
+        # Query text = the semantic scene context (conflict zones + intent)
+        query_text = hl_behaviour.to_string()
 
-        # 3) canonical re-render (consistent RAG formatting)
+        # 1) Level 1 + Level 2: within skill bucket, semantic search
+        if image is not None:
+            query_embedding = self._compute_query_embedding(query_text, image)
+            docs: List[Document] = self.store.similarity_search_by_vector(
+                embedding=query_embedding,
+                k=num_entries,
+                filter={"driving_skill": driving_skill},
+            )
+        else:
+            docs: List[Document] = self.store.similarity_search(
+                query=query_text,
+                k=num_entries,
+                filter={"driving_skill": driving_skill},
+            )
+
+        # 2) Re-render each doc via display_text or format_memory_text for consistent RAG
         rendered: List[Document] = []
         for d in docs:
+            # Prefer stored display_text, fall back to re-rendering from payload
+            md = d.metadata or {}
+            display = md.get("display_text")
+            if display:
+                rendered.append(Document(page_content=display, metadata=deepcopy(md)))
+                continue
+
             payload = self._doc_to_payload(d)
             if payload is None:
-                # seed/older docs might not have payload_json
                 rendered.append(d)
                 continue
 
@@ -469,6 +625,49 @@ class PlannerMemory:
                 payload,
                 max_list_items=max_list_items_for_rag,
             )
-            rendered.append(Document(page_content=text, metadata=deepcopy(d.metadata or {})))
+            rendered.append(Document(page_content=text, metadata=deepcopy(md)))
+
+        return rendered
+
+    def retrieve_memories_by_text(
+        self,
+        query_text: str,
+        num_entries: int = 3,
+        *,
+        image: Optional[np.ndarray] = None,
+    ) -> List[Document]:
+        """
+        Retrieve memories by text/image similarity without a driving-skill filter.
+
+        Used in the NS pipeline's Stage 1, where the intent is not yet known.
+        """
+        if num_entries <= 0:
+            return []
+
+        if image is not None:
+            query_embedding = self._compute_query_embedding(query_text, image)
+            docs: List[Document] = self.store.similarity_search_by_vector(
+                embedding=query_embedding,
+                k=num_entries,
+            )
+        else:
+            docs: List[Document] = self.store.similarity_search(
+                query=query_text,
+                k=num_entries,
+            )
+
+        rendered: List[Document] = []
+        for d in docs:
+            md = d.metadata or {}
+            display = md.get("display_text")
+            if display:
+                rendered.append(Document(page_content=display, metadata=deepcopy(md)))
+                continue
+            payload = self._doc_to_payload(d)
+            if payload is None:
+                rendered.append(d)
+                continue
+            text = self.format_memory_text(payload)
+            rendered.append(Document(page_content=text, metadata=deepcopy(md)))
 
         return rendered
