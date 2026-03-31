@@ -5,9 +5,9 @@ from scene_descriptor.data_extractors.route_extractor import (
     RouteData,
     LaneChangeData,
     IntersectionData,
-    IntersectionType,
     LaneInfo,
 )
+from privileged_route_planner import IntersectionType
 
 from .base_formatter import BaseFormatter
 
@@ -52,7 +52,7 @@ class RouteFormatter(BaseFormatter):
             name: str,
             has_lane: bool,
             is_oncoming: bool,
-            can_change: bool,
+            same_dir: bool,
             same_dir_changes_available: bool,
         ) -> str:
             # No adjacent lane on that side
@@ -71,7 +71,7 @@ class RouteFormatter(BaseFormatter):
                 )
 
             # Same-direction lane
-            if can_change:
+            if same_dir:
                 return (
                     f"{name} lane in same-direction traffic is available."
                 )
@@ -84,7 +84,7 @@ class RouteFormatter(BaseFormatter):
             "LEFT",
             lane_info.has_left_lane,
             lane_info.left_oncoming,
-            lane_info.can_change_left,
+            lane_info.left_same_dir,
             lane_info.same_direction_lane_change_available,
         )
 
@@ -92,7 +92,7 @@ class RouteFormatter(BaseFormatter):
             "RIGHT",
             lane_info.has_right_lane,
             lane_info.right_oncoming,
-            lane_info.can_change_right,
+            lane_info.right_same_dir,
             lane_info.same_direction_lane_change_available,
         )
 
@@ -110,7 +110,8 @@ class RouteFormatter(BaseFormatter):
         direction = "LEFT" if lc_data.target_maneuver == RoadOption.CHANGELANELEFT else "RIGHT"
 
         if not lc_data.inside_lane_change:
-            return f"{indent}Change lane to the {direction} after driving {f(lc_data.distance_to_lane_change, precision)} metres"
+            # return f"{indent}Change lane to the {direction} after driving {f(lc_data.distance_to_lane_change, precision)} metres"
+            return f"{indent}Change lane to the {direction}"
 
         return f"{indent}Changing lane to the {direction}"
 
@@ -150,3 +151,89 @@ class RouteFormatter(BaseFormatter):
         #     return f"{indent}{turn} at {i_type} intersection"
 
         # return f"{indent}Executing {turn} maneuver at {i_type} intersection"
+
+    @classmethod
+    def summarize(
+        cls,
+        route_data: RouteData,
+        precision: int = 2
+    ) -> str:
+        if route_data is None:
+            return ""
+
+        route_bullets = []
+        lane_bullets = []
+
+        lc = route_data.lane_change_data
+        i = route_data.intersection_data
+        li = route_data.lane_info
+
+        if i:
+            turn_map = {
+                RoadOption.LEFT: "turn left",
+                RoadOption.RIGHT: "turn right",
+            }
+            turn = turn_map.get(i.target_maneuver, "continue straight")
+
+            i_type = {
+                IntersectionType.SIGNALIZED: "signalized intersection",
+                IntersectionType.UNSIGNALIZED: "unsignalized intersection",
+            }.get(i.signalized, "junction")
+
+            if i.inside_intersection:
+                route_bullets.append(
+                    f"The ego is inside a {i_type} and is executing a maneuver to {turn}."
+                )
+            elif i.distance_to_intersection < 10.0:
+                route_bullets.append(
+                    f"The ego is at a {i_type} and should {turn}."
+                )
+            else:
+                route_bullets.append(
+                    f"The route requires the ego to {turn} at an upcoming {i_type}."
+                )
+
+        elif lc:
+            direction = "left" if lc.target_maneuver == RoadOption.CHANGELANELEFT else "right"
+            if lc.inside_lane_change:
+                route_bullets.append(
+                    f"[CAUTION] The ego is currently changing lanes to the {direction}."
+                )
+            else:
+                route_bullets.append(
+                    f"[CAUTION] The route requires a lane change to the {direction}."
+                )
+
+        else:
+            route_bullets.append("The ego should continue following the current route.")
+
+        if li:
+            if li.has_left_lane:
+                if li.left_oncoming:
+                    lane_bullets.append("The left adjacent lane is oncoming but can be used briefly for overtakes.")
+                elif li.left_same_dir:
+                    lane_bullets.append("A same-direction lane is available on the left.")
+                else:
+                    lane_bullets.append("A left adjacent lane exists but is not permitted for same-direction travel.")
+            else:
+                lane_bullets.append("There is no adjacent lane on the left.")
+
+            if li.has_right_lane:
+                if li.right_oncoming:
+                    lane_bullets.append("The right adjacent lane is oncoming but can be used briefly for overtakes.")
+                elif li.right_same_dir:
+                    lane_bullets.append("A same-direction lane is available on the right.")
+                else:
+                    lane_bullets.append("A right adjacent lane exists but is not permitted for same-direction travel.")
+            else:
+                lane_bullets.append("There is no adjacent lane on the right.")
+
+        sections = []
+
+        if route_bullets:
+            sections.append("Route Navigation Context:\n" + "\n".join(f"- {b}" for b in route_bullets))
+
+        if lane_bullets:
+            sections.append("Lane Topology Context:\n" + "\n".join(f"- {b}" for b in lane_bullets))
+
+        return "\n\n".join(sections)

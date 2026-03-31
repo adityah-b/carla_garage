@@ -35,3 +35,26 @@ class PedestrianFormatter(BaseFormatter):
 
         return ", ".join(parts)
 
+    @classmethod
+    def summarize(
+        cls,
+        peds: List[PedestrianData],
+    ) -> str:
+        if not peds:
+            return ""
+
+        bullets = []
+
+        for p in peds:
+            dist = round(p.relative_distance)
+            if p.is_on_road:
+                bullets.append(
+                    f"[CAUTION] A pedestrian is crossing the road {dist} m ahead."
+                )
+            else:
+                bullets.append(
+                    f"A pedestrian is nearby at {dist} m."
+                )
+
+        return "Pedestrian Context:\n" + "\n".join(f"- {b}" for b in bullets)
+

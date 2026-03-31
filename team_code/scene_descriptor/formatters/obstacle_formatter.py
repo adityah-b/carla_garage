@@ -38,3 +38,26 @@ class ObstacleFormatter(BaseFormatter):
             parts.append(f"Blocking Intersection. Wait Until Cleared")
 
         return ", ".join(parts)
+
+    @classmethod
+    def summarize(
+        cls,
+        obstacle_data: ObstacleData,
+    ) -> str:
+        if obstacle_data is None or not obstacle_data.ego_obstacles:
+            return ""
+
+        bullets = []
+
+        for obs in obstacle_data.ego_obstacles:
+            dist = round(obs.relative_distance)
+            if obs.is_near_junction:
+                bullets.append(
+                    f"[CAUTION] A stationary obstacle is {dist} m ahead near an intersection and blocks the route."
+                )
+            else:
+                bullets.append(
+                    f"[CAUTION] A stationary obstacle is {dist} m ahead and blocks the route."
+                )
+
+        return "Obstacle Context:\n" + "\n".join(f"- {b}" for b in bullets)

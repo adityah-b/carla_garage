@@ -56,3 +56,42 @@ class TrafficFormatter(BaseFormatter):
             f"Relative Distance: {f(ss_data.distance_to_stop_sign, precision)}, "
             f"Cleared: {ss_data.cleared}"
         )
+
+    @classmethod
+    def summarize(
+        cls,
+        traffic_data: TrafficData,
+    ) -> str:
+        if traffic_data is None:
+            return ""
+
+        bullets = []
+
+        tl = traffic_data.next_traffic_light
+        ss = traffic_data.next_stop_sign
+
+        if tl:
+            tl_dist = round(tl.distance_to_light)
+            if tl.state in ("RED", "YELLOW"):
+                bullets.append(
+                    f"[CAUTION] Traffic light is {tl.state} and {tl_dist} m ahead."
+                )
+            else:
+                bullets.append(
+                    f"Traffic light is {tl.state} and {tl_dist} m ahead."
+                )
+
+        if ss:
+            ss_dist = round(ss.distance_to_stop_sign)
+            if ss.cleared:
+                bullets.append(
+                    f"Stop sign is {ss_dist} m ahead and has already been cleared."
+                )
+            else:
+                bullets.append(
+                    f"[CAUTION] Stop sign is {ss_dist} m ahead and has not been cleared yet."
+                )
+
+        bullets.append(f"Speed limit is {round(traffic_data.speed_limit)} m/s.")
+
+        return "Traffic Context:\n" + "\n".join(f"- {b}" for b in bullets)

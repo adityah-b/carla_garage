@@ -22,3 +22,13 @@ class EgoVehicleFormatter(BaseFormatter):
         lines.append(text_data)
 
         return "\n".join(lines)
+
+    @classmethod
+    def summarize(
+        cls,
+        ego_vehicle_data: EgoVehicleData,
+    ) -> str:
+        return (
+            "Ego Context:\n"
+            f"- Ego speed is {round(ego_vehicle_data.speed)} m/s."
+        )
