@@ -384,6 +384,7 @@ class LaneHandler:
     def generate_lanelet(
         start_wp : carla.Waypoint,
         max_length : float = 80.0,
+        bwd_length : float = 0.0,
         bidirectional : bool = False,
         backward : bool = False,
     ) -> List[Lanelet]:
@@ -394,11 +395,17 @@ class LaneHandler:
         lanelets : List[Lanelet] = []
 
         if bidirectional:
+            if bwd_length > 0.0:
+                fwd_length = max_length - bwd_length
+            else:
+                fwd_length = max_length / 2
+                bwd_length = max_length / 2
+
             fwd_dense_lanelets = LaneHandler._gen_wps(
                 start_wp=start_wp,
                 wp_step_func=(lambda wp, dist : wp.next(dist)),
                 junc_step_func=(JunctionHandler.get_next_junction),
-                max_length=(max_length / 2),
+                max_length=fwd_length,
                 backward=False
             )
 
@@ -406,7 +413,7 @@ class LaneHandler:
                 start_wp=start_wp,
                 wp_step_func=(lambda wp, dist : wp.previous(dist)),
                 junc_step_func=(JunctionHandler.get_previous_junction),
-                max_length=(max_length / 2),
+                max_length=bwd_length,
                 backward=True
             )
 
@@ -734,7 +741,7 @@ class LaneHandler:
 
         # Find target junction exit from global route
         junction_exit_wp = next((wp for wp in route_waypoints if not wp.is_junction), None)
-        target_junction_exit_vec = junction_exit_wp.transform.get_forward_vector()
+        target_junction_exit_vec = junction_exit_wp.transform.get_forward_vector() if junction_exit_wp else None
 
         oncoming_wps = []
 
@@ -753,9 +760,36 @@ class LaneHandler:
                 junc_entry_vec = j_conn.entry_junction.transform.get_forward_vector()
 
                 entry_oncoming_wrt_target_entry = (junc_entry_vec.dot(target_junction_entry_vec) <= -dot_threshold)
-                entry_oncoming_wrt_target_exit  = (junc_entry_vec.dot(target_junction_exit_vec)  <= -dot_threshold)
+                entry_oncoming_wrt_target_exit = (
+                    target_junction_exit_vec is not None and junc_entry_vec.dot(target_junction_exit_vec) <= -dot_threshold
+                )
 
                 if not (entry_oncoming_wrt_target_entry or entry_oncoming_wrt_target_exit):
+                    continue
+
+                if entry_oncoming_wrt_target_entry:
+                    ref_wp = junction_entry_wp
+                elif entry_oncoming_wrt_target_exit and junction_exit_wp is not None:
+                    ref_wp = junction_exit_wp
+                else:
+                    continue
+
+                # Check lateral distance between source waypoint and chosen waypoint
+                # Ignore if lateral distance > 2 * lane_width as they don't affect the ego
+                lane_width = ref_wp.lane_width
+                wp_right_vec = ref_wp.transform.get_right_vector()
+                wp_right_vec = np.array([wp_right_vec.x, wp_right_vec.y])
+
+                wp_loc = ref_wp.transform.location
+
+                chosen_wp_loc = j_conn.entry_junction.transform.location
+
+                wp_to_chosen_vec = chosen_wp_loc - wp_loc
+                wp_to_chosen_vec = np.array([wp_to_chosen_vec.x, wp_to_chosen_vec.y])
+
+                lateral_disp = float(wp_right_vec.dot(wp_to_chosen_vec))
+
+                if np.abs(lateral_disp) > 2 * lane_width:
                     continue
 
                 # Unique lanelet generation points
@@ -767,8 +801,28 @@ class LaneHandler:
         return oncoming_wps
 
     @staticmethod
+    def _segments_intersect_2d(
+        p1: np.ndarray, p2: np.ndarray,
+        p3: np.ndarray, p4: np.ndarray,
+    ) -> bool:
+        """
+        Return True if 2-D segment P1→P2 intersects segment P3→P4.
+        Collinear / parallel segments are treated as non-intersecting.
+        """
+        d1 = p2 - p1
+        d2 = p4 - p3
+        cross = float(d1[0] * d2[1] - d1[1] * d2[0])
+        if abs(cross) < 1e-9:
+            return False
+        diff = p3 - p1
+        t = float(diff[0] * d2[1] - diff[1] * d2[0]) / cross
+        u = float(diff[0] * d1[1] - diff[1] * d1[0]) / cross
+        return 0.0 <= t and 0.0 <= u
+
+    @staticmethod
     def get_cross_dir_lanes(
         waypoint : carla.Waypoint,
+        route_waypoints : List[carla.Waypoint],
         crossing_angle : float = 30.0,
     ) -> List[carla.Waypoint]:
         """
@@ -791,6 +845,26 @@ class LaneHandler:
 
         junction_map = JunctionHandler.create_junction_map(junction_wp)
 
+        # Build the ego segment: entry connection → exit connection, using the
+        # same approach as get_same_dir_lanes (entry from the junction hop result,
+        # exit from the first non-junction waypoint on the route AFTER the junction).
+        # We must skip past junction waypoints first; without this, if the ego is
+        # still approaching the junction the search would return the ego's current
+        # (pre-junction) position, making the segment degenerate.
+        found_junction = False
+        ego_exit_wp = None
+        for wp in route_waypoints:
+            if wp.is_junction:
+                found_junction = True
+            elif found_junction:
+                ego_exit_wp = wp
+                break
+        ego_segment: Optional[Tuple[np.ndarray, np.ndarray]] = None
+        if ego_exit_wp is not None:
+            ep1 = np.array([ego_entry_wp.transform.location.x, ego_entry_wp.transform.location.y])
+            ep2 = np.array([ego_exit_wp.transform.location.x, ego_exit_wp.transform.location.y])
+            ego_segment = (ep1, ep2)
+
         cross_wps = []
 
         # Get all junction connections
@@ -799,13 +873,20 @@ class LaneHandler:
         for junction_connections in junction_map.values():
             for j_conn in junction_connections:
                 junc_entry_vec = j_conn.entry_junction.transform.get_forward_vector()
-                junc_exit_vec = j_conn.exit_junction.transform.get_forward_vector()
 
                 # Crossing lanelets are perpendicular to ego's lanelet
                 if np.abs(junc_entry_vec.dot(ego_wp_vec)) >= dot_threshold:
                     continue
-                # if np.abs(junc_exit_vec.dot(ego_wp_vec)) >= dot_threshold:
-                #     continue
+
+                # Only keep candidates whose path (entry_connection → exit_connection)
+                # actually intersects the ego's path through the junction.
+                if ego_segment is not None:
+                    cp1 = np.array([j_conn.entry_connection.transform.location.x,
+                                    j_conn.entry_connection.transform.location.y])
+                    cp2 = np.array([j_conn.exit_connection.transform.location.x,
+                                    j_conn.exit_connection.transform.location.y])
+                    if not LaneHandler._segments_intersect_2d(cp1, cp2, *ego_segment):
+                        continue
 
                 # Unique lanelet generation points
                 k = wp_key(j_conn.exit_junction)
