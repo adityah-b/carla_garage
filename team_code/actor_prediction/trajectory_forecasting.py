@@ -81,6 +81,78 @@ class MotionForecaster:
 
         return vehicle_route_points[route_index + route_index_offset:], route_index_offset
 
+    def _get_braking_distance(
+        self,
+        speed: float,
+        reaction_time: float,
+        brake_accel: float,
+    ) -> float:
+        d_brake = speed * reaction_time + (speed ** 2) / (2 * brake_accel)
+        return d_brake
+
+    def _dilate_bbox(
+        self,
+        bbox: carla.BoundingBox,
+        front_buffer_m: float,
+        rear_buffer_m: float,
+        lateral_buffer_m: float,
+    ) -> carla.BoundingBox:
+        """
+        Dilate a CARLA bounding box asymmetrically along its longitudinal axis,
+        and symmetrically along its lateral axis.
+
+        Args:
+            bbox:
+                Input bounding box. Assumed to already have the correct world-space
+                location and rotation.
+            front_buffer_m:
+                Extra distance to add in front of the vehicle (meters).
+            rear_buffer_m:
+                Extra distance to add behind the vehicle (meters).
+            lateral_buffer_m:
+                Symmetric expansion on the left and right sides of the vehicle (meters).
+
+        Returns:
+            A new carla.BoundingBox with updated center and extents.
+        """
+
+        # Original half-extents
+        ex = bbox.extent.x
+        ey = bbox.extent.y
+        ez = bbox.extent.z
+
+        # New half-extents
+        # X is asymmetrical, so the half-extent grows by the average of the two buffers
+        new_ex = ex + 0.5 * (front_buffer_m + rear_buffer_m)
+
+        # Y is symmetrical, so the half-extent simply grows by the lateral buffer amount
+        new_ey = ey + lateral_buffer_m
+
+        # Center shift in the box's LOCAL forward direction (+x in CARLA bbox space)
+        local_forward_shift = 0.5 * (front_buffer_m - rear_buffer_m)
+
+        # Rotate that local shift into world XY using the bbox yaw
+        yaw_rad = np.deg2rad(bbox.rotation.yaw)
+        dx_world = local_forward_shift * np.cos(yaw_rad)
+        dy_world = local_forward_shift * np.sin(yaw_rad)
+
+        new_loc = carla.Location(
+            x=bbox.location.x + dx_world,
+            y=bbox.location.y + dy_world,
+            z=bbox.location.z,
+        )
+
+        new_extent = carla.Vector3D(
+            x=new_ex,
+            y=new_ey,
+            z=ez,
+        )
+
+        dilated_bbox = carla.BoundingBox(new_loc, new_extent)
+        dilated_bbox.rotation = bbox.rotation
+
+        return dilated_bbox
+
     # def forecast_vehicle_bbs_array(
     #     self,
     #     all_vehicle_data : List[VehicleDataEntry],
@@ -251,10 +323,9 @@ class MotionForecaster:
         all_vehicle_data : List[VehicleDataEntry],
         prediction_horizons : Dict[int, int],
         default_future_frames : int
-    ) -> Dict[int, List[carla.BoundingBox]]:
-        # self.lateral_controller.reset_state()
-
+    ) -> Tuple[Dict[int, List[carla.BoundingBox]], Dict[int, List[carla.BoundingBox]]]:
         predicted_bounding_boxes = {v.id : [] for v in all_vehicle_data}
+        predicted_dilated_bounding_boxes = {v.id : [] for v in all_vehicle_data}
 
         # Setup initial vectorized states (control, velocity, location, heading)
         previous_actions = np.array([[v.steer, v.throttle, v.brake] for v in all_vehicle_data])
@@ -271,6 +342,7 @@ class MotionForecaster:
         # Get route points per vehicle
         route_pts_by_idx : List[np.ndarray] = [v.vehicle_route_points for v in all_vehicle_data]
 
+        # TODO: CLEAN THIS UP LATER, ESP THE HARDCODED DISTANCE CHECK
         def should_use_controller(
             route_pts_xy : np.ndarray,
             vehicle_pos_xy : np.ndarray,
@@ -281,7 +353,7 @@ class MotionForecaster:
             end_pt = route_pts_xy[-1]
             prev_end_pt = route_pts_xy[-2]
             last_dir = end_pt - prev_end_pt
-            n = np.hypot(last_dir[0], last_dir[1])
+            n = max(1e-3, np.hypot(last_dir[0], last_dir[1]))
 
             # Convert to unit vector
             last_dir_unit = last_dir / n
@@ -296,7 +368,10 @@ class MotionForecaster:
             return (not beyond_end) and (dist_to_end_sq > 2.0 ** 2)
 
         # Forecast future locations, headings, velocities and create their bounding boxes
-        stride = 1
+        base_front_buffer_m = self.config.front_buffer_m
+        rear_buffer_m = self.config.rear_buffer_m
+        lateral_buffer_m = self.config.lateral_buffer_m
+
         for i in range(default_future_frames):
             if i != 0:
                 nearest_offsets = self._get_all_nearest_route_indices(locations, route_pts_by_idx, int(5)) # 1 point per 2m
@@ -311,7 +386,7 @@ class MotionForecaster:
                     route_pts_by_idx[idx] = route_pts_by_idx[idx][offset:]
                     current_route = route_pts_by_idx[idx]
 
-                    if i % stride == 0 and should_use_controller(current_route[:, :2], locations[idx, :2]):
+                    if should_use_controller(current_route[:, :2], locations[idx, :2]):
                         # Pure pursuit
                         steer = self.lateral_controller.step_pure_pursuit(
                             route_points=current_route,
@@ -339,6 +414,15 @@ class MotionForecaster:
                 yaws_deg = np.rad2deg(headings)
 
                 for idx, v_data in enumerate(all_vehicle_data):
+                    front_buffer_m = base_front_buffer_m
+                    if v_data.traffic_type != "leading":
+                        d_brake = self._get_braking_distance(
+                            speed=velocities[idx],
+                            reaction_time=self.config.min_agent_reaction_time_s,
+                            brake_accel=self.config.brake_acceleration
+                        )
+                        front_buffer_m += d_brake
+
                     loc = carla.Location(
                         x=float(locations[idx, 0]),
                         y=float(locations[idx, 1]),
@@ -351,11 +435,29 @@ class MotionForecaster:
                     bbox = carla.BoundingBox(loc, e)
                     bbox.rotation = rot
 
-                    predicted_bounding_boxes[v_data.id].append(bbox)
+                    # Dilate true bounding box to enforce minimum gaps
+                    new_bbox = self._dilate_bbox(
+                        bbox=bbox,
+                        front_buffer_m=base_front_buffer_m,
+                        rear_buffer_m=rear_buffer_m,
+                        lateral_buffer_m=lateral_buffer_m,
+                    )
 
-        return predicted_bounding_boxes
+                    # Dilate true bounding box with braking distance for soft costs
+                    dilated_bbox = self._dilate_bbox(
+                        bbox=bbox,
+                        front_buffer_m=front_buffer_m,
+                        rear_buffer_m=rear_buffer_m,
+                        lateral_buffer_m=lateral_buffer_m,
+                    )
 
-    def forecast_vehicle_bbs(
+                    predicted_bounding_boxes[v_data.id].append(new_bbox)
+                    predicted_dilated_bounding_boxes[v_data.id].append(dilated_bbox)
+
+        return predicted_bounding_boxes, predicted_dilated_bounding_boxes
+
+    # TODO: PASS IN EGO VEHICLE DATA HERE
+    def forecast_ego_vehicle_bbs(
         self,
         vehicle : carla.Vehicle,
         vehicle_route_points : np.ndarray,
@@ -379,10 +481,16 @@ class MotionForecaster:
         else:
             vehicle_target_speed = vehicle_speed
 
-        # Calculate the throttle command based on the target speed and current speed
-        throttle = self.long_controller.get_throttle_extrapolation(vehicle_target_speed, vehicle_speed)
+        # Calculate throttle and brake command based on the target speed and current speed
+        throttle, brake = self.long_controller.get_throttle_and_brake(
+            hazard_brake=False,
+            target_speed=vehicle_target_speed.item(),
+            current_speed=vehicle_speed.item()
+        )
+        brake = float(brake)
         steering = self.lateral_controller.step(vehicle_route_points, vehicle_speed, vehicle_location, vehicle_heading_angle.item())
-        action = np.array([steering, throttle, 0.0]).flatten()
+
+        action = np.array([steering, throttle, brake]).flatten()
 
         # Iterate over the future frames and forecast the agent's state
         future_bounding_boxes = []
@@ -400,8 +508,10 @@ class MotionForecaster:
             route_index += route_index_offset
 
             steering = self.lateral_controller.step(vehicle_forecast_route, vehicle_speed, vehicle_location, vehicle_heading_angle.item())
-            throttle = self.long_controller.get_throttle_extrapolation(vehicle_target_speed, vehicle_speed)
-            action = np.array([steering, throttle, 0.0]).flatten()
+            throttle, brake = self.long_controller.get_throttle_and_brake(hazard_brake=False, target_speed=vehicle_target_speed.item(), current_speed=vehicle_speed.item())
+            brake = float(brake)
+
+            action = np.array([steering, throttle, brake]).flatten()
 
             # Record predicted bounding boxes at output frequency
             if i % self.steps_per_output == 0:

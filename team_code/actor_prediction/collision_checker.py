@@ -3,7 +3,7 @@ import numpy as np
 
 from scipy import ndimage
 from typing import List, Dict, Set, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .geometric_utils import GeometricUtils
 
@@ -17,16 +17,20 @@ class CollisionInterval:
 
 @dataclass
 class LaneOverlapInterval:
-    time_start_idx : int
-    time_end_idx : int
+    is_valid : bool
 
-    space_start_idx : int
-    space_end_idx : int
+    time_start_idx : int = -1
+    time_end_idx : int = -1
 
-    overlap_actor_bboxes : List[carla.BoundingBox]
-    overlap_route_bboxes : List[carla.BoundingBox]
+    space_start_idx : int = -1
+    space_end_idx : int = -1
 
-    frame_occupancies : Dict[int, Tuple[int, int]]
+    actor_tbb_bboxes : List[carla.BoundingBox] = field(default_factory=list)
+    actor_ebb_bboxes : List[carla.BoundingBox] = field(default_factory=list)
+    route_subset_bboxes : List[carla.BoundingBox] = field(default_factory=list)
+
+    tbb_frame_occupancies : Dict[int, Tuple[int, int]] = field(default_factory=dict)
+    ebb_frame_occupancies : Dict[int, Tuple[int, int]] = field(default_factory=dict)
 
 class CollisionChecker:
     _structure_cache : Dict[int, np.ndarray] = {}
@@ -78,7 +82,7 @@ class CollisionChecker:
             bb_a = bounding_boxes_a[i]
 
             for j in range(j0, j1 + 1):
-                if GeometricUtils.check_obb_intersection(bb_a, bounding_boxes_b[j]):
+                if GeometricUtils.check_obb_intersection_2d(bb_a, bounding_boxes_b[j]):
                     collided[i] = True
                     break
 
@@ -129,67 +133,98 @@ class CollisionChecker:
 
     # TODO: CURRENTLY DOING LONGEST (CONSERVATIVE) INTERVAL, MAY BE WORTH LOOKING INTO LIST OF ALL OVERLAP INTERVALS LATER
     @staticmethod
-    def _find_overlap_intervals(
-        actor_boxes : List[carla.BoundingBox],
-        route_boxes : List[carla.BoundingBox],
-    ) -> List[LaneOverlapInterval]:
-        num_actor_boxes = len(actor_boxes)
-        num_route_boxes = len(route_boxes)
+    def _find_overlap_interval(
+        actor_tbb_bboxes : List[carla.BoundingBox],
+        actor_ebb_bboxes : List[carla.BoundingBox],
+        route_subset_bboxes : List[carla.BoundingBox],
+        ignore_tbb : bool = False,
+    ) -> LaneOverlapInterval:
+        num_actor_boxes = len(actor_tbb_bboxes)
+        num_route_boxes = len(route_subset_bboxes)
         if num_actor_boxes == 0 or num_route_boxes == 0:
-            return []
+            return LaneOverlapInterval(is_valid=False)
 
         has_overlap_intervals = False
 
         # Global overlap bounds
-        global_actor_min = float('inf')
-        global_actor_max = float('-inf')
+        global_ebb_time_min = float('inf')
+        global_ebb_time_max = float('-inf')
+
+        global_tbb_time_min = float('inf')
+        global_tbb_time_max = float('-inf')
+
         global_route_min = float('inf')
         global_route_max = float('-inf')
 
         # Per-frame occupancies
-        frame_occupancies = {}
+        ebb_frame_occupancies = {}
+        tbb_frame_occupancies = {}
 
         # Get per-frame collisions
         for i in range(num_actor_boxes):
-            actor_bb = actor_boxes[i]
+            ebb_bb = actor_ebb_bboxes[i]
+            tbb_bb = actor_tbb_bboxes[i]
 
             # Track current frame overlap bounds
-            current_frame_route_min = float('inf')
-            current_frame_route_max = float('-inf')
+            current_frame_ebb_route_min = float('inf')
+            current_frame_ebb_route_max = float('-inf')
+
+            current_frame_tbb_route_min = float('inf')
+            current_frame_tbb_route_max = float('-inf')
+
             has_frame_overlap = False
 
             for j in range(num_route_boxes):
-                route_bb = route_boxes[j]
-                if GeometricUtils.check_obb_intersection(actor_bb, route_bb):
+                route_bb = route_subset_bboxes[j]
+
+                # Check if EBB overlaps
+                if GeometricUtils.check_obb_intersection_2d(ebb_bb, route_bb):
                     has_overlap_intervals = True
                     has_frame_overlap = True
 
+                    # Update EBB per-frame bounds
+                    current_frame_ebb_route_min = min(current_frame_ebb_route_min, j)
+                    current_frame_ebb_route_max = max(current_frame_ebb_route_max, j)
+
                     # Update Global Bounds (actor indices are temporal, route indices are spatial)
-                    global_actor_min = min(global_actor_min, i)
-                    global_actor_max = max(global_actor_max, i)
+                    global_ebb_time_min = min(global_ebb_time_min, i)
+                    global_ebb_time_max = max(global_ebb_time_max, i)
 
                     global_route_min = min(global_route_min, j)
                     global_route_max = max(global_route_max, j)
 
-                    # Update per-frame bounds
-                    current_frame_route_min = min(current_frame_route_min, j)
-                    current_frame_route_max = max(current_frame_route_max, j)
+                    # Since EBB overlapped, check if TBB also overlaps
+                    if not ignore_tbb and GeometricUtils.check_obb_intersection_2d(tbb_bb, route_bb):
+                        global_tbb_time_min = min(global_tbb_time_min, i)
+                        global_tbb_time_max = max(global_tbb_time_max, i)
 
+                        current_frame_tbb_route_min = min(current_frame_tbb_route_min, j)
+                        current_frame_tbb_route_max = max(current_frame_tbb_route_max, j)
+
+            # Save bounds if there was an EBB overlap this frame
             if has_frame_overlap:
-                frame_occupancies[i] = (int(current_frame_route_min), int(current_frame_route_max))
+                ebb_frame_occupancies[i] = (int(current_frame_ebb_route_min), int(current_frame_ebb_route_max))
 
+                # Only save TBB bounds if overlap exists
+                if current_frame_tbb_route_min != float('inf'):
+                    tbb_frame_occupancies[i] = (int(current_frame_tbb_route_min), int(current_frame_tbb_route_max))
+
+        # No overlaps in any frame
         if not has_overlap_intervals:
-            return []
+            return LaneOverlapInterval(is_valid=False)
 
-        return [LaneOverlapInterval(
-            int(global_actor_min),
-            int(global_actor_max),
-            int(global_route_min),
-            int(global_route_max),
-            actor_boxes,
-            route_boxes,
-            frame_occupancies,
-        )]
+        return LaneOverlapInterval(
+            is_valid=True,
+            time_start_idx=global_ebb_time_min,
+            time_end_idx=global_ebb_time_max,
+            space_start_idx=global_route_min,
+            space_end_idx=global_route_max,
+            actor_tbb_bboxes=actor_tbb_bboxes,
+            actor_ebb_bboxes=actor_ebb_bboxes,
+            route_subset_bboxes=route_subset_bboxes,
+            tbb_frame_occupancies=tbb_frame_occupancies,
+            ebb_frame_occupancies=ebb_frame_occupancies,
+        )
 
     @staticmethod
     def predict_actor_collisions(
@@ -216,17 +251,35 @@ class CollisionChecker:
 
     @staticmethod
     def get_lane_overlaps(
-        actor_predictions : Dict[int, List[carla.BoundingBox]], # K=actor id, V=predicted BBs,
-        route_bbs : List[carla.BoundingBox],
-    ) -> Dict[int, List[LaneOverlapInterval]]: # K=actor id, V=collision intervals
-        all_overlap_intervals : Dict[int, List[LaneOverlapInterval]] = {}
-        for actor_id, actor_bb_preds in actor_predictions.items():
-            overlap_intervals = CollisionChecker._find_overlap_intervals(
-                actor_boxes=actor_bb_preds,
-                route_boxes=route_bbs
+        veh_tbb_predictions : Dict[int, List[carla.BoundingBox]], # K=actor id, V=predicted BBs,
+        veh_ebb_predictions : Dict[int, List[carla.BoundingBox]],
+        ped_predictions : Dict[int, List[carla.BoundingBox]],
+        route_subset_bbs : List[carla.BoundingBox],
+    ) -> Dict[int, LaneOverlapInterval]: # K=actor id, V=collision interval
+        all_overlap_intervals : Dict[int, LaneOverlapInterval] = {}
+
+        # Vehicles
+        for veh_id in veh_tbb_predictions.keys():
+            veh_tbbs = veh_tbb_predictions[veh_id]
+            veh_ebbs = veh_ebb_predictions[veh_id]
+            overlap_interval = CollisionChecker._find_overlap_interval(
+                actor_tbb_bboxes=veh_tbbs,
+                actor_ebb_bboxes=veh_ebbs,
+                route_subset_bboxes=route_subset_bbs,
             )
-            if len(overlap_intervals) > 0:
-                all_overlap_intervals[actor_id] = overlap_intervals
+            if overlap_interval.is_valid:
+                all_overlap_intervals[veh_id] = overlap_interval
+
+        # Pedestrians
+        for ped_id, ped_bbs in ped_predictions.items():
+            overlap_interval = CollisionChecker._find_overlap_interval(
+                actor_tbb_bboxes=ped_bbs,
+                actor_ebb_bboxes=ped_bbs,
+                route_subset_bboxes=route_subset_bbs,
+                ignore_tbb=True
+            )
+            if overlap_interval.is_valid:
+                all_overlap_intervals[ped_id] = overlap_interval
 
         return all_overlap_intervals
 
@@ -260,7 +313,7 @@ class CollisionChecker:
                 )
 
                 # Check if actor overlaps bounding box
-                if GeometricUtils.check_obb_intersection(actor_bb, route_bb):
+                if GeometricUtils.check_obb_intersection_2d(actor_bb, route_bb):
                     if actor_id not in intruding_actors:
                         intruding_actors[actor_id] = i
 
