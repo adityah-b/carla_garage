@@ -4,7 +4,21 @@ import numpy as np
 from typing import Dict, Optional, Tuple, List
 
 from config import GlobalConfig
+from dataclasses import dataclass
+
+from privileged_route_planner import PlannerState
+from team_code.scene_descriptor.scene_descriptor import SceneData
+from team_code.actor_prediction.motion_prediction import PredictionData
+
 from actor_prediction.collision_checker import CollisionInterval, LaneOverlapInterval
+from team_code.local_planner.directive_profiles import DilationProfile, resolve_dilation_profile
+
+@dataclass
+class STMaps:
+    S_arr: np.ndarray
+    T_arr: np.ndarray
+    occupancy_map: np.ndarray
+    cost_map: np.ndarray
 
 class STOccupancyGrid:
     def __init__(self, config : GlobalConfig, st_grid_spec) -> None:
@@ -25,33 +39,7 @@ class STOccupancyGrid:
         self._envelope_slope: Optional[float] = None
         self._envelope_mask: Optional[np.ndarray] = None
 
-        # ---------------- Cost-shaping directive parameters ----------------
-
-        # Temporal dilation by command (seconds_before, seconds_after)
-        self.temporal_dilation_by_cmd : Dict[str, Tuple[float, float]] = {
-            "default" : (0.5, 0.5), # symmetric 0.5s caution window
-            "yield_for" : (3, 1.0), # 2s before collision, 1s after
-        }
-
-        # Spatial dilation by command (meters)
-        self.spatial_dilation_by_cmd : Dict[str, float] = {
-            "default" : 0.5, # 0.5m buffer around collision s-band
-            "yield_for" : 2.0, # 1m buffer
-        }
-
-        # Spatial dilation by actor type (meters)
-        self.spatial_dilation_by_type : Dict[str, float] = {
-            "default" : 0.5,
-            "vehicle" : 1.0,
-            "cyclist" : 1.5,
-            "pedestrian" : 2.0,
-        }
-
-        # Cost decay by command
-        self.cost_decay_by_cmd : Dict[str, float] = {
-            "default" : 1.1,
-            "yield_for" : 0.5,
-        }
+        # Cost-shaping: resolved per-actor via directive_profiles module
 
     def make_grids(
         self,
@@ -114,60 +102,53 @@ class STOccupancyGrid:
 
         return self._envelope_mask
 
-    # def build_st_occupancy(
-    #     self,
-    #     route_points_3d : np.ndarray,
-    #     max_speed : float,
-    #     actor_collisions : Dict[int, List[CollisionInterval]],
-    #     all_conditions : Dict[int, Tuple] = {}
-    # ) -> np.ndarray:
-    #     route_geometry = self.precompute_route_geometry(route_points_3d)
-
-    #     # ---------------- 2) dynamic obstacles → occupancy ----------------
-    #     bands = self.compute_actor_s_bands(
-    #         route_geometry=route_geometry,
-    #         actor_collisions=actor_collisions,
-    #         window=2,
-    #         all_conditions=all_conditions
-    #     )
-    #     cost_dyn = self.build_costmap_from_bands(self.T_arr, self.S_arr, bands_by_id=bands)
-
-    #     # ---------------- 3) envelope → valid mask ----------------
-    #     valid = self.get_envelope_mask(max_speed)
-    #     occ_env = ~valid  # treat outside envelope as blocked
-
-    #     # ---------------- 4) combine & (optionally) inflate ----------------
-    #     cost_total = np.maximum(cost_dyn, occ_env.astype(np.float32))  # boolean occupancy used by neighbours/Dijkstra
-
-    #     return cost_total
-
     def build_st_occupancy(
         self,
-        route_points_3d : np.ndarray,
-        max_speed : float,
-        actor_overlaps : Dict[int, List[LaneOverlapInterval]],
+        planner_state : PlannerState,
+        scene_data : SceneData,
+        prediction_data : PredictionData,
         all_conditions : Dict[int, Tuple] = {},
-    ) -> np.ndarray:
-        route_geometry = self.precompute_route_geometry(route_points_3d)
+        s_bounds : Optional[Tuple[float, float]] = None,
+    ) -> STMaps:
+        max_speed = scene_data.traffic_data.speed_limit
 
-        # ---------------- 2) dynamic obstacles → occupancy ----------------
-        bands = self.compute_actor_s_bands(
-            route_geometry=route_geometry,
-            actor_overlaps=actor_overlaps,
-            window=2,
-            all_conditions=all_conditions
+        # ---------------- 1) compute per-actor s-bands ----------------
+        tbb_bands, ebb_bands = self.compute_actor_s_bands(
+            planner_state=planner_state,
+            scene_data=scene_data,
+            prediction_data=prediction_data,
+            all_conditions=all_conditions,
+            s_bounds=s_bounds,
         )
-        cost_dyn = self.build_costmap_from_bands(self.T_arr, self.S_arr, bands_by_id=bands)
 
-        # ---------------- 3) envelope → valid mask ----------------
+        # ---------------- 2) hard occupancy from TBBs (no dilation) ----------------
+        occupancy_map = self.build_occupancy_from_bands(self.T_arr, self.S_arr, tbb_bands)
+
+        # 3) Soft cost strictly from EBBs (now safely scaled down)
+        # TODO: UPDATE THIS FIX THE COST MAP CONSTRUCTION
+        cost_map = self.build_costmap_from_bands(self.T_arr, self.S_arr, ebb_bands, collision_cost=180.0)
+
+        # --- ENFORCE HIERARCHY 1: True Collisions ---
+        # Hard blocks (TBBs) must act as infinite cost walls to the Dijkstra search.
+        # This overwrites any overlapping EBB soft costs with np.inf.
+        cost_map[occupancy_map > 0] = self.st_grid_spec.collision_cost
+
+        # 4) Penalise cells outside kinematic envelope
         valid = self.get_envelope_mask(max_speed)
-        occ_env = ~valid  # treat outside envelope as blocked
 
-        # ---------------- 4) combine & (optionally) inflate ----------------
-        # TODO: INFLATING ENVELOPE COST
-        cost_total = np.maximum(cost_dyn, 100 * occ_env.astype(np.float32))  # boolean occupancy used by neighbours/Dijkstra
+        # --- ENFORCE HIERARCHY 2: Speed Limits ---
+        # Do NOT hard-block (~valid) in the occupancy_map.
+        # Apply the envelope cost to the cost_map, but use np.maximum so we
+        # don't accidentally overwrite the np.inf collision walls we just built.
+        env_cost = self.config.st_grid_spec.envelope_cost
+        cost_map[~valid] = np.maximum(cost_map[~valid], env_cost)
 
-        return cost_total
+        return STMaps(
+            S_arr=self.S_arr,
+            T_arr=self.T_arr,
+            occupancy_map=occupancy_map,
+            cost_map=cost_map,
+        )
 
     def obb_corners_world_xy(
         self,
@@ -252,13 +233,241 @@ class STOccupancyGrid:
         s = s_at[i_s] + u_b * L[i_s]
         return s.astype(np.float32)
 
+    def _build_s_bands_from_occupancies(
+        self,
+        frame_occupancies: Dict[int, Tuple[int, int]],
+        t_start: int,
+        t_end: int,
+        route_bboxes: List[carla.BoundingBox],
+        s_route: np.ndarray,
+        ego_s_max: float,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Project route-bbox occupancy indices to s-coordinates over [t_start, t_end]."""
+        T = t_end - t_start + 1
+        s_all = np.full((T, 2), np.inf, dtype=np.float32)
+        for t_idx, (bb_start, bb_end) in frame_occupancies.items():
+            t_rel = t_idx - t_start
+            if not (0 <= t_rel < T):
+                continue
+            rs = self.config.bb_route_idx_to_dense_route_idx(bb_start)
+            re = self.config.bb_route_idx_to_dense_route_idx(bb_end)
+
+            rs = min(len(s_route) - 1, rs)
+            re = min(len(s_route) - 1, re)
+
+            s_min_val = s_route[rs] - route_bboxes[bb_start].extent.x
+            s_max_val = s_route[re] + route_bboxes[bb_end].extent.x
+            if s_min_val < ego_s_max < s_max_val and t_rel == 0:
+                s_min_val = ego_s_max + 0.1
+            s_all[t_rel, 0] = s_min_val
+            s_all[t_rel, 1] = s_max_val
+        return s_all[:, 0], s_all[:, 1]
+
+    def _filter_bands_by_s_bounds(
+        self,
+        s_min: np.ndarray,
+        s_max: np.ndarray,
+        time_indices: np.ndarray,
+        s_bounds: Optional[Tuple[float, float]],
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Trim to the contiguous valid window within s_bounds. Returns None if fully out of range."""
+        valid_mask = np.ones(len(s_min), dtype=bool)
+        if s_bounds is not None:
+            s_bound_min, s_bound_max = s_bounds
+            valid_mask = ~((s_max < s_bound_min) | (s_min > s_bound_max))
+        if not np.any(valid_mask):
+            return None
+        locs = np.where(valid_mask)[0]
+        first, last = locs[0], locs[-1]
+        return s_min[first:last + 1], s_max[first:last + 1], time_indices[first:last + 1]
+
+    def _make_s_band_entry(
+        self,
+        s_min: np.ndarray,
+        s_max: np.ndarray,
+        time_indices: np.ndarray,
+        profile: DilationProfile,
+        directive: str = "default",
+    ) -> Dict:
+        return {
+            "prediction_frequency": self.prediction_frequency,
+            "s_min": s_min,
+            "s_max": s_max,
+            "collision_start_idx": int(time_indices[0]),
+            "collision_end_idx": int(time_indices[-1]),
+            "action_type": directive,
+            "time_pad_before": profile.dt_before,
+            "time_pad_after": profile.dt_after,
+            "space_dilation_before": profile.ds_st_before,
+            "space_dilation_after": profile.ds_st_after,
+            "cost_scale": profile.cost_scale,
+            "decay_exponent": profile.decay_st,
+        }
+
+    def compute_actor_s_bands(
+        self,
+        planner_state : PlannerState,
+        scene_data : SceneData,
+        prediction_data : PredictionData,
+        *,
+        all_conditions: Dict[int, Tuple] = {},
+        s_bounds: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[Dict[int, Dict[str, np.ndarray]], Dict[int, Dict[str, np.ndarray]]]:
+        """
+        For each actor compute s-bands from TBB and EBB route overlap data.
+
+        Returns
+        -------
+        tbb_bands : Dict[actor_id → band]
+            Bands strictly from physical bounding boxes (TBB).
+            Dilation is 0. Used for hard occupancy.
+        cost_bands : Dict[actor_id → band]
+            Bands from extended bounding boxes (EBB).
+            Used purely for soft cost (decay padding around TBB).
+        """
+        tbb_bands: Dict[int, Dict[str, np.ndarray]] = {}
+        cost_bands: Dict[int, Dict[str, np.ndarray]] = {}
+
+        route_index = planner_state.route_index
+        s_route = planner_state.s_route[route_index:] - planner_state.s_route[route_index]
+        ego_s_max = self.config.ego_extent_x
+
+        all_actor_overlaps = prediction_data.all_actor_overlaps
+
+        _ZERO_PROFILE = DilationProfile()
+
+        for actor_id, overlap_interval in all_actor_overlaps.items():
+            if actor_id in all_conditions:
+                directive, actor_type, traffic_type, priority = all_conditions[actor_id]
+            else:
+                directive, actor_type, traffic_type, priority = "default", "default", "default", "medium"
+
+            profile = resolve_dilation_profile(directive, actor_type, traffic_type, priority)
+
+            route_bboxes: List[carla.BoundingBox] = overlap_interval.route_subset_bboxes
+            tbb_occ = overlap_interval.tbb_frame_occupancies
+            ebb_occ = overlap_interval.ebb_frame_occupancies
+
+            # ---------------------------------------------------------
+            # 1. TBB: Hard Occupancy (STRICTLY NO DILATION)
+            # ---------------------------------------------------------
+            result = None
+            if len(tbb_occ) > 0:
+                tbb_times = sorted(tbb_occ.keys())
+                tbb_t_start, tbb_t_end = tbb_times[0], tbb_times[-1]
+                tbb_time_indices = np.arange(tbb_t_start, tbb_t_end + 1, dtype=np.int32)
+
+                tbb_s_min, tbb_s_max = self._build_s_bands_from_occupancies(
+                    tbb_occ, tbb_t_start, tbb_t_end, route_bboxes, s_route, ego_s_max
+                )
+                result = self._filter_bands_by_s_bounds(tbb_s_min, tbb_s_max, tbb_time_indices, s_bounds)
+                if result is not None:
+                    tbb_s_min, tbb_s_max, tbb_time_indices = result
+                    tbb_bands[actor_id] = self._make_s_band_entry(
+                        tbb_s_min, tbb_s_max, tbb_time_indices,
+                        profile=_ZERO_PROFILE, directive=directive,
+                    )
+
+            # ---------------------------------------------------------
+            # 2. EBB: Soft Cost (EBB baseline + directive ST deltas)
+            # ---------------------------------------------------------
+            if len(ebb_occ) > 0:
+                ebb_t_start = overlap_interval.time_start_idx
+                ebb_t_end = overlap_interval.time_end_idx
+                ebb_time_indices = np.arange(ebb_t_start, ebb_t_end + 1, dtype=np.int32)
+
+                ebb_s_min, ebb_s_max = self._build_s_bands_from_occupancies(
+                    ebb_occ, ebb_t_start, ebb_t_end, route_bboxes, s_route, ego_s_max
+                )
+                ebb_result = self._filter_bands_by_s_bounds(ebb_s_min, ebb_s_max, ebb_time_indices, s_bounds)
+                if ebb_result is not None:
+                    ebb_s_min, ebb_s_max, ebb_time_indices = ebb_result
+                    cost_bands[actor_id] = self._make_s_band_entry(
+                        ebb_s_min, ebb_s_max, ebb_time_indices,
+                        profile=profile, directive=directive,
+                    )
+            elif len(tbb_occ) > 0 and result is not None:
+                # Fallback: no EBB exists — use TBB + directive profile dilation
+                cost_bands[actor_id] = self._make_s_band_entry(
+                    tbb_s_min, tbb_s_max, tbb_time_indices,
+                    profile=profile, directive=directive,
+                )
+
+        return tbb_bands, cost_bands
+
+    def get_frenet_s_bounds(
+        self,
+        bbox_corners_xy_N: np.ndarray,
+        route_xy: np.ndarray,
+        route_s: np.ndarray,
+        route_yaws: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Vectorized projection of N bounding boxes (each with 4 corners) onto a reference path.
+
+        Args:
+            corners_xy_N: (N, 4, 2) array of [x, y] coordinates for bounding box corners over time.
+            route_x, route_y: (M,) arrays of the reference path coordinates (sliced for efficiency).
+            route_s: (M,) array of accumulated s-values along the path.
+            route_theta: (M,) array of heading angles (in radians) along the path.
+
+        Returns:
+            s_min, s_max: Two (N,) arrays containing the min and max s-values per timestep.
+        """
+        # 1. Expand dimensions for broadcasting
+        # corners: (N, 4, 1, 2) | route: (1, 1, M, 2)
+        corners_expanded = bbox_corners_xy_N[:, :, np.newaxis, :]
+        route_expanded = route_xy[np.newaxis, np.newaxis, :, :]
+
+        # 2. Compute distances from all corners at all times to all route points
+        # Resulting shape: (N, 4, M)
+        diff = corners_expanded - route_expanded
+        dists_sq = np.sum(diff * diff, axis=3)
+
+        # 3. Find the index of the nearest route point for each corner at each time
+        # Resulting shape: (N, 4)
+        nearest_idx = np.argmin(dists_sq, axis=2)
+
+        # 4. Extract reference data using advanced indexing
+        ref_x = route_xy[nearest_idx, 0]         # (N, 4)
+        ref_y = route_xy[nearest_idx, 1]         # (N, 4)
+        ref_s = route_s[nearest_idx]         # (N, 4)
+        ref_theta = route_yaws[nearest_idx] # (N, 4)
+
+        # 5. Compute displacement vectors
+        dx = bbox_corners_xy_N[:, :, 0] - ref_x   # (N, 4)
+        dy = bbox_corners_xy_N[:, :, 1] - ref_y   # (N, 4)
+
+        # 6. normal vectors at the reference points
+        t_x, t_y = np.cos(ref_theta), np.sin(ref_theta)
+        n_x, n_y = -np.sin(ref_theta), np.cos(ref_theta)
+
+        # 7. Dot products to get Delta S and exact D
+        delta_s = dx * t_x + dy * t_y        # (N, 4)
+        d_vals  = dx * n_x + dy * n_y        # (N, 4)
+
+        # 8. Calculate absolute S for all corners
+        s_corners = ref_s + delta_s          # (N, 4)
+
+        s_corners = np.clip(s_corners, route_s[0], route_s[-1])
+
+        # 9. Reduce to min and max along the corner axis (axis=1)
+        s_min = np.min(s_corners, axis=1)    # (N,)
+        s_max = np.max(s_corners, axis=1)    # (N,)
+
+        d_min = np.min(d_vals, axis=1)
+        d_max = np.max(d_vals, axis=1)
+
+        return s_min, s_max, d_min, d_max
+
     # def compute_actor_s_bands(
     #     self,
-    #     route_geometry : Dict[str, np.ndarray],
-    #     actor_collisions : Dict[int, List[CollisionInterval]],
+    #     planner_state : PlannerState,
+    #     scene_data : SceneData,
+    #     prediction_data : PredictionData,
     #     *,
-    #     window: int = 2,
     #     all_conditions: Dict[int, Tuple] = {},
+    #     s_bounds: Optional[Tuple[float, float]] = None,
     # ) -> Dict[int, Dict[str, np.ndarray]]:
     #     """
     #     For each actor, project its four OBB corners per time to s, then
@@ -276,205 +485,104 @@ class STOccupancyGrid:
     #     around the collision band. Actor type and importance scale the collision
     #     cost and dilation to reflect perceived risk.
     #     """
-    #     # TODO: Vectorizing colliding carla bounding boxes here for now. Future work needs to have the vectorization be done earlier in the pipeline
-    #     def bbox_to_vec7(bb : carla.BoundingBox) -> np.ndarray:
-    #         return np.array([
-    #             bb.location.x, bb.location.y, bb.location.z,
-    #             bb.extent.x,   bb.extent.y,   bb.extent.z,
-    #             bb.rotation.yaw
-    #         ], dtype=np.float32)
-
     #     out: Dict[int, Dict[str, np.ndarray]] = {}
 
-    #     # Number of discrete time indices to extend before/after the true
-    #     # collision interval for each action type.
-    #     time_extension_steps = {
-    #         # "yield_for": (2, 10),      # wait longer after the collision
-    #         "yield_for": (100, 10),      # wait longer after the collision
-    #         # "yield_for": (10, 100),      # wait longer after the collision
-    #         # "yield_for": (50, 50),      # wait longer after the collision
-    #         "watch_out_for": (10, 10),   # symmetric caution window
-    #     }
+    #     route_index = planner_state.route_index
+    #     route_pts = planner_state.route_points[route_index:]
+    #     route_yaws = planner_state.rotation_angles[route_index:]
+    #     s_route = planner_state.s_route[route_index:] - planner_state.s_route[route_index]
 
-    #     # Spatial dilation (in metres) based on actor type and action flavour.
-    #     base_space_dilation = 0.5
-    #     space_dilation_by_actor_type = {"vehicle": 0.5, "cyclist": 1.0, "ped": 1.5}
-    #     space_dilation_by_action = {"yield_for": 1.0, "watch_out_for": 0.5}
-
-    #     # Collision cost scaling based on actor type + importance.
-    #     collision_cost_scale = {"vehicle": 1.0, "cyclist": 1.2, "ped": 1.4}
-
-    #     # Project collision intervals
-    #     for actor_id, collisions in actor_collisions.items():
-    #         # NOTE: Only using single collision interval (i.e. longest collision interval for now)
-    #         collision_interval = collisions[0]
-    #         start_idx = collision_interval.start_idx
-    #         end_idx = collision_interval.end_idx
-
-    #         # TODO: Vectorizing colliding carla bounding boxes here for now. Future work needs to have the vectorization be done earlier in the pipeline
-    #         # TODO: No need to store colliding bboxes of source and target, only target should be fine
-    #         bboxes : List[carla.BoundingBox] = collision_interval.collision_bboxes_b
-    #         bboxes_arr = np.stack([bbox_to_vec7(bb) for bb in bboxes], axis=0)
-
-    #         action_type: Optional[str] = None
-    #         actor_type: Optional[str] = None
-    #         importance: float = 0.0
-    #         # NOTE : TEMPORARY, DEBUGGING
-    #         if actor_id in all_conditions:
-    #             action_type, actor_type, importance = all_conditions[actor_id]
-    #         else:
-    #             action_type, actor_type, importance = "yield_for", "vehicle", 1.0
-
-    #         # Determine time padding driven by the action type (if any)
-    #         pad_before = pad_after = 0
-    #         if action_type is not None:
-    #             pad_before, pad_after = time_extension_steps[action_type]
-
-    #         extended_start = max(0, start_idx - pad_before)
-    #         extended_end = min(bboxes_arr.shape[0] - 1, end_idx + pad_after)
-
-    #         extended_indices = np.arange(extended_start, extended_end, dtype=np.int32)
-    #         arr_extended = bboxes_arr[extended_indices]
-    #         T_ext = arr_extended.shape[0]
-
-    #         corners_ext = self.obb_corners_world_xy(arr_extended)
-    #         s_all_ext = self.project_points_to_route_s(
-    #             corners_ext.reshape(-1, 2), route_geometry, window=window
-    #         ).reshape(T_ext, 4)
-
-    #         s_min_ext = np.min(s_all_ext, axis=1)
-    #         s_max_ext = np.max(s_all_ext, axis=1)
-
-    #         collision_mask = (extended_indices >= start_idx) & (extended_indices <= end_idx)
-    #         time_distance_steps = np.zeros_like(extended_indices, dtype=np.float32)
-    #         if collision_mask.any():
-    #             # Distance in discrete steps to the nearest point inside the collision interval
-    #             before_dist = np.maximum(0, start_idx - extended_indices)
-    #             after_dist = np.maximum(0, extended_indices - end_idx)
-    #             time_distance_steps = np.maximum(before_dist, after_dist).astype(np.float32)
-
-    #         action_dilation = space_dilation_by_action.get(action_type, 0.0)
-    #         actor_dilation = space_dilation_by_actor_type.get(actor_type, 0.0)
-    #         space_dilation = base_space_dilation + action_dilation + actor_dilation
-    #         cost_scale = collision_cost_scale.get(actor_type, 1.0) * (1.0 + 0.75 * importance)
-
-    #         out[actor_id] = {
-    #             "s_min": s_min_ext.astype(np.float32),
-    #             "s_max": s_max_ext.astype(np.float32),
-    #             "start_idx": int(extended_start),
-    #             "end_idx": int(extended_end),
-    #             "collision_start_idx": int(start_idx),
-    #             "collision_end_idx": int(end_idx),
-    #             "collision_mask": collision_mask.astype(np.bool_),
-    #             "time_indices": extended_indices.astype(np.int32),
-    #             "time_distance_steps": time_distance_steps.astype(np.float32),
-    #             "time_extension_steps_before": int(pad_before),
-    #             "time_extension_steps_after": int(pad_after),
-    #             "space_dilation": float(space_dilation),
-    #             "action_type": action_type,
-    #             "actor_type": actor_type,
-    #             "importance": float(importance),
-    #             "cost_scale": float(cost_scale),
-    #         }
-
-    #     return out
-
-    # def compute_actor_s_bands(
-    #     self,
-    #     route_geometry : Dict[str, np.ndarray],
-    #     actor_overlaps : Dict[int, List[LaneOverlapInterval]],
-    #     *,
-    #     window: int = 2,
-    #     all_conditions: Dict[int, Tuple] = {},
-    #     prediction_frequency : int = 10,
-    # ) -> Dict[int, Dict[str, np.ndarray]]:
-    #     """
-    #     For each actor, project its four OBB corners per time to s, then
-    #     take min/max across corners → s_min(t), s_max(t).
-
-    #     `all_conditions` lets callers describe how to extend and weight the costs
-    #     for specific actors using (action_type, actor_type, importance):
-    #         - action_type ∈ {"yield_for", "watch_out_for"}
-    #         - actor_type  ∈ {"vehicle", "cyclist", "ped"}
-    #         - importance  ∈ [0.0, 1.0]
-
-    #     "yield_for" emphasises waiting until the actor passes the conflict region
-    #     by padding the time dimension primarily before the collision interval.
-    #     "watch_out_for" builds symmetric time padding and a larger spatial buffer
-    #     around the collision band. Actor type and importance scale the collision
-    #     cost and dilation to reflect perceived risk.
-    #     """
-    #     # TODO: Vectorizing colliding carla bounding boxes here for now. Future work needs to have the vectorization be done earlier in the pipeline
-    #     def bbox_to_vec7(bb : carla.BoundingBox) -> np.ndarray:
-    #         return np.array([
-    #             bb.location.x, bb.location.y, bb.location.z,
-    #             bb.extent.x,   bb.extent.y,   bb.extent.z,
-    #             bb.rotation.yaw
-    #         ], dtype=np.float32)
-
-    #     out: Dict[int, Dict[str, np.ndarray]] = {}
+    #     # Get overlap intervals
+    #     all_actor_overlaps = prediction_data.all_actor_overlaps
 
     #     # Project overlap intervals
-    #     for actor_id, overlaps in actor_overlaps.items():
-    #         if not overlaps:
+    #     for actor_id, overlap_interval in all_actor_overlaps.items():
+    #         if not overlap_interval.is_valid:
     #             continue
 
     #         # Get conditions for each actor
     #         if actor_id in all_conditions:
     #             action_type, actor_type, importance = all_conditions[actor_id]
     #         else:
-    #             action_type, actor_type, importance = "yield_for", "default", 1.0
+    #             # action_type, actor_type, importance = "yield_for", "default", 1.0
+    #             action_type, actor_type, importance = "default", "default", 1.0
 
     #         # Get space and time padding based on command and object type
     #         time_pad_before, time_pad_after = self.temporal_dilation_by_cmd[action_type]
-
-    #         action_space_dilation = self.spatial_dilation_by_cmd[action_type]
-    #         actor_space_dilation = self.spatial_dilation_by_type[actor_type]
-    #         space_dilation = action_space_dilation + actor_space_dilation
 
     #         cost_scale = 1.0 + 0.75 * importance
 
     #         # NOTE: Only using single overlap interval
     #         # Get overlap interval time indices
-    #         overlap_interval = overlaps[0]
-    #         start_idx = overlap_interval.time_start_idx
-    #         end_idx = overlap_interval.time_end_idx
+    #         t_start_idx = overlap_interval.time_start_idx
+    #         t_end_idx = overlap_interval.time_end_idx
 
-    #         # TODO: Vectorizing colliding carla bounding boxes here for now. Future work needs to have the vectorization be done earlier in the pipeline
-    #         # TODO: No need to store colliding bboxes of source and target, only target should be fine
-    #         # Get overlapping actor bounding boxes
-    #         bboxes : List[carla.BoundingBox] = overlap_interval.overlap_actor_bboxes
-    #         bboxes_arr = np.stack([bbox_to_vec7(bb) for bb in bboxes], axis=0)
+    #         # Create time index array
+    #         time_indices = np.arange(t_start_idx, t_end_idx + 1, dtype=np.int32)
 
-    #         # Get collision slice
-    #         time_indices = np.arange(start_idx, end_idx + 1, dtype=np.int32)
-    #         arr_collision = bboxes_arr[time_indices]
-    #         T_collision = arr_collision.shape[0]
+    #         # Get route and overlapping bounding box data
+    #         route_start_idx = overlap_interval.space_start_idx * 20
+    #         route_end_idx = overlap_interval.space_end_idx * 20
+    #         route_slice = slice(route_start_idx, route_end_idx + 1)
 
-    #         # Project 4 corners of bounding boxes to s along route per timestep t
-    #         corners_collision = self.obb_corners_world_xy(arr_collision)  # expected (T_collision, 4, 2)
-    #         s_all_collision = self.project_points_to_route_s(
-    #             corners_collision.reshape(-1, 2),
-    #             route_geometry,
-    #             window=window,
-    #         ).reshape(T_collision, 4)
+    #         actor_ebb_corners_N = overlap_interval.actor_overlapping_ebb_corners
+    #         print(f'\n\nFRENET TRANSFORM')
+    #         print(f'\tACTOR ID: {actor_id}, BB_IDX: {overlap_interval.space_start_idx}, ROUTE_START_IDX: {route_start_idx}, S_ROUTE[0]: {s_route[route_start_idx]}')
+    #         s_min, s_max, d_min, d_max = self.get_frenet_s_bounds(
+    #             bbox_corners_xy_N=actor_ebb_corners_N,
+    #             route_xy=route_pts[route_slice, :2],
+    #             route_s=s_route[route_slice],
+    #             route_yaws=route_yaws[route_slice],
+    #         )
 
-    #         # Reduce collision band to min and max s per timestep
-    #         s_min = np.min(s_all_collision, axis=1)
-    #         s_max = np.max(s_all_collision, axis=1)
+    #         # print(f'\n\nS_MIN: {s_min}, \nS_MAX: {s_max}, \nD_MIN: {d_min}, \nD_MAX: {d_max}')
+
+    #         D_THRESHOLD = self.config.ego_extent_y * 1.1
+    #         lateral_threat_mask = (d_min <= D_THRESHOLD) & (d_max >= -D_THRESHOLD)
+
+    #         # 2. Define S-Bounds Mask (with corrected parenthesis and OR logic)
+    #         if s_bounds is not None:
+    #             s_bound_min, s_bound_max = s_bounds
+    #             # Mask is TRUE if the vehicle is strictly outside the bounds
+    #             s_out_of_bounds = (s_max < s_bound_min) | (s_min > s_bound_max)
+    #             s_threat_mask = ~s_out_of_bounds
+    #             print(f'\n\nACTOR ID: {actor_id}, S_MIN: {s_min}, S_BOUND_MIN: {s_bound_min}')
+    #         else:
+    #             s_threat_mask = np.ones_like(lateral_threat_mask, dtype=bool)
+
+    #         # 3. Combine Masks: A threat only exists if BOTH S and D overlap
+    #         valid_mask = lateral_threat_mask & s_threat_mask
+
+    #         # 4. Handle vehicles that are completely harmless
+    #         if not np.any(valid_mask):
+    #             continue # Skip adding this actor to the output dictionary
+
+    #         # 5. Crop arrays to the continuous valid time window
+    #         # This prevents creating gaps in the middle of your time arrays,
+    #         # which would break your downstream ST grid builder.
+    #         valid_indices = np.where(valid_mask)[0]
+    #         first_idx = valid_indices[0]
+    #         last_idx = valid_indices[-1]
+
+    #         s_min = s_min[first_idx:last_idx + 1]
+    #         s_max = s_max[first_idx:last_idx + 1]
+    #         time_indices = time_indices[first_idx:last_idx + 1]
+
+    #         # Recompute the start and end collision indices for the valid window
+    #         t_start_idx = time_indices[0]
+    #         t_end_idx = time_indices[-1]
 
     #         out[actor_id] = {
-    #             # Prediction frame rate
-    #             "prediction_frequency" : prediction_frequency,
+    #             # Prediction frequency
+    #             "prediction_frequency" : self.prediction_frequency,
 
     #             # Collision band extents over time
     #             "s_min": s_min,
     #             "s_max": s_max,
 
-    #             # Exact collision indices (in the bbox timeline)
-    #             "collision_start_idx": start_idx,
-    #             "collision_end_idx": end_idx,
-    #             "time_indices": time_indices,
+    #             # Use the new filtered time indices
+    #             "collision_start_idx": t_start_idx,
+    #             "collision_end_idx": t_end_idx,
 
     #             # Command directive parameters
     #             "action_type": action_type,
@@ -482,132 +590,11 @@ class STOccupancyGrid:
     #             "importance": importance,
     #             "time_pad_before" : time_pad_before,
     #             "time_pad_after" : time_pad_after,
-    #             "space_dilation" : space_dilation,
+    #             "space_dilation" : 0.0,
     #             "cost_scale": cost_scale,
     #         }
 
     #     return out
-
-    def compute_actor_s_bands(
-        self,
-        route_geometry : Dict[str, np.ndarray],
-        actor_overlaps : Dict[int, List[LaneOverlapInterval]],
-        *,
-        window: int = 2,
-        all_conditions: Dict[int, Tuple] = {},
-    ) -> Dict[int, Dict[str, np.ndarray]]:
-        """
-        For each actor, project its four OBB corners per time to s, then
-        take min/max across corners → s_min(t), s_max(t).
-
-        `all_conditions` lets callers describe how to extend and weight the costs
-        for specific actors using (action_type, actor_type, importance):
-            - action_type ∈ {"yield_for", "watch_out_for"}
-            - actor_type  ∈ {"vehicle", "cyclist", "ped"}
-            - importance  ∈ [0.0, 1.0]
-
-        "yield_for" emphasises waiting until the actor passes the conflict region
-        by padding the time dimension primarily before the collision interval.
-        "watch_out_for" builds symmetric time padding and a larger spatial buffer
-        around the collision band. Actor type and importance scale the collision
-        cost and dilation to reflect perceived risk.
-        """
-        # TODO: Vectorizing colliding carla bounding boxes here for now. Future work needs to have the vectorization be done earlier in the pipeline
-        def bbox_to_vec7(bb : carla.BoundingBox) -> np.ndarray:
-            return np.array([
-                bb.location.x, bb.location.y, bb.location.z,
-                bb.extent.x,   bb.extent.y,   bb.extent.z,
-                bb.rotation.yaw
-            ], dtype=np.float32)
-
-        out: Dict[int, Dict[str, np.ndarray]] = {}
-
-        # Project overlap intervals
-        for actor_id, overlaps in actor_overlaps.items():
-            if not overlaps:
-                continue
-
-            # Get conditions for each actor
-            if actor_id in all_conditions:
-                action_type, actor_type, importance = all_conditions[actor_id]
-            else:
-                action_type, actor_type, importance = "yield_for", "default", 1.0
-
-            # Get space and time padding based on command and object type
-            time_pad_before, time_pad_after = self.temporal_dilation_by_cmd[action_type]
-
-            action_space_dilation = self.spatial_dilation_by_cmd[action_type]
-            actor_space_dilation = self.spatial_dilation_by_type[actor_type]
-            space_dilation = action_space_dilation + actor_space_dilation
-
-            cost_scale = 1.0 + 0.75 * importance
-
-            # NOTE: Only using single overlap interval
-            # Get overlap interval time indices
-            overlap_interval = overlaps[0]
-            t_start_idx = overlap_interval.time_start_idx
-            t_end_idx = overlap_interval.time_end_idx
-
-            # Create time index array
-            time_indices = np.arange(t_start_idx, t_end_idx + 1, dtype=np.int32)
-            T_steps = time_indices.shape[0]
-
-            # Get route and overlapping bounding box data
-            route_bboxes : List[carla.BoundingBox] = overlap_interval.overlap_route_bboxes
-            frame_occupancies = overlap_interval.frame_occupancies
-            s_at = route_geometry["s_at_vtx"]
-
-            s_all_overlap = np.full((T_steps, 2), np.nan, dtype=np.float32)
-
-            # print(f'\n\nS VALUE CONSTRUCTION for actor: {actor_id}')
-            for t_idx, route_bb_indices in frame_occupancies.items():
-                t_rel_idx = t_idx - t_start_idx
-
-                bb_start_idx, bb_end_idx = route_bb_indices
-
-                # Transform bounding box indices to indices along route
-                # TODO: Hard coded for now, UPDATE INDEX TRANSORMATION WITH CONFIG NUMBERS
-                route_start_idx = bb_start_idx * 20
-                route_end_idx = bb_end_idx *  20
-
-                # print(f'\tbb route start: {route_start_idx}, bb route end: {route_end_idx}')
-
-                s_min_val = s_at[route_start_idx] - (route_bboxes[bb_start_idx].extent.x)
-                s_max_val = s_at[route_end_idx] + (route_bboxes[bb_end_idx].extent.x)
-
-                # print(f'\t\ts_at[start]: {s_at[route_start_idx]}, s_at[end]: {s_at[route_end_idx]}, s_min: {s_min_val}, s_max_val: {s_max_val}')
-
-                s_all_overlap[t_rel_idx, 0] = s_min_val
-                s_all_overlap[t_rel_idx, 1] = s_max_val
-
-            # Reduce collision band to min and max s per timestep
-            s_min = s_all_overlap[:, 0]
-            s_max = s_all_overlap[:, 1]
-
-            out[actor_id] = {
-                # Prediction frequency
-                "prediction_frequency" : self.prediction_frequency,
-
-                # Collision band extents over time
-                "s_min": s_min,
-                "s_max": s_max,
-
-                # Exact collision indices (in the bbox timeline)
-                "collision_start_idx": t_start_idx,
-                "collision_end_idx": t_end_idx,
-                "time_indices": time_indices,
-
-                # Command directive parameters
-                "action_type": action_type,
-                "actor_type": actor_type,
-                "importance": importance,
-                "time_pad_before" : time_pad_before,
-                "time_pad_after" : time_pad_after,
-                "space_dilation" : space_dilation,
-                "cost_scale": cost_scale,
-            }
-
-        return out
 
     # def build_costmap_from_bands(
     #     self,
@@ -839,13 +826,67 @@ class STOccupancyGrid:
 
     #     return cost
 
+    def build_occupancy_from_bands(
+        self,
+        t: np.ndarray,
+        s: np.ndarray,
+        tbb_bands_by_id: Dict[int, Dict[str, np.ndarray]],
+    ) -> np.ndarray:
+        """
+        Rasterize TBB bands into a binary hard-occupancy grid.
+
+        Cells covered by the true bounding-box s-interval at each timestep are
+        set to ``collision_cost``; all other cells remain 0.  No spatial dilation
+        or temporal decay is applied — the core footprint is strictly blocked.
+        """
+        t = t.reshape(-1)
+        s = s.reshape(-1)
+        K, S = t.size, s.size
+
+        collision_cost = self.config.st_grid_spec.collision_cost
+        occ = np.zeros((K, S), dtype=np.float32)
+
+        if not tbb_bands_by_id:
+            return occ
+
+        ds = float(self.st_grid_spec.ds)
+
+        for actor_id, band in tbb_bands_by_id.items():
+            s_min_local = band["s_min"]
+            s_max_local = band["s_max"]
+            if s_min_local.size == 0:
+                continue
+
+            k_start = band["collision_start_idx"]
+            k_end   = band["collision_end_idx"]
+            k0 = max(0, k_start)
+            k1 = min(K - 1, k_end)
+            if k1 < k0:
+                continue
+
+            offset = k0 - k_start
+            span   = k1 - k0 + 1
+            smin_slice = s_min_local[offset : offset + span]
+            smax_slice = s_max_local[offset : offset + span]
+
+            j_lo = np.clip(np.floor(smin_slice / ds), 0, S - 1).astype(np.int32)
+            j_hi = np.clip(np.floor(smax_slice / ds), 0, S - 1).astype(np.int32)
+
+            for r in range(span):
+                if not (np.isfinite(smin_slice[r]) and np.isfinite(smax_slice[r])):
+                    continue
+                lo, hi = int(j_lo[r]), int(j_hi[r])
+                if hi >= lo:
+                    occ[k0 + r, lo : hi + 1] = collision_cost
+
+        return occ
+
     def build_costmap_from_bands(
         self,
         t: np.ndarray,
         s: np.ndarray,
         bands_by_id: Dict[int, Dict[str, np.ndarray]],
-        *,
-        collision_cost: float = 255.0,
+        collision_cost : float,
     ) -> np.ndarray:
         """
         Global envelope + 1D (time-axis) distance-to-core mask.
@@ -872,6 +913,27 @@ class STOccupancyGrid:
         for actor_id, band in bands_by_id.items():
             s_min_local = band["s_min"]
             s_max_local = band["s_max"]
+
+            # Core collision indices
+            k_col_start = band["collision_start_idx"]
+            k_col_end = band["collision_end_idx"]
+
+            # --- NEW: Clamp temporal indices and crop spatial arrays to ST grid bounds ---
+            if k_col_start >= K or k_col_end < 0:
+                continue  # Prediction is entirely outside the ST planning horizon
+
+            valid_start = max(0, -k_col_start)
+            valid_end = min(len(s_min_local), K - k_col_start)
+
+            # Crop the arrays so they match the clamped time interval
+            s_min_local = s_min_local[valid_start:valid_end]
+            s_max_local = s_max_local[valid_start:valid_end]
+
+            # Clamp the time indices
+            k_col_start = max(0, k_col_start)
+            k_col_end = min(K - 1, k_col_end)
+            # -----------------------------------------------------------------------------
+
             if s_min_local.size == 0 or s_max_local.size == 0:
                 continue
             if not (s_min_local.size == s_max_local.size):
@@ -880,23 +942,18 @@ class STOccupancyGrid:
                     f"got {s_min_local.size}, {s_max_local.size}"
                 )
 
-            # Core collision indices
-            k_col_start = band["collision_start_idx"]
-            k_col_end = band["collision_end_idx"]
-
             # Command directive parameters
             prediction_frequency = band["prediction_frequency"]
 
-            action_type = band["action_type"]
-            importance = band["importance"]
             cost_scale = band["cost_scale"]
 
             time_pad_before_s = band["time_pad_before"]
             time_pad_after_s = band["time_pad_after"]
 
-            space_dilation = band["space_dilation"]
+            space_dilation_before = band["space_dilation_before"]
+            space_dilation_after = band["space_dilation_after"]
 
-            decay_exponent = self.cost_decay_by_cmd[action_type]
+            decay_exponent = band["decay_exponent"]
 
             # Cost temporal window in steps
             time_pad_before_steps = int(np.round(time_pad_before_s * prediction_frequency))
@@ -904,9 +961,9 @@ class STOccupancyGrid:
             k_ext_start = max(0, k_col_start - time_pad_before_steps)
             k_ext_end = min(K - 1, k_col_end + time_pad_after_steps)
 
-            # Get global envelope over collision region with spatial dilation
-            s_min_global = np.min(s_min_local) - space_dilation
-            s_max_global = np.max(s_max_local) + space_dilation
+            # Get global envelope over collision region with asymmetric spatial dilation
+            s_min_global = np.min(s_min_local) - space_dilation_before
+            s_max_global = np.max(s_max_local) + space_dilation_after
 
             j_lo_global = np.clip(np.floor(s_min_global / ds), 0, S - 1).astype(np.int32)
             j_hi_global = np.clip(np.floor(s_max_global / ds), 0, S - 1).astype(np.int32)
@@ -916,9 +973,9 @@ class STOccupancyGrid:
             ENV_COLS = j_hi_global - j_lo_global + 1
             envelope_mask = np.zeros((ENV_ROWS, ENV_COLS), dtype=np.bool_)
 
-            # Populate envelope mask with true collision region
-            s_min_dil = s_min_local - space_dilation
-            s_max_dil = s_max_local + space_dilation
+            # Populate envelope mask with true collision region (asymmetric spatial dilation)
+            s_min_dil = s_min_local - space_dilation_before
+            s_max_dil = s_max_local + space_dilation_after
 
             j_lo_dil = np.clip(np.floor(s_min_dil / ds), j_lo_global, j_hi_global).astype(np.int32)
             j_hi_dil = np.clip(np.floor(s_max_dil / ds), j_lo_global, j_hi_global).astype(np.int32)
@@ -939,7 +996,7 @@ class STOccupancyGrid:
             rr_start = k_col_start - k_ext_start
             envelope_mask[rr_start : rr_start + COL_SPAN, :] = core_mask_in_envelope
 
-            max_cost = collision_cost * cost_scale
+            max_cost = float(collision_cost * cost_scale)
 
             mask = envelope_mask  # (ENV_ROWS, ENV_COLS) bool
             N, W = mask.shape
@@ -954,8 +1011,6 @@ class STOccupancyGrid:
             right_idx = np.where(mask, idx, 2 * N)                                  # (N,W)
             last_true_right = np.minimum.accumulate(right_idx[::-1], axis=0)[::-1]  # (N,W)
             dist_right = (last_true_right - idx).astype(np.float32)                 # (N,W)
-
-            max_cost = float(collision_cost * cost_scale)
             before_denom = float(max(time_pad_before_steps, 1))
             after_denom  = float(max(time_pad_after_steps, 1))
 

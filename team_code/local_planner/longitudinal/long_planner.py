@@ -1,14 +1,79 @@
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 
 from typing import Dict, List, Tuple, Optional
+from dataclasses import dataclass, field
 
 from config import GlobalConfig
+
+from privileged_route_planner import PlannerState
+from team_code.scene_descriptor.scene_descriptor import SceneData
+from team_code.actor_prediction.motion_prediction import PredictionData
+
 from actor_prediction.collision_checker import CollisionInterval, LaneOverlapInterval
 
 from .config_specs import *
 from .planner_algo import PlannerAlgo
-from .st_occupancy import STOccupancyGrid
+from .st_occupancy import STOccupancyGrid, STMaps
+
+
+@dataclass
+class LongPlannerResult:
+    """Mirrors LatPlannerResult — bundles all longitudinal plan state in one object."""
+
+    # Route anchor for the plan
+    plan_route_start_idx: int = -1
+    s_distance: float = 0.0        # planned horizon in metres
+
+    # Time-indexed profiles (all same length after interpolation)
+    vel_profile:  np.ndarray = field(default_factory=lambda: np.array([]))
+    time_profile: np.ndarray = field(default_factory=lambda: np.array([]))
+    s_profile:    np.ndarray = field(default_factory=lambda: np.array([]))
+    plan_indices: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=int))
+
+    # Execution cursor
+    profile_step_idx: int = 0
+    ego_idx:          int = 0
+
+    # Plan metadata
+    plan_cost:   float = float("inf")
+    is_new_plan: bool  = False
+
+    # ST maps — stored for logging/visualization
+    st_maps: Optional[object] = None   # STMaps instance
+
+    # ── derived properties ────────────────────────────────────────────────────
+
+    @property
+    def is_empty_plan(self) -> bool:
+        return self.vel_profile.size == 0
+
+    @property
+    def has_active_plan(self) -> bool:
+        return (self.vel_profile.size > 0
+                and self.profile_step_idx < len(self.vel_profile))
+
+    @property
+    def target_speed(self) -> float:
+        """Current commanded speed (m/s), or 0 when no active plan."""
+        if not self.has_active_plan:
+            return 0.0
+        return float(self.vel_profile[self.profile_step_idx])
+
+    def clear(self) -> None:
+        self.plan_route_start_idx = -1
+        self.s_distance           = 0.0
+        self.vel_profile          = np.array([])
+        self.time_profile         = np.array([])
+        self.s_profile            = np.array([])
+        self.plan_indices         = np.empty((0, 2), dtype=int)
+        self.profile_step_idx     = 0
+        self.ego_idx              = 0
+        self.plan_cost            = float("inf")
+        self.is_new_plan          = False
+        self.st_maps              = None
+
 
 class LongPlanner:
     def __init__(
@@ -31,74 +96,89 @@ class LongPlanner:
             config=self.config,
             st_grid_spec=self.st_grid_spec
         )
-        self.planner = PlannerAlgo(algo_name=algo_name, st_algo_spec=self.st_algo_spec)
+        self.planner = PlannerAlgo(
+            config=self.config,
+            st_algo_spec=self.st_algo_spec,
+            algo_name=algo_name,
+        )
 
-        # Planner state
-        self.current_vel_profile: np.ndarray = np.array([])
-        self.current_time_profile: np.ndarray = np.array([])
-        self.current_s_profile: np.ndarray = np.array([])
-        self.current_plan_indices: np.ndarray = np.empty((0, 2), dtype=int)
-        self.profile_step_idx: int = 0
-        self.ego_idx : int = 0
-        self.cur_path = None
-        self.current_plan_cost: float = float("inf")   # NEW
-        # TODO: PROPERLY IMPLEMENT THE EGO STATION CHECK, MAYBE PRECOMPUTE ROUTE DURING INITIALIZATION OR AFTER ROUTE CHANGES
-        self.plan_route_start_idx: int = -1
+        self.current_plan: LongPlannerResult = LongPlannerResult()
+
+    # ── backward-compatible aliases (used by trajectory_planner.py) ───────────
 
     @property
     def has_active_plan(self) -> bool:
-        return self.current_vel_profile.size > 0 and self.profile_step_idx < len(self.current_vel_profile)
+        return self.current_plan.has_active_plan
+
+    @property
+    def current_vel_profile(self) -> np.ndarray:
+        return self.current_plan.vel_profile
+
+    @property
+    def profile_step_idx(self) -> int:
+        return self.current_plan.profile_step_idx
+
+    @property
+    def plan_route_start_idx(self) -> int:
+        return self.current_plan.plan_route_start_idx
+
+    @property
+    def current_st_maps(self) -> Optional[STMaps]:
+        return self.current_plan.st_maps
 
     def reset_plan(self) -> None:
-        self.current_vel_profile = np.array([])
-        self.current_time_profile = np.array([])
-        self.current_s_profile = np.array([])
-        self.current_plan_indices = np.empty((0, 2), dtype=int)
-        self.profile_step_idx = 0
-        self.current_plan_cost = float("inf")
-        self.cur_path = None
-        self.plan_route_start_idx = -1
+        self.current_plan.clear()
 
     def remaining_plan_samples(self) -> np.ndarray:
         """Return remaining (s, t) samples of the current plan from now onward."""
-        if not self.has_active_plan:
-            return np.array([])
+        plan = self.current_plan
+        if not plan.has_active_plan:
+            return np.empty((0, 2), dtype=float)
 
-        if self.profile_step_idx >= len(self.current_time_profile):
-            return np.array([])
+        if plan.profile_step_idx >= len(plan.time_profile):
+            return np.empty((0, 2), dtype=float)
 
-        current_time = self.current_time_profile[self.profile_step_idx]
-        future_times = self.current_time_profile[self.profile_step_idx :]
-        future_times -= current_time
-        future_times = np.maximum(future_times, 0.0)
+        current_time = float(plan.time_profile[plan.profile_step_idx])
+        current_s    = float(plan.s_profile[plan.profile_step_idx])
 
-        future_s = self.current_s_profile[self.profile_step_idx :]
-        future_s -= self.current_s_profile[self.profile_step_idx]
-        future_s = np.maximum(future_s, 0.0)
+        future_times = plan.time_profile[plan.profile_step_idx:].copy()
+        future_s     = plan.s_profile[plan.profile_step_idx:].copy()
 
-        # return np.stack([future_s, remaining_time], axis=1)
-        return np.stack([future_s, future_times], axis=1)
+        future_times = np.maximum(future_times - current_time, 0.0)
+        future_s     = np.maximum(future_s     - current_s,    0.0)
+
+        return np.column_stack((future_s, future_times))
 
     def compute_new_plan(
         self,
-        occupancy_map: np.ndarray,
+        st_maps: STMaps,
         ego_speed: float,
         ego_max_speed: float,
+        ego_accel : float,
         plan_route_start_idx: int,
         plan_s_goal_m: Optional[float] = None,
         *,
-        force_replace: bool = False,               # NEW
+        force_replace: bool = False,
+        ego_cruise_speed : Optional[float] = None,
+        ego_goal_speed : Optional[float] = None,
     ) -> None:
         """Plan a new profile and (optionally) replace existing one if better/required."""
         start_idx = 0
         goal_idx = self._goal_idx_from_distance(plan_s_goal_m)
+        print(f'\n\nLONG PLANNNER')
+        print(f'\tPLAN_S: {plan_s_goal_m}, GOAL_IDX: {goal_idx}')
+        print(f'\tACCEL: {ego_accel}')
 
         path, total_cost = self.planner.run(
-            occupancy_map,
+            st_maps.occupancy_map,
+            st_maps.cost_map,
             start_idx,
             goal_idx,
             v0=ego_speed,
             v_max=ego_max_speed,
+            v_cruise_ref=ego_cruise_speed,
+            v_goal_ref=ego_goal_speed,
+            a0=ego_accel,
         )
 
         # No path found
@@ -156,40 +236,29 @@ class LongPlanner:
         # - had no plan, or
         # - were forced to replace (unsafe), or
         # - found a cheaper plan.
-        self.cur_path = path
-        print(f'new cost: {total_cost}, old cost: {self.current_plan_cost}')
-        self.current_plan_cost = float(total_cost)
-
-        # TODO: PROPERLY IMPLEMENT THE EGO STATION CHECK, MAYBE PRECOMPUTE ROUTE DURING INITIALIZATION OR AFTER ROUTE CHANGES
-        self.plan_route_start_idx = plan_route_start_idx
-
-        # profiles = self.extract_profiles_from_path(
-        #     path,
-        #     self.grid_mapper.T_arr,
-        #     self.grid_mapper.S_arr,
-        #     self.st_algo_spec.dt_algo,
-        # )
         profiles = profiles_new
-        self.profiles = profiles
-        # self.plot_st_profiles(profiles)
 
         time_prof = profiles["t"]
-        vel_prof = profiles["v"]
-        s_prof   = profiles["s"]
-        indices  = profiles["idx"]
+        vel_prof  = profiles["v"]
+        s_prof    = profiles["s"]
+        indices   = profiles["idx"]
 
-        t0 = time_prof[0]
-        t1 = time_prof[-1]
+        t0    = time_prof[0]
+        t1    = time_prof[-1]
         t_sim = np.arange(t0, t1 + self.dt_sim, self.dt_sim)
 
         vel_interp = np.interp(t_sim, time_prof, vel_prof)
-        s_interp = np.interp(t_sim, time_prof, s_prof)
+        s_interp   = np.interp(t_sim, time_prof, s_prof)
 
-        self.current_vel_profile = vel_interp
-        self.current_time_profile = t_sim
-        self.current_s_profile = s_interp
-        self.current_plan_indices = indices
-        self.profile_step_idx = 0
+        # Commit to current_plan — keeps all state in one place
+        self.current_plan.plan_route_start_idx = plan_route_start_idx
+        self.current_plan.plan_cost            = float(total_cost)
+        self.current_plan.vel_profile          = vel_interp[1:]
+        self.current_plan.time_profile         = t_sim[1:]
+        self.current_plan.s_profile            = s_interp[1:]
+        self.current_plan.plan_indices         = indices[1:]
+        self.current_plan.profile_step_idx     = 0
+        self.current_plan.is_new_plan          = True
 
     def validate_plan_against_occupancy(
         self,
@@ -239,125 +308,20 @@ class LongPlanner:
 
         return is_safe, ttc_min
 
-    # def run_step(
-    #     self,
-    #     ego_route_points_3d : np.ndarray,
-    #     ego_speed : float,
-    #     ego_max_speed : float,
-    #     actor_collisions : Dict[int, List[CollisionInterval]], # K=actor id, V=collision intervals
-    #     plan_tick_counter : int,
-    #     plan_route_start_idx: int,
-    #     all_conditions : Dict = {},
-    #     plan_s_goal_m: Optional[float] = None,
-    #     s_ego_m: float = 0.0,
-    # ) -> np.ndarray:
-    #     """Run the longitudinal planner at simulation rate."""
-
-    #     should_plan_now = (plan_tick_counter % self.sim_ticks_per_plan) == 1 or not self.has_active_plan
-
-    #     if should_plan_now:
-    #         occupancy_map = self.grid_mapper.build_st_occupancy(
-    #             route_points_3d=ego_route_points_3d,
-    #             max_speed=ego_max_speed,
-    #             actor_collisions=actor_collisions,
-    #             all_conditions=all_conditions
-    #         )
-
-    #         plan_safe = False
-    #         if self.has_active_plan:
-    #             # NOTE: VERY EXPERIMENTAL, TRYING TO GENERATE A BETTER PLAN EVEN WHEN SAFE
-    #             # self.compute_new_plan(
-    #             #     occupancy_map=occupancy_map,
-    #             #     ego_speed=ego_speed,
-    #             #     ego_max_speed=ego_max_speed,
-    #             #     plan_s_goal_m=plan_s_goal_m,
-    #             #     plan_route_start_idx=plan_route_start_idx,
-    #             #     force_replace=False,
-    #             # )
-
-    #             print(f'Velocity profile exists, checking safety')
-    #             remaining_samples = self.remaining_plan_samples()
-    #             is_safe, ttc_min = self.validate_plan_against_occupancy(
-    #                 occupancy_map=occupancy_map,
-    #                 plan_samples=remaining_samples,
-    #             )
-
-    #             print(f'remaining samples shape: {remaining_samples.shape}')
-    #             print(f'ttc_min: {ttc_min}')
-    #             # if ttc_min > 1.25 * remaining_samples[1][-1]:
-    #             # if ttc_min > 1.25 * (2 * plan_s_goal_m / ego_max_speed):
-    #             if is_safe:
-    #                 plan_safe = True
-    #                 print(f'Safe plan, proceed')
-    #             else:
-    #                 plan_safe = False
-    #                 print(f'Unsafe, replanning')
-    #                 self.compute_new_plan(
-    #                     occupancy_map=occupancy_map,
-    #                     ego_speed=ego_speed,
-    #                     ego_max_speed=ego_max_speed,
-    #                     plan_s_goal_m=plan_s_goal_m,
-    #                     plan_route_start_idx=plan_route_start_idx,
-    #                     force_replace=(not plan_safe),
-    #                 )
-    #         else:
-    #             # OPTIONAL: if you ever want to *opportunistically* search for a cheaper
-    #             # plan even when safe, you can call compute_new_plan here with
-    #             # force_replace=False and let cost decide:
-    #             #
-    #             self.compute_new_plan(
-    #                 occupancy_map=occupancy_map,
-    #                 ego_speed=ego_speed,
-    #                 ego_max_speed=ego_max_speed,
-    #                 plan_s_goal_m=plan_s_goal_m,
-    #                 plan_route_start_idx=plan_route_start_idx,
-    #                 force_replace=False,
-    #             )
-
-    #         # self.plot_st_map(self.grid_mapper, occupancy_map, ego_max_speed, self.cur_path)
-
-    #     vel_cmd = 0.0
-    #     # TODO: CONFIGURABLE PREDICTION AND DISTANCE HORIZONS
-    #     # TODO: PROPERLY IMPLEMENT THE EGO STATION CHECK, MAYBE PRECOMPUTE ROUTE DURING INITIALIZATION OR AFTER ROUTE CHANGES
-    #     if self.has_active_plan:
-    #         print(f'Velocity profile exists, no 10Hz match yet')
-    #         ego_idx = np.searchsorted(self.current_s_profile, s_ego_m, side="left")
-    #         print(f'ego_idx: {ego_idx}, profile step idx: {self.profile_step_idx}, max_idx: {len(self.current_s_profile) - 1}')
-
-    #         if ego_idx > len(self.current_s_profile) - 1:
-    #             print(f'EGO IDX BEYOND PLAN HORIZON, REPLANNING')
-    #             vel_cmd = self.current_vel_profile[-1]
-    #             self.reset_plan()
-    #             return vel_cmd
-
-    #         ego_idx = max(ego_idx, self.profile_step_idx)
-    #         vel_cmd = self.current_vel_profile[ego_idx]
-
-    #         self.profile_step_idx += 1
-    #         self.profile_step_idx = max(ego_idx, self.profile_step_idx)
-
-    #         # NOTE: TEMPORARY, CHECKING IF THIS FIXES FORECASTING IN TRAJECTORYPLANNER
-    #         self.ego_idx = ego_idx
-
-    #         # self.plot_st_profiles(self.profiles, self.current_time_profile[ego_idx], ego_speed, vel_cmd)
-    #     # plt.show()
-
-    #     return vel_cmd
-
     def run_step(
         self,
-        ego_route_points_3d : np.ndarray,
-        ego_speed : float,
-        ego_max_speed : float,
-        actor_collisions : Dict[int, List[CollisionInterval]], # K=actor id, V=collision intervals
-        actor_overlaps : Dict[int, List[LaneOverlapInterval]], # K=actor id, V=overlap intervals
         plan_tick_counter : int,
-        plan_route_start_idx: int,
-        route_index : int,
+        planner_state : PlannerState,
+        scene_data : SceneData,
+        prediction_data : PredictionData,
         all_conditions : Dict = {},
         plan_s_goal_m: Optional[float] = None,
         s_ego_m: float = 0.0,
-    ) -> np.ndarray:
+        ego_cruise_speed : Optional[float] = None,
+        ego_goal_speed : Optional[float] = None,
+        s_bounds : Optional[Tuple[float, float]] = None,
+        profile_time : bool = False,
+    ) -> LongPlannerResult:
         """Run the longitudinal planner at simulation rate."""
         def bbox_to_vec7(bb) -> np.ndarray:
             return np.array([
@@ -368,49 +332,63 @@ class LongPlanner:
 
         should_plan_now = (plan_tick_counter % self.sim_ticks_per_plan) == 1 or not self.has_active_plan
 
+        ego_speed = scene_data.ego_data.speed
+        max_speed = scene_data.traffic_data.speed_limit
+
+        route_index = planner_state.route_index
+        route_pts = planner_state.route_points[route_index:]
+
+        self.current_plan.is_new_plan = False
+
         if should_plan_now:
-            occupancy_map = self.grid_mapper.build_st_occupancy(
-                route_points_3d=ego_route_points_3d,
-                max_speed=ego_max_speed,
-                actor_overlaps=actor_overlaps,
+            t_occ_start = time.perf_counter()
+            st_maps = self.grid_mapper.build_st_occupancy(
+                planner_state=planner_state,
+                scene_data=scene_data,
+                prediction_data=prediction_data,
                 all_conditions=all_conditions,
+                s_bounds=s_bounds,
             )
+            t_occ_end = time.perf_counter()
+            self.current_plan.st_maps = st_maps
+
+            # TODO VERY EXPERIMENTAL
+            # self.compute_new_plan(
+            #     occupancy_map=occupancy_map,
+            #     ego_speed=ego_speed,
+            #     ego_max_speed=ego_max_speed,
+            #     ego_accel=scene_data.ego_data.accel,
+            #     plan_s_goal_m=plan_s_goal_m,
+            #     plan_route_start_idx=route_index,
+            #     force_replace=False,
+            #     ego_cruise_speed=ego_cruise_speed,
+            #     ego_goal_speed=ego_goal_speed,
+            # )
 
             plan_safe = True
             if self.has_active_plan:
-                # TODO VERY EXPERIMENTAL
-                self.compute_new_plan(
-                    occupancy_map=occupancy_map,
-                    ego_speed=ego_speed,
-                    ego_max_speed=ego_max_speed,
-                    plan_s_goal_m=plan_s_goal_m,
-                    plan_route_start_idx=route_index,
-                    force_replace=False,
-                )
+                all_actor_collisions = prediction_data.all_actor_collisions
 
-                route_geometry = self.grid_mapper.precompute_route_geometry(ego_route_points_3d)
+                route_geometry = self.grid_mapper.precompute_route_geometry(route_pts)
                 print(f'Velocity profile exists, checking safety')
                 remaining_samples = self.remaining_plan_samples()
 
                 # Rollout ego trajectory and check for collisions
-                for actor_id, collisions in actor_collisions.items():
+                for actor_id, collisions in all_actor_collisions.items():
                     if not collisions:
                         continue
 
+                    # TODO: FIGURE OUT A WAY TO HANDLE COLLISION CHECKS WHEN FIRST GENERATING A PLAN
+                    # CAUSES PLANS TO FLICKER BACK AND FORTH BECAUSE EGO FORECAST PRIOR TO VEL PROFILE WITH TARGET SPEED
+                    # PREDICTS COLLISIONS AND THEN WE CHECK THESE WITH THE NEW GENERATED PLAN WHICH HAS NO COLLISIONS
+                    if self.profile_step_idx == 0:
+                        continue
                     collision_interval = collisions[0]
                     start_idx = collision_interval.start_idx
                     ttc_min = start_idx * self.st_grid_spec.dt
 
-                    # Check when the collision happens
-                    # if ttc_min > 6.0:
-                    #     print(f'Ignoring collision with actor: {actor_id}, ttc_min: {ttc_min}, plan_time_end: {remaining_samples[-1, -1]}')
-                    #     continue
-                    if ttc_min > 1.0 + remaining_samples[-1, -1]:
-                        print(f'Ignoring collision with actor: {actor_id}, ttc_min: {ttc_min}, plan_time_end: {remaining_samples[-1, -1]}')
-                        continue
-
                     # Check where the collision happens
-                    ego_collision_bb = np.array([bbox_to_vec7(collision_interval.collision_bboxes_a[start_idx])])
+                    ego_collision_bb = np.array([bbox_to_vec7(collision_interval.collision_bboxes_b[start_idx])])
                     corners_collision = self.grid_mapper.obb_corners_world_xy(ego_collision_bb)  # expected (T_collision, 4, 2)
                     ego_s_collision = self.grid_mapper.project_points_to_route_s(
                         corners_collision.reshape(-1, 2),
@@ -421,75 +399,124 @@ class LongPlanner:
                     s_min = np.min(ego_s_collision, axis=1)[0]
                     s_max = np.max(ego_s_collision, axis=1)[0]
 
-                    s_min_idx = np.clip(np.floor(s_min / self.st_grid_spec.ds), 0, occupancy_map.shape[1] - 1).astype(np.int32)
-                    s_max_idx = np.clip(np.floor(s_max / self.st_grid_spec.ds), 0, occupancy_map.shape[1] - 1).astype(np.int32)
-                    t_idx = int(np.clip(start_idx, 0, occupancy_map.shape[0] - 1))
+                    if s_bounds is not None:
+                        s_bound_min, s_bound_max = s_bounds
+                        if (s_max < s_bound_min) or (s_min > s_bound_max):
+                            print(f'Ignoring collision with actor {actor_id}, collision out of bounds')
+                            continue
+                        elif ttc_min > remaining_samples[-1, -1]:
+                            print(f'Ignoring collision with actor: {actor_id}, ttc_min: {ttc_min}, plan_time_end: {remaining_samples[-1, -1]}')
+                            continue
+
+                    elif ttc_min > remaining_samples[-1, -1]:
+                        print(f'Ignoring collision with actor: {actor_id}, ttc_min: {ttc_min}, plan_time_end: {remaining_samples[-1, -1]}')
+                        continue
+
+                    s_min_idx = np.clip(np.floor(s_min / self.st_grid_spec.ds), 0, st_maps.occupancy_map.shape[1] - 1).astype(np.int32)
+                    s_max_idx = np.clip(np.floor(s_max / self.st_grid_spec.ds), 0, st_maps.occupancy_map.shape[1] - 1).astype(np.int32)
+                    t_idx = int(np.clip(start_idx, 0, st_maps.occupancy_map.shape[0] - 1))
 
                     print(f'\n\nEGO ROLLOUT COLLISION')
                     print(f'\t\tactor_id: {actor_id}, s_min: {s_min}, s_max: {s_max}, s_min_idx: {s_min_idx}, s_max_idx: {s_max_idx}, t_idx: {t_idx}, ttc_min: {ttc_min}, plan_time_end: {remaining_samples[-1, -1]}')
-                    occupancy_map[t_idx, s_min_idx : s_max_idx] = 255.0
+                    # occupancy_map[t_idx, s_min_idx : s_max_idx] = 255.0
                     plan_safe = False
-                    # break
+                    break
 
-                print(f'remaining samples shape: {remaining_samples.shape}')
+                # print(f'remaining samples shape: {remaining_samples.shape}')
                 if plan_safe:
                     print(f'Safe plan, proceed')
                 else:
                     print(f'Unsafe, replanning')
                     self.compute_new_plan(
-                        occupancy_map=occupancy_map,
+                        st_maps=st_maps,
                         ego_speed=ego_speed,
-                        ego_max_speed=ego_max_speed,
+                        ego_max_speed=max_speed,
+                        ego_accel=scene_data.ego_data.accel,
                         plan_s_goal_m=plan_s_goal_m,
                         plan_route_start_idx=route_index,
                         force_replace=(not plan_safe),
+                        ego_cruise_speed=ego_cruise_speed,
+                        ego_goal_speed=ego_goal_speed,
                     )
             else:
                 # OPTIONAL: if you ever want to *opportunistically* search for a cheaper
                 # plan even when safe, you can call compute_new_plan here with
                 # force_replace=False and let cost decide:
                 #
+                t_dijk_start = time.perf_counter()
                 self.compute_new_plan(
-                    occupancy_map=occupancy_map,
+                    st_maps=st_maps,
                     ego_speed=ego_speed,
-                    ego_max_speed=ego_max_speed,
+                    ego_max_speed=max_speed,
+                    ego_accel=scene_data.ego_data.accel,
                     plan_s_goal_m=plan_s_goal_m,
                     plan_route_start_idx=route_index,
-                    force_replace=False,
+                    force_replace=True,
+                    ego_cruise_speed=ego_cruise_speed,
+                    ego_goal_speed=ego_goal_speed,
                 )
+                t_dijk_end = time.perf_counter()
 
-            # self.plot_st_map(self.grid_mapper, occupancy_map, ego_max_speed, self.cur_path)
+            # TODO: TESTING PREDICTION MODULE SYNC
 
-        vel_cmd = 0.0
+            # route_geometry = self.grid_mapper.precompute_route_geometry(route_pts)
+            # # Check where the collision happens
+            # for idx, ego_bb in enumerate(prediction_data.ego_forecasted_bbs):
+            #     ego_bb_arr = np.array([bbox_to_vec7(ego_bb)])
+            #     corners_collision = self.grid_mapper.obb_corners_world_xy(ego_bb_arr)  # expected (T_collision, 4, 2)
+            #     ego_s_collision = self.grid_mapper.project_points_to_route_s(
+            #         corners_collision.reshape(-1, 2),
+            #         route_geometry,
+            #     ).reshape(1, 4)
+
+            #     # Reduce collision band to min and max s per timestep
+            #     s_min = np.min(ego_s_collision, axis=1)[0]
+            #     s_max = np.max(ego_s_collision, axis=1)[0]
+
+            #     s_min_idx = np.clip(np.floor(s_min / self.st_grid_spec.ds), 0, st_maps.occupancy_map.shape[1] - 1).astype(np.int32)
+            #     s_max_idx = np.clip(np.floor(s_max / self.st_grid_spec.ds), 0, st_maps.occupancy_map.shape[1] - 1).astype(np.int32)
+            #     t_idx = int(np.clip(idx, 0, st_maps.occupancy_map.shape[0] - 1))
+
+            #     st_maps.occupancy_map[t_idx, s_min_idx : s_max_idx] = 1
+            #     st_maps.cost_map[t_idx, s_min_idx : s_max_idx] = 155.0
+
+            # TODO: TESTING PREDICTION MODULE SYNC
+
+            # self.plot_st_map(self.grid_mapper, st_maps.cost_map, max_speed)
+            # plt.show()
+            # if self.has_active_plan:
+            #     cur_t = self.current_time_profile[self.profile_step_idx]
+            #     cur_v = self.current_vel_profile[self.profile_step_idx]
+            #     self.plot_st_profiles(self.profiles, cur_t, ego_speed, cur_v)
+
+        plan = self.current_plan
+
+        if profile_time:
+            print("--- LongPlanner runtime ---")
+            print(f"ST costmap construction time: {(t_occ_end - t_occ_start)*1000:.2f} ms")
+            print(f"ST Dijkstra planning time: {(t_dijk_end - t_dijk_start)*1000:.2f} ms")
+        #     print(f"Corridor construction time: {(t_corr_end - t_corr_start)*1000:.2f} ms")
+        #     print(f"SL QP planning time: {(t_qp_end - t_qp_start)*1000:.2f} ms")
+
         # TODO: CONFIGURABLE PREDICTION AND DISTANCE HORIZONS
         # TODO: PROPERLY IMPLEMENT THE EGO STATION CHECK, MAYBE PRECOMPUTE ROUTE DURING INITIALIZATION OR AFTER ROUTE CHANGES
-        if self.has_active_plan:
+        if plan.has_active_plan:
             print(f'Velocity profile exists, no 10Hz match yet')
-            ego_idx = np.searchsorted(self.current_s_profile, s_ego_m, side="left")
-            print(f'ego_idx: {ego_idx}, profile step idx: {self.profile_step_idx}, max_idx: {len(self.current_s_profile) - 1}')
+            ego_idx = np.searchsorted(plan.s_profile, s_ego_m, side="left")
+            print(f'ego_idx: {ego_idx}, profile step idx: {plan.profile_step_idx}, max_idx: {len(plan.s_profile) - 1}')
 
-            # if ego_idx > len(self.current_s_profile) - 1:
-            #     print(f'EGO IDX BEYOND PLAN HORIZON, REPLANNING')
-            #     vel_cmd = self.current_vel_profile[-1]
-            #     self.reset_plan()
-            #     return vel_cmd
+            if ego_idx > len(plan.s_profile) - 1:
+                print(f'EGO IDX BEYOND PLAN HORIZON, REPLANNING')
+                self.reset_plan()
+                return self.current_plan
 
-            ego_idx = max(ego_idx, self.profile_step_idx)
-            # vel_cmd = self.current_vel_profile[ego_idx]
-            vel_cmd = self.current_vel_profile[self.profile_step_idx]
-
-            self.profile_step_idx += 1
-            # self.profile_step_idx = max(ego_idx, self.profile_step_idx)
-
-            # NOTE: TEMPORARY, CHECKING IF THIS FIXES FORECASTING IN TRAJECTORYPLANNER
-            self.ego_idx = ego_idx
-
-            # self.plot_st_profiles(self.profiles, self.current_time_profile[self.profile_step_idx], ego_speed, vel_cmd)
+            # ego_idx = max(ego_idx, plan.profile_step_idx)
+            plan.profile_step_idx += 1
+            plan.ego_idx = ego_idx
         else:
             self.reset_plan()
-        # plt.show()
 
-        return vel_cmd
+        return self.current_plan
 
     def extract_profiles_from_path(
         self,
@@ -524,6 +551,7 @@ class LongPlanner:
         v     = np.array([p[2] for p in path], dtype=float)
         a     = np.array([p[3] for p in path], dtype=float)
 
+        print(f'\tPATH S_IDX: {s_idx[-1]}')
         tt = t[t_idx]
         ss = s[s_idx]
 
@@ -584,14 +612,27 @@ class LongPlanner:
             # show horizontal goal line for reference
             ax.axhline(s[goal_idx], color="tab:green", lw=1.2, alpha=0.6, label="goal s")
 
-        # Optional: overlay the Dijkstra path
-        if path and len(path) > 0:
-            t_idx_path = np.array([p[0] for p in path], dtype=int)
-            s_idx_path = np.array([p[1] for p in path], dtype=int)
-            ax.plot(t[t_idx_path], s[s_idx_path],
-                    lw=2.5, color="tab:blue", zorder=5, label="planned path")
-            ax.scatter(t[t_idx_path], s[s_idx_path],
-                    s=18, color="tab:blue", zorder=6)
+        # Overlay the Dijkstra path
+        if self.has_active_plan:
+            remaining_path = self.remaining_plan_samples()
+            s_vals = remaining_path[:, 0]
+            t_vals = remaining_path[:, 1]
+
+            ax.plot(
+                t_vals,
+                s_vals,
+                lw=2.5,
+                color="tab:blue",
+                zorder=7,
+                label="planned path",
+            )
+            ax.scatter(
+                t_vals,
+                s_vals,
+                s=18,
+                color="tab:blue",
+                zorder=8,
+            )
 
         ax.set_xlabel("time t (s)")
         ax.set_ylabel("arc length s (m)")
@@ -599,36 +640,36 @@ class LongPlanner:
         ax.set_title("s–T costmap")
         ax.legend(loc="best", frameon=True)
         ax.grid(True, lw=0.6, alpha=0.5)
+
         return fig, ax
 
     def plot_st_profiles(
         self,
-        profiles : Dict[str, np.ndarray],
-        cur_time : float,
-        ego_speed : float,
-        target_speed : float,
-        title: str = "Speed profile (s, v, a, j)"
+        profiles: Dict[str, np.ndarray],
+        cur_time: float,
+        ego_speed: float,
+        target_speed: float,
+        title: str = "Speed profile (s, v, a, j)",
     ):
-        """
-        Plot s(t), v(t), a(t), j(t) from a Dijkstra path and RETURN the profiles.
+        tt = profiles["t"]
+        ss = profiles["s"]
+        vv = profiles["v"]
+        aa = profiles["a"]
+        jj = profiles["j"]
 
-        Returns:
-        fig, axs, profiles_dict (with keys 't','s','v','a','j')
-        """
-        tt, ss, vv, aa, jj = profiles["t"], profiles["s"], profiles["v"], profiles["a"], profiles["j"]
-
-        fig, axs = plt.subplots(4, 1, figsize=(9, 8), sharex=True)
+        fig, axs = plt.subplots(4, 1, figsize=(9, 8), sharex=True, constrained_layout=True)
         fig.suptitle(title)
 
         axs[0].plot(tt, ss, marker="o")
         axs[0].set_ylabel("s (m)")
         axs[0].grid(True, lw=0.6, alpha=0.5)
 
-        axs[1].plot(tt, vv, marker="o")
+        axs[1].plot(tt, vv, marker="o", label="planned")
         axs[1].scatter([cur_time], [ego_speed], s=40, color="red", zorder=5, label="ego current")
         axs[1].scatter([cur_time], [target_speed], s=40, color="green", zorder=5, label="vel target")
         axs[1].set_ylabel("v (m/s)")
         axs[1].grid(True, lw=0.6, alpha=0.5)
+        axs[1].legend(loc="best", frameon=True)
 
         axs[2].plot(tt, aa, marker="o")
         axs[2].set_ylabel("a (m/s²)")
