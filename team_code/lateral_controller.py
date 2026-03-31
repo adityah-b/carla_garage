@@ -123,25 +123,32 @@ class LateralPIDController(LateralController):
 
     return steering
 
-  def step_pure_pursuit(self, route_points, current_speed, vehicle_position, vehicle_heading):
+  def step_pure_pursuit(
+    self,
+    route_points,
+    current_speed,
+    vehicle_position,
+    vehicle_heading,
+  ):
     """
     Geometric Pure Pursuit using specific wheelbase geometry.
     """
-    L_f = self.config.front_wheel_base
-    L_r = self.config.rear_wheel_base
-    L = L_f + L_r
+    L = self.config.front_wheel_base + self.config.rear_wheel_base
 
     # 1. Dynamic Lookahead (Higher speed = Look further)
-    lookahead_dist = self.lateral_pid_speed_scale * (current_speed * 3.6) + self.lateral_pid_speed_offset
-    lookahead_dist *= 0.5 # 1 point per 2m
-    # print(f'\n\nLATERAL CONTROLLER')
-    # print(f'\tLOOKAHEAD DIST: {lookahead_dist}')
-    # print(f'\tROUTE LEN: {route_points.shape[0]}')
-    lookahead_dist = np.clip(lookahead_dist,
-                             4.0 * 0.5, # 1 point per 2m
-                             12.0 * 0.5)
+    # Pure-pursuit dynamic lookahead in meters
+    min_lookahead_m = 2.0
+    max_lookahead_m = 8.0
+    lookahead_gain_s = 0.35  # seconds; lookahead grows as speed * time-horizon
 
-    lookahead_idx = int(min(lookahead_dist, route_points.shape[0] - 1))
+    lookahead_m = current_speed * lookahead_gain_s
+    lookahead_m = np.clip(lookahead_m, min_lookahead_m, max_lookahead_m)
+
+    # Route points are spaced 2 m apart
+    point_spacing_m = 2.0
+    lookahead_idx = max(1, int(np.round(lookahead_m / point_spacing_m)))
+    lookahead_idx = min(lookahead_idx, route_points.shape[0] - 1)
+
     target_pt = route_points[lookahead_idx]
 
     # 2. Local Coordinates (Translate and Rotate)
@@ -166,8 +173,6 @@ class LateralPIDController(LateralController):
     # 4. Compute Steering Angle (delta)
     # delta = atan(L * kappa)
     steering_angle = np.arctan(L * kappa)
-
-    print(f'\n\nSTEERING ANGEL: {steering_angle}')
 
     # 5. Normalize for CARLA [-1, 1]
     return np.clip(steering_angle, -1.0, 1.0)
