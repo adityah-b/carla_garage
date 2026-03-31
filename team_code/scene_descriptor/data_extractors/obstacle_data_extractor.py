@@ -6,9 +6,9 @@ from typing import List, Tuple, Dict, Optional
 
 from agents.navigation.local_planner import RoadOption
 from config import GlobalConfig
-from .base_actor_extractor import BaseActorExtractor
-from privileged_route_planner import PlannerState
-from actor_prediction.collision_checker import CollisionChecker
+from team_code.privileged_route_planner import PlannerState
+from team_code.scene_descriptor.data_extractors.base_actor_extractor import BaseActorExtractor
+from team_code.actor_prediction.geometric_utils import GeometricUtils
 
 @dataclass(frozen=True, slots=True)
 class ObstacleDataEntry:
@@ -18,6 +18,7 @@ class ObstacleDataEntry:
     obstructs_ego : bool
     intrusion_idx : Optional[int]
     is_near_junction: bool
+    bbox_corners_xy : np.ndarray
 
     @property
     def id(self) -> int:
@@ -249,13 +250,19 @@ class ObstacleDataExtractor(BaseActorExtractor):
 
         lookahead_index = min(
             route_points.shape[0],
-            route_index + int(self.config.obstacle_detection_radius * self.config.points_per_meter)
+            route_index + int(self.config.obstacle_detection_radius_m * self.config.points_per_meter)
         )
 
         # Slice route
         relevant_cmds = route_commands[route_index : lookahead_index]
 
         ego_loc = ego_transform.location
+        ego_fwd = ego_transform.get_forward_vector()
+
+        ego_xy = np.array([ego_loc.x, ego_loc.y], dtype=np.float32)
+        ego_fwd_xy = np.array([ego_fwd.x, ego_fwd.y], dtype=np.float32)
+
+        radius_thresh_sq = self.config.obstacle_detection_radius_m ** 2
 
         def is_on_driving_lane(
             actor : carla.Actor,
@@ -268,16 +275,50 @@ class ObstacleDataExtractor(BaseActorExtractor):
             )
             return wp is not None
 
-        # Find obstacles on road and filter out unwanted types
         excluded_types = ['dirtdebris', 'mesh']
-        driving_obstacles : List[carla.Actor] = [
-            obs
-            for obs in obstacles if \
-                obs.is_active and \
-                is_on_driving_lane(obs) and \
-                not any(t in obs.type_id for t in excluded_types) and \
-                ego_loc.distance(obs.get_location()) <= self.config.obstacle_detection_radius
+
+        # Find obstacles on road and filter out unwanted types
+        candidate_obstacles : List[carla.Actor] = []
+        for obs in obstacles:
+            if not obs.is_active:
+                continue
+
+            if any(t in obs.type_id for t in excluded_types):
+                continue
+
+            if not is_on_driving_lane(obs):
+                continue
+
+            candidate_obstacles.append(obs)
+
+        if not candidate_obstacles:
+            return ObstacleData()
+
+        # Gather obstacle locations
+        obstacle_locs = np.array(
+            [[obs.get_location().x, obs.get_location().y] for obs in candidate_obstacles],
+            dtype=np.float32
+        )
+
+        # Vector from ego to obstacle
+        rel_ego_xy = obstacle_locs - ego_xy
+
+        # Squared distance to ego
+        obs_to_ego_dist_sq = np.sum(rel_ego_xy ** 2, axis=1)
+
+        # Ahead of ego filter
+        front_dot = rel_ego_xy @ ego_fwd_xy
+
+        # Distance and location filter
+        mask = (
+            (obs_to_ego_dist_sq <= radius_thresh_sq) &
+            (front_dot >= 0.0)
+        )
+
+        driving_obstacles = [
+            obs for obs, keep in zip(candidate_obstacles, mask) if keep
         ]
+
         if not driving_obstacles:
             return ObstacleData()
 
@@ -322,6 +363,9 @@ class ObstacleDataExtractor(BaseActorExtractor):
             obstructs_ego = intrusion_idx is not None
             is_near_junction = near_junction(intrusion_idx) if obstructs_ego else False
 
+            obs_bb = GeometricUtils.get_actor_bbox(obstacle)
+            obs_bb_corners = np.array([GeometricUtils.get_bbox_corners_xy(obs_bb)])
+
             obstacle_data_entry = ObstacleDataEntry(
                 obstacle=obstacle,
                 relative_position=tuple(rel_pos),
@@ -329,6 +373,7 @@ class ObstacleDataExtractor(BaseActorExtractor):
                 obstructs_ego=obstructs_ego,
                 intrusion_idx=intrusion_idx,
                 is_near_junction=is_near_junction,
+                bbox_corners_xy=obs_bb_corners,
             )
 
             all_obstacles.append(obstacle_data_entry)
